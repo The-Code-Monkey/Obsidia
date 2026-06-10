@@ -55,27 +55,45 @@ jobs:
       - name: Verify Kernel Boot
         run: |
           sudo apt-get install -y qemu-system-x86 ovmf
-          
-          # Find the OVMF firmware path dynamically
-          OVMF_PATH=$(find /usr/share -name "OVMF_CODE.fd" -o -name "OVMF_CODE.fd.fd" | head -n 1)
-          
+
+          OVMF_PATH=$(find /usr/share -name "OVMF_CODE*.fd" | head -n 1)
           if [ -z "$OVMF_PATH" ]; then
-            echo "Error: Could not find OVMF firmware."
+            echo "::error::Could not find OVMF firmware."
             exit 1
           fi
-          
-          echo "Using OVMF firmware at: $OVMF_PATH"
-          
-          # Run QEMU using the dynamically found path
-          timeout 5s qemu-system-x86_64 \
-             -M q35 -m 512M \
-             -bios "$OVMF_PATH" \
-             -cdrom obsidia.iso \
-             -serial stdio \
-             -nographic \
-             -monitor none || true
-             
+          echo "Using OVMF firmware: $OVMF_PATH"
 
+          set +e
+          timeout 30s qemu-system-x86_64 \
+            -M q35 -m 512M \
+            -bios "$OVMF_PATH" \
+            -cdrom obsidia.iso \
+            -serial stdio \
+            -display none \
+            -no-reboot \
+            -d guest_errors,int \
+            2>&1 | tee boot.log
+          set -e
+
+          echo "::group::Boot log"
+          cat boot.log
+          echo "::endgroup::"
+
+          if grep -q "BOOT_OK" boot.log; then
+            echo "Kernel reached stable state."
+          else
+            echo "::error::Boot marker 'BOOT_OK' not found — kernel did not boot cleanly."
+            exit 1
+          fi
+
+      - name: Upload boot log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log
+          path: boot.log
+          if-no-files-found: warn
+          
       # Attach the final obsidia.iso to the GitHub Actions run
       - name: Upload ISO Artifact
         uses: actions/upload-artifact@v4
