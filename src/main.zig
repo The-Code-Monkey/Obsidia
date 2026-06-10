@@ -17,6 +17,7 @@ export fn _start() callconv(.C) noreturn {
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
     serial.print("[OBSIDIA] Running on modern x86_64 architecture.\n", .{});
     serial.print("========================================\n", .{});
+    serial.print("BOOT_OK\n", .{});
 
     while (true) {
         // x86_64 specific instruction to halt the processor until the next interrupt
