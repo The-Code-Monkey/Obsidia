@@ -56,6 +56,10 @@ jobs:
                   iso_root -o obsidia.iso
                   
           ./limine/limine bios-install obsidia.iso
+
+      - name: Verify ISO Contents
+        run: |
+          xorriso -indev obsidia.iso -find / -exec report_el_torito
           
 
       - name: Verify Kernel Boot
