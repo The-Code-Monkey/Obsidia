@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Import the Limine module so the kernel can parse bootloader data
-    const limine = b.dependency("limine_zig", .{});
+    const limine = b.dependency("limine", .{});
     kernel.root_module.addImport("limine", limine.module("limine"));
 
     // We want the kernel to be output to zig-out/bin/
