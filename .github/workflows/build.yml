@@ -42,15 +42,28 @@ jobs:
           mkdir -p iso_root/boot
           cp zig-out/bin/kernel.elf iso_root/boot/
           cp limine.conf iso_root/
-          
-          # Copy Limine UEFI binaries
+
+          # Build a FAT EFI System Partition image containing the bootloader
+          mkdir -p efi_root/EFI/BOOT
+          cp limine/BOOTX64.EFI efi_root/EFI/BOOT/
+
+          dd if=/dev/zero of=efi.img bs=1M count=4
+          mformat -i efi.img -F ::
+          mmd     -i efi.img ::/EFI
+          mmd     -i efi.img ::/EFI/BOOT
+          mcopy   -i efi.img limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+
+          # Place the ESP image inside the ISO tree
           mkdir -p iso_root/EFI/BOOT
-          cp limine/BOOTX64.EFI iso_root/EFI/BOOT/
-          
-          # Create UEFI-only ISO
-          xorriso -as mkisofs -o obsidia.iso \
-                  --efi-boot EFI/BOOT/BOOTX64.EFI -efi-boot-part --efi-boot-image \
-                  --protective-msdos-label iso_root
+          cp efi.img iso_root/boot/efi.img
+
+          xorriso -as mkisofs \
+            -R -J \
+            -e boot/efi.img \
+            -no-emul-boot \
+            -isohybrid-gpt-basdat \
+            -o obsidia.iso \
+            iso_root
 
       - name: Verify Kernel Boot
         run: |
