@@ -75,32 +75,35 @@ jobs:
 
       - name: Verify Kernel Boot
         run: |
-          sudo apt-get install -y qemu-system-x86 ovmf
+          set -euo pipefail
+          sudo apt-get install -y qemu-system-x86 ovmf mtools
 
-          # Pick the PLAIN OVMF (avoid .ms / .secboot Secure Boot variants)
-          OVMF_CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd \
-                         /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -n1)
-          OVMF_VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd \
-                             /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -n1)
-
-          if [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ]; then
-            echo "::error::Could not find plain OVMF firmware."
-            ls -la /usr/share/OVMF/ || true
-            exit 1
-          fi
-
-          # VARS must be writable, so copy it out of the read-only system path
+          OVMF_CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -n1)
+          OVMF_VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -n1)
           cp "$OVMF_VARS_SRC" /tmp/OVMF_VARS.fd
           echo "Using OVMF code: $OVMF_CODE"
+
+          # Build a bare FAT boot image: bootloader + config + kernel, no partition table
+          dd if=/dev/zero of=boot.img bs=1M count=64
+          mformat -i boot.img -F ::
+          mmd   -i boot.img ::/EFI
+          mmd   -i boot.img ::/EFI/BOOT
+          mmd   -i boot.img ::/boot
+          mcopy -i boot.img limine/BOOTX64.EFI   ::/EFI/BOOT/BOOTX64.EFI
+          mcopy -i boot.img limine.conf          ::/limine.conf
+          mcopy -i boot.img zig-out/bin/kernel.elf ::/boot/kernel.elf
+
+          echo "=== boot.img contents ==="
+          mdir -i boot.img ::/ ::/EFI/BOOT ::/boot
 
           set +e
           timeout 30s qemu-system-x86_64 \
             -M q35 -m 512M \
             -drive if=pflash,format=raw,unit=0,readonly=on,file="$OVMF_CODE" \
             -drive if=pflash,format=raw,unit=1,file=/tmp/OVMF_VARS.fd \
-            -drive id=obsidia,file=obsidia.iso,format=raw,if=none \
+            -drive id=boot,file=boot.img,format=raw,if=none \
             -device qemu-xhci \
-            -device usb-storage,drive=obsidia,bootindex=0 \
+            -device usb-storage,drive=boot,bootindex=0 \
             -serial stdio \
             -display none \
             -no-reboot \
@@ -115,7 +118,7 @@ jobs:
           if grep -q "BOOT_OK" boot.log; then
             echo "Kernel reached stable state."
           else
-            echo "::error::Boot marker 'BOOT_OK' not found — kernel did not boot cleanly."
+            echo "::error::Boot marker 'BOOT_OK' not found."
             exit 1
           fi
 
