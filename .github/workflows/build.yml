@@ -65,7 +65,8 @@ jobs:
             -R -J \
             -e boot/efi.img \
             -no-emul-boot \
-            -isohybrid-gpt-basdat \
+            -efi-boot-part --efi-boot-image \
+            -append_partition 2 0xef efi.img \
             -o obsidia.iso \
             iso_root
 
