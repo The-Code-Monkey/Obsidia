@@ -56,12 +56,24 @@ jobs:
         run: |
           sudo apt-get install -y qemu-system-x86 ovmf
           
-          # Debug: Find where OVMF is hiding
-          find /usr/share -name "OVMF_CODE.fd" || echo "File not found"
+          # Find the OVMF firmware path dynamically
+          OVMF_PATH=$(find /usr/share -name "OVMF_CODE.fd" -o -name "OVMF_CODE.fd.fd" | head -n 1)
           
-          # Run QEMU with a flexible path (if you find a different path, update the line below)
-          timeout 5s qemu-system-x86_64 -M q35 -m 512M -bios /usr/share/OVMF/OVMF_CODE.fd \
-             -cdrom obsidia.iso -serial stdio -nographic -monitor none || true
+          if [ -z "$OVMF_PATH" ]; then
+            echo "Error: Could not find OVMF firmware."
+            exit 1
+          fi
+          
+          echo "Using OVMF firmware at: $OVMF_PATH"
+          
+          # Run QEMU using the dynamically found path
+          timeout 5s qemu-system-x86_64 \
+             -M q35 -m 512M \
+             -bios "$OVMF_PATH" \
+             -cdrom obsidia.iso \
+             -serial stdio \
+             -nographic \
+             -monitor none || true
              
 
       # Attach the final obsidia.iso to the GitHub Actions run
