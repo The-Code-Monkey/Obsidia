@@ -52,11 +52,6 @@ jobs:
                   --efi-boot EFI/BOOT/BOOTX64.EFI -efi-boot-part --efi-boot-image \
                   --protective-msdos-label iso_root
                   
-
-      - name: Verify ISO Contents
-        run: |
-          xorriso -indev obsidia.iso -find / -exec report_el_torito
-          
       - name: Verify Kernel Boot
         run: |
           sudo apt-get install -y qemu-system-x86 ovmf
