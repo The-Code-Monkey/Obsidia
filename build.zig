@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Attach the higher-half linker script
-    kernel.setLinkerScript(b.path("linker.ld"));
+    kernel.setLinkerScript(b.path("linker-x86_64.lds"));
 
     // Freestanding kernels must not assume a red zone
     kernel.root_module.red_zone = false;
