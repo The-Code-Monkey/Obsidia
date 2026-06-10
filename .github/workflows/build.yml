@@ -52,7 +52,17 @@ jobs:
 
       - name: Verify Kernel Boot
         run: |
-          sudo apt-get install -y qemu-system-x86 ovmf
+          sudo apt-get install -y qemu-system-x86 ovmf mtools
+
+          dd if=/dev/zero of=boot.img bs=1M count=64
+          mformat -i boot.img -F ::
+          mmd -i boot.img ::/EFI
+          mmd -i boot.img ::/EFI/BOOT
+          mmd -i boot.img ::/boot
+          mcopy -i boot.img limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+          mcopy -i boot.img limine.conf ::/limine.conf
+          mcopy -i boot.img zig-out/bin/kernel.elf ::/boot/kernel.elf
+          mdir -i boot.img ::/EFI/BOOT
 
           cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/OVMF_VARS.fd
 
@@ -60,7 +70,9 @@ jobs:
             -M q35 -m 512M \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
             -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
-            -cdrom obsidia.iso \
+            -drive id=boot,file=boot.img,format=raw,if=none \
+            -device qemu-xhci \
+            -device usb-storage,drive=boot,bootindex=0 \
             -serial stdio \
             -display none \
             -no-reboot \
