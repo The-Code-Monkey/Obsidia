@@ -56,17 +56,27 @@ jobs:
         run: |
           sudo apt-get install -y qemu-system-x86 ovmf
 
-          OVMF_PATH=$(find /usr/share -name "OVMF_CODE*.fd" | head -n 1)
-          if [ -z "$OVMF_PATH" ]; then
-            echo "::error::Could not find OVMF firmware."
+          # Pick the PLAIN OVMF (avoid .ms / .secboot Secure Boot variants)
+          OVMF_CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd \
+                         /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -n1)
+          OVMF_VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd \
+                             /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -n1)
+
+          if [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS_SRC" ]; then
+            echo "::error::Could not find plain OVMF firmware."
+            ls -la /usr/share/OVMF/ || true
             exit 1
           fi
-          echo "Using OVMF firmware: $OVMF_PATH"
+
+          # VARS must be writable, so copy it out of the read-only system path
+          cp "$OVMF_VARS_SRC" /tmp/OVMF_VARS.fd
+          echo "Using OVMF code: $OVMF_CODE"
 
           set +e
           timeout 30s qemu-system-x86_64 \
             -M q35 -m 512M \
-            -bios "$OVMF_PATH" \
+            -drive if=pflash,format=raw,unit=0,readonly=on,file="$OVMF_CODE" \
+            -drive if=pflash,format=raw,unit=1,file=/tmp/OVMF_VARS.fd \
             -cdrom obsidia.iso \
             -serial stdio \
             -display none \
