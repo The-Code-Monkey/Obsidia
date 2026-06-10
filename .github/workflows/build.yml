@@ -1,0 +1,67 @@
+name: Build Obsidia ISO
+
+# Trigger the workflow on every push to any branch
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+
+jobs:
+  build:
+    name: Compile and Package ISO
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Install the Zig compiler 
+      # (Using 0.13.0, but you can change this to 'master' if you want bleeding edge)
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      # We need xorriso and mtools to assemble the bootable disk image
+      - name: Install ISO Tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso mtools
+
+      # Pull the Limine binaries directly from their repo during the CI run
+      - name: Fetch Limine Binaries
+        run: |
+          git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1
+
+      - name: Build Zig Kernel
+        run: zig build
+
+      - name: Assemble Bootable ISO
+        run: |
+          mkdir -p iso_root
+          cp zig-out/bin/kernel.elf iso_root/
+          cp limine.conf iso_root/
+
+          # Copy Limine BIOS/UEFI boot files
+          cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/
+          mkdir -p iso_root/EFI/BOOT
+          cp limine/BOOTX64.EFI iso_root/EFI/BOOT/
+          cp limine/BOOTIA32.EFI iso_root/EFI/BOOT/
+
+          # Generate the ISO
+          xorriso -as mkisofs -b limine-bios-cd.bin \
+                  -no-emul-boot -boot-load-size 4 -boot-info-table \
+                  --efi-boot limine-uefi-cd.bin \
+                  -efi-boot-part --efi-boot-image --protective-msdos-label \
+                  iso_root -o obsidia.iso
+
+          # Install the Limine bootloader to the ISO
+          ./limine/limine bios-install obsidia.iso
+
+      # Attach the final obsidia.iso to the GitHub Actions run
+      - name: Upload ISO Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obsidia-os
+          path: obsidia.iso
+          if-no-files-found: error
