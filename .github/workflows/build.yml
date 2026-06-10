@@ -64,11 +64,12 @@ jobs:
 
       - name: Verify Kernel Boot
         run: |
-          sudo apt-get install -y qemu-system-x86
-          # -nographic disables the GUI initialization
-          # -monitor none disables the interactive monitor window
-          timeout 5s qemu-system-x86_64 -m 512M -cdrom obsidia.iso -serial stdio -nographic -monitor none || true
-          
+          sudo apt-get install -y qemu-system-x86 ovmf
+          # -bios forces the use of OVMF (UEFI firmware)
+          # -nographic -serial stdio redirects the logs
+          timeout 5s qemu-system-x86_64 -M q35 -m 512M -bios /usr/share/OVMF/OVMF_CODE.fd \
+             -cdrom obsidia.iso -serial stdio -nographic -monitor none || true
+             
 
       # Attach the final obsidia.iso to the GitHub Actions run
       - name: Upload ISO Artifact
