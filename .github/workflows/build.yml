@@ -81,7 +81,7 @@ jobs:
             -serial stdio \
             -display none \
             -no-reboot \
-            -d guest_errors,int \
+            -d guest_errors \
             2>&1 | tee boot.log
           set -e
 
