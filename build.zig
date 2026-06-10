@@ -3,6 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
+    const limine = b.dependency("limine", .{
+        .api_revision = 3,
+        .allow_deprecated = false,
+        .no_pointers = false,
+    });
+    kernel.root_module.addImport("limine", limine.module("limine"));
+
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
         .os_tag = .freestanding,
