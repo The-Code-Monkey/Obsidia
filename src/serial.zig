@@ -3,21 +3,21 @@ const std = @import("std");
 // The standard base address for the COM1 serial port
 const PORT: u16 = 0x3F8;
 
-// Write a single byte to an I/O port using inline assembly
+// Write a single byte to an I/O port
 inline fn outb(port: u16, data: u8) void {
-    asm volatile ("outb %[data], %[port]"
+    asm volatile ("outb %al, %dx"
         :
         : [data] "{al}" (data),
-          [port] "{N{dx}}" (port),
+          [port] "{dx}" (port),
     );
 }
 
 // Read a single byte from an I/O port
 inline fn inb(port: u16) u8 {
     var data: u8 = undefined;
-    asm volatile ("inb %[port], %[data]"
+    asm volatile ("inb %dx, %al"
         : [data] "={al}" (data),
-        : [port] "{N{dx}}" (port),
+        : [port] "{dx}" (port),
     );
     return data;
 }
