@@ -62,29 +62,25 @@ jobs:
           mcopy -i boot.img limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
           mcopy -i boot.img limine.conf ::/limine.conf
           mcopy -i boot.img zig-out/bin/kernel.elf ::/boot/kernel.elf
-          mdir -i boot.img ::/EFI/BOOT
 
           cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/OVMF_VARS.fd
 
-          qemu-system-x86_64 \
+          timeout 25 qemu-system-x86_64 \
             -M q35 -m 512M \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
             -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
             -drive id=boot,file=boot.img,format=raw,if=none \
             -device qemu-xhci \
             -device usb-storage,drive=boot,bootindex=0 \
-            -serial stdio \
+            -chardev stdio,id=char0,logfile=boot.log,signal=off \
+            -serial chardev:char0 \
             -display none \
             -no-reboot \
-            -d guest_errors \
-            2>&1 | tee boot.log &
+            2>&1 || true
 
-          sleep 20
-          kill %1 2>/dev/null
-
+          echo "=== boot.log ==="
           cat boot.log
           grep -q "BOOT_OK" boot.log
-   
 
       - name: Upload boot log
         if: always()
