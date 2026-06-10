@@ -28,10 +28,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xorriso mtools
 
-      # Pull the Limine binaries directly from their repo during the CI run
+      # Pull the Limine binaries and compile the installer utility
       - name: Fetch Limine Binaries
         run: |
           git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1
+          make -C limine
 
       - name: Build Zig Kernel
         run: zig build
