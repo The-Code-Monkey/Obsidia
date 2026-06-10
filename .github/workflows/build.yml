@@ -39,22 +39,23 @@ jobs:
 
       - name: Assemble Bootable ISO
         run: |
+          set -euo pipefail
+
           mkdir -p iso_root/boot
           cp zig-out/bin/kernel.elf iso_root/boot/
           cp limine.conf iso_root/
 
-          # Build a FAT EFI System Partition image containing the bootloader
-          mkdir -p efi_root/EFI/BOOT
-          cp limine/BOOTX64.EFI efi_root/EFI/BOOT/
-
+          # Build the FAT EFI System Partition
           dd if=/dev/zero of=efi.img bs=1M count=4
           mformat -i efi.img -F ::
-          mmd     -i efi.img ::/EFI
-          mmd     -i efi.img ::/EFI/BOOT
-          mcopy   -i efi.img limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+          mmd   -i efi.img ::/EFI
+          mmd   -i efi.img ::/EFI/BOOT
+          mcopy -i efi.img limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
 
-          # Place the ESP image inside the ISO tree
-          mkdir -p iso_root/EFI/BOOT
+          # Prove the ESP actually contains the bootloader
+          echo "=== ESP contents ==="
+          mdir -i efi.img ::/EFI/BOOT
+
           cp efi.img iso_root/boot/efi.img
 
           xorriso -as mkisofs \
@@ -64,6 +65,10 @@ jobs:
             -isohybrid-gpt-basdat \
             -o obsidia.iso \
             iso_root
+
+          # Prove the ISO advertises an EFI boot entry
+          echo "=== ISO boot info ==="
+          xorriso -indev obsidia.iso -report_el_torito plain 2>&1 | grep -i efi || true
 
       - name: Verify Kernel Boot
         run: |
