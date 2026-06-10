@@ -51,13 +51,18 @@ jobs:
           xorriso -as mkisofs -o obsidia.iso \
                   --efi-boot EFI/BOOT/BOOTX64.EFI -efi-boot-part --efi-boot-image \
                   --protective-msdos-label iso_root
-                  
+
       - name: Verify Kernel Boot
         run: |
           sudo apt-get install -y qemu-system-x86 ovmf
-          # -bios /usr/share/OVMF/OVMF_CODE.fd forces UEFI mode
+          
+          # Debug: Find where OVMF is hiding
+          find /usr/share -name "OVMF_CODE.fd" || echo "File not found"
+          
+          # Run QEMU with a flexible path (if you find a different path, update the line below)
           timeout 5s qemu-system-x86_64 -M q35 -m 512M -bios /usr/share/OVMF/OVMF_CODE.fd \
              -cdrom obsidia.iso -serial stdio -nographic -monitor none || true
+             
 
       # Attach the final obsidia.iso to the GitHub Actions run
       - name: Upload ISO Artifact
