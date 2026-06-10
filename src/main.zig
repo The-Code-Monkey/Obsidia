@@ -2,6 +2,9 @@ const std = @import("std");
 const limine = @import("limine");
 const serial = @import("serial.zig");
 
+// Tell Limine which base revision of the protocol this kernel supports.
+export var base_revision: limine.BaseRevision = .{ .revision = 3 };
+
 // Request a framebuffer from the bootloader. 
 // Limine will read this struct, set up the screen, and populate the response with the memory address.
 export var framebuffer_request: limine.FramebufferRequest = .{};
