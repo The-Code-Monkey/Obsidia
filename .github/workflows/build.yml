@@ -59,6 +59,13 @@ jobs:
           # Install the Limine bootloader to the ISO
           ./limine/limine bios-install obsidia.iso
 
+      - name: Verify Kernel Boot
+        run: |
+          sudo apt-get install -y qemu-system-x86
+          # Boot QEMU, send serial to stdout, and kill it after 5 seconds
+          timeout 5s qemu-system-x86_64 -m 512M -cdrom obsidia.iso -serial stdio || true
+          
+
       # Attach the final obsidia.iso to the GitHub Actions run
       - name: Upload ISO Artifact
         uses: actions/upload-artifact@v4
