@@ -1,29 +1,47 @@
-const std = @import("std");
+const builtin = @import("builtin");
 const limine = @import("limine");
 const serial = @import("serial.zig");
 
-// Tell Limine which base revision of the protocol this kernel supports.
-export var base_revision: limine.BaseRevision = .{ .revision = 3 };
+export var start_marker: limine.RequestsStartMarker linksection(".limine_requests_start") = .{};
+export var end_marker: limine.RequestsEndMarker linksection(".limine_requests_end") = .{};
 
-// Request a framebuffer from the bootloader. 
-// Limine will read this struct, set up the screen, and populate the response with the memory address.
-export var framebuffer_request: limine.FramebufferRequest = .{};
+export var base_revision: limine.BaseRevision linksection(".limine_requests") = .init(3);
+export var framebuffer_request: limine.FramebufferRequest linksection(".limine_requests") = .{};
 
-// The entry point called by Limine. It must use the C calling convention.
-export fn _start() callconv(.C) noreturn {
-
-    // Initialize the COM1 serial port
-    serial.init();
-
-    // Send our first formatted log message out of the VM!
-    serial.print("========================================\n", .{});
-    serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
-    serial.print("[OBSIDIA] Running on modern x86_64 architecture.\n", .{});
-    serial.print("========================================\n", .{});
-    serial.print("BOOT_OK\n", .{});
-
+fn hcf() noreturn {
     while (true) {
-        // x86_64 specific instruction to halt the processor until the next interrupt
-        asm volatile ("hlt");
+        switch (builtin.cpu.arch) {
+            .x86_64 => asm volatile ("hlt"),
+            .aarch64 => asm volatile ("wfi"),
+            .riscv64 => asm volatile ("wfi"),
+            .loongarch64 => asm volatile ("idle 0"),
+            else => unreachable,
+        }
     }
+}
+
+export fn _start() noreturn {
+    // Serial first, so we can see everything that follows — including failures.
+    serial.init();
+    serial.print("========================================\n", .{});
+    serial.print("[OBSIDIA] Kernel entered _start.\n", .{});
+
+    if (!base_revision.isSupported()) {
+        serial.print("[OBSIDIA] PANIC: base revision not supported\n", .{});
+        hcf();
+    }
+    serial.print("[OBSIDIA] Base revision OK.\n", .{});
+
+    if (framebuffer_request.response) |fb_response| {
+        const fb = fb_response.getFramebuffers()[0];
+        serial.print("[OBSIDIA] Framebuffer acquired: {}x{}\n", .{ fb.width, fb.height });
+    } else {
+        serial.print("[OBSIDIA] WARN: no framebuffer response\n", .{});
+    }
+
+    serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
+    serial.print("BOOT_OK\n", .{});
+    serial.print("========================================\n", .{});
+
+    hcf();
 }
