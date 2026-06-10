@@ -5,8 +5,8 @@
     .dependencies = .{
         // Modern, type-safe Zig bindings for the Limine boot protocol
         .limine = .{
-            .url = "git+https://github.com/48cf/limine-zig#73456cb040e3650f9689e3a6a12df08235e1be87",
-            .hash = "1220a26d9c9b46ba642df5204481f185db265008cf145625bf5a473138b321a4be03",
+            .url = "https://github.com/48cf/limine-zig/archive/73456cb040e3650f9689e3a6a12df08235e1be87.tar.gz",
+            .hash = "12200000000000000000000000000000000000000000000000000000000000000000",
         },
     },
     .paths = .{
