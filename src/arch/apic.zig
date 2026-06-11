@@ -33,6 +33,15 @@ const LAPIC_SVR = 0xF0;
 
 const IA32_APIC_BASE = 0x1B; // MSR: bit 11 = LAPIC global enable
 
+// LAPIC timer registers + LVT bits.
+const LVT_TIMER = 0x320; // Local Vector Table entry for the timer
+const TIMER_INIT = 0x380; // initial count
+const TIMER_CUR = 0x390; // current count (read-only)
+const TIMER_DIV = 0x3E0; // divide configuration
+const TIMER_PERIODIC = 1 << 17; // LVT: periodic mode
+const TIMER_MASKED = 1 << 16; // LVT: masked
+const TIMER_VECTOR: u8 = VECTOR_OFFSET; // fire the same vector the PIT timer used (32)
+
 var lapic: [*]volatile u32 = undefined; // LAPIC MMIO (via HHDM)
 var bsp_id: u32 = 0; // APIC ID of the boot CPU
 var active = false;
@@ -158,4 +167,69 @@ pub fn init() void {
 
     asm volatile ("sti"); // interrupts back on, now via the APIC
     serial.print("[APIC] APIC initialized.\n", .{});
+}
+
+// Mask an IRQ at the I/O APIC (used to silence the PIT once the LAPIC timer
+// drives the timer vector).
+pub fn maskIrq(irq: u8) void {
+    var gsi: u32 = irq;
+    for (acpi.isos()) |iso| {
+        if (iso.source == irq) gsi = iso.gsi;
+    }
+    const io = ioApicForGsi(gsi) orelse return;
+    const idx = gsi - io.gsi_base;
+    const low = ioRead(io, 0x10 + idx * 2);
+    ioWrite(io, 0x10 + idx * 2, low | (1 << 16)); // set the mask bit
+}
+
+// Spin until the PIT tick counter advances once, bounded so we never hang if the
+// PIT isn't ticking.
+fn waitForTick() bool {
+    const start = pic.ticks();
+    var guard: u64 = 0;
+    while (pic.ticks() == start) : (guard += 1) {
+        if (guard > 4_000_000_000) return false;
+    }
+    return true;
+}
+
+// Calibrate the Local APIC timer against the PIT, then run it in periodic mode
+// and retire the PIT. The LAPIC timer fires the SAME vector the PIT-driven timer
+// used, so the existing handler (timerTick) and the uptime counter are reused.
+pub fn initTimer(hz: u32) void {
+    if (!active) return;
+    serial.print("[APIC] Calibrating LAPIC timer against the PIT...\n", .{});
+    lapicWrite(TIMER_DIV, 0x3); // divide bus clock by 16
+    lapicWrite(LVT_TIMER, TIMER_MASKED); // masked while we measure
+
+    // Count how far the LAPIC timer falls over 10 PIT ticks (= 100 ms @ 100 Hz).
+    if (!waitForTick()) { // align to a PIT tick edge first
+        serial.print("[APIC]   PIT not ticking; keeping the PIT as the timer.\n", .{});
+        return;
+    }
+    lapicWrite(TIMER_INIT, 0xFFFFFFFF); // start the LAPIC timer at max
+    const t0 = pic.ticks();
+    var guard: u64 = 0;
+    while (pic.ticks() - t0 < 10) : (guard += 1) {
+        if (guard > 4_000_000_000) break;
+    }
+    const elapsed = 0xFFFFFFFF - lapicRead(TIMER_CUR);
+    lapicWrite(TIMER_INIT, 0); // stop
+
+    if (elapsed < 1000) { // implausibly small -> calibration failed
+        serial.print("[APIC]   calibration failed (elapsed {d}); keeping the PIT.\n", .{elapsed});
+        return;
+    }
+    // elapsed counts in 100 ms -> counts/sec = elapsed*10. The periodic initial
+    // count for the requested frequency:
+    const counts_per_sec = @as(u64, elapsed) * 10;
+    const count: u32 = @intCast(counts_per_sec / hz);
+    serial.print("[APIC]   LAPIC timer ~{d} MHz; count {d}/period for {d} Hz.\n", .{ counts_per_sec / 1_000_000, count, hz });
+
+    // Silence the PIT and run the LAPIC timer periodically on the timer vector.
+    maskIrq(0);
+    lapicWrite(TIMER_DIV, 0x3);
+    lapicWrite(LVT_TIMER, TIMER_PERIODIC | @as(u32, TIMER_VECTOR));
+    lapicWrite(TIMER_INIT, count);
+    serial.print("[APIC]   PIT retired; LAPIC timer periodic @ {d} Hz (vector {d}).\n", .{ hz, TIMER_VECTOR });
 }

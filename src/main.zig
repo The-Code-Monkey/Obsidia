@@ -163,6 +163,8 @@ export fn _start() noreturn {
         acpi.init(r.address); // r.address is the RSDP's physical address
         // Retire the 8259 PIC and route interrupts through the LAPIC + I/O APIC.
         apic.init();
+        // Calibrate + start the LAPIC timer (retires the PIT as the timer source).
+        apic.initTimer(100); // 100 Hz, matching the old PIT rate
     } else {
         serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable, staying on PIC)\n", .{});
     }
