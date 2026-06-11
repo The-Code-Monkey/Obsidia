@@ -202,5 +202,16 @@ fn runAfterReclaim() callconv(.C) noreturn {
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
     keyboard.setSink(&shell.feed); // route keystrokes into the shell
-    shell.run(); // the command loop (never returns)
+
+    // Make the shell a real scheduled thread. From here the kernel multitasks:
+    // the timer preempts between the idle thread (this context) and the shell.
+    scheduler.init(); // adopt this context as the idle thread (thread 0)
+    scheduler.spawn("shell", &shellThread); // the shell runs as thread 1
+    scheduler.startPreemption(); // permanent timer-driven preemption
+    scheduler.idle(); // idle forever; the scheduler runs the shell. never returns
+}
+
+// The shell's command loop, wrapped so it can run as a kernel thread.
+fn shellThread() void {
+    shell.run();
 }

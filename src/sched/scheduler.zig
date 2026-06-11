@@ -12,7 +12,7 @@ const serial = @import("../drivers/serial.zig");
 const heap = @import("../mm/heap.zig");
 const pic = @import("../arch/pic.zig"); // timer tick hook + tick counter
 
-const STACK_SIZE = 16 * 1024; // 16 KiB per thread
+const STACK_SIZE = 32 * 1024; // 32 KiB per thread (the shell uses std.fmt etc.)
 const MAX_THREADS = 16;
 
 // The low-level context switch, written in assembly (a normal Zig function with
@@ -77,7 +77,7 @@ fn setupMain() void {
 // Create a thread that will start executing `func`. We hand-build its stack so
 // the first switchContext "returns" into func, and so that if func ever returns
 // it lands in threadExit.
-fn spawn(name: []const u8, func: *const fn () void) void {
+pub fn spawn(name: []const u8, func: *const fn () void) void {
     if (thread_count >= MAX_THREADS) return;
     const stack = heap.allocator().alloc(u8, STACK_SIZE) catch {
         serial.print("[SCHED]   failed to allocate a thread stack\n", .{});
@@ -192,4 +192,36 @@ pub fn preemptDemo() void {
     pic.on_tick = null; // stop preempting
     preempting = false;
     serial.print("[SCHED] Preemptive demo complete.\n", .{});
+}
+
+// --- Permanent multitasking --------------------------------------------------
+// Adopt the current (boot) context as thread 0 — the idle thread.
+pub fn init() void {
+    setupMain();
+    threads[0].name = "idle";
+}
+
+// Turn on timer-driven preemption for good: every timer tick switches threads.
+pub fn startPreemption() void {
+    preempting = true;
+    pic.on_tick = &yield;
+}
+
+// The idle thread's body: halt until an interrupt; the timer preempts us to any
+// runnable thread (e.g. the shell). Never returns.
+pub fn idle() noreturn {
+    while (true) asm volatile ("hlt");
+}
+
+// Print the thread table (used by the shell's `ps` command).
+pub fn dump() void {
+    serial.print("  ID  STATE      NAME\n", .{});
+    for (threads[0..thread_count], 0..) |t, i| {
+        const st = switch (t.state) {
+            .ready => "ready",
+            .running => "running",
+            .finished => "finished",
+        };
+        serial.print("  {d:>2}  {s:<9}  {s}\n", .{ i, st, t.name });
+    }
 }

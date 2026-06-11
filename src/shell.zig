@@ -12,6 +12,7 @@ const pic = @import("arch/pic.zig"); // register the IRQ4 handler; read uptime t
 const pmm = @import("mm/pmm.zig"); // for the `mem` command
 const console = @import("drivers/console.zig"); // to blink the on-screen cursor
 const power = @import("arch/power.zig"); // restart / shutdown
+const scheduler = @import("sched/scheduler.zig"); // for the `ps` command
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -248,7 +249,7 @@ fn execute(raw: []const u8) void {
     const args = if (sp) |i| std.mem.trim(u8, text[i + 1 ..], " ") else text[0..0]; // the rest
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
-        serial.print("commands: help, clear, echo <text>, mem, uptime, history,\n", .{});
+        serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
         serial.print("          sleep [secs], restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
@@ -269,6 +270,8 @@ fn execute(raw: []const u8) void {
         while (k > 0) : (k -= 1) { // oldest first
             serial.print("  {d}: {s}\n", .{ hist_size - k + 1, histAt(k) });
         }
+    } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
+        scheduler.dump();
     } else if (std.mem.eql(u8, cmd, "clear")) { // clear the terminal
         serial.print("\x1b[2J\x1b[H", .{}); // ANSI: erase screen + cursor home
     } else if (std.mem.eql(u8, cmd, "echo")) { // print the arguments back
