@@ -15,6 +15,7 @@ const vmm = @import("mm/vmm.zig"); // page tables / virtual memory
 const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
 const console = @import("drivers/console.zig"); // on-screen framebuffer text console
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
+const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
 const shell = @import("shell.zig"); // interactive serial command shell
@@ -169,6 +170,12 @@ export fn _start() noreturn {
     } else {
         serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable, staying on PIC)\n", .{});
     }
+
+    // Bring up the ATA PIO disk (block device). Probes the primary master; on a
+    // machine without a legacy IDE disk (e.g. q35, or a disk-less boot) it simply
+    // reports "no disk" and the kernel carries on.
+    ata.init();
+    ata.selfTest();
 
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
     serial.print("BOOT_OK\n", .{}); // the marker our test harness greps for
