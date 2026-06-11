@@ -9,11 +9,13 @@ const serial = @import("drivers/serial.zig"); // COM1 logging
 const gdt = @import("arch/gdt.zig"); // segment descriptors + TSS
 const idt = @import("arch/idt.zig"); // interrupt/exception handlers
 const pic = @import("arch/pic.zig"); // legacy interrupt controller + timer
+const apic = @import("arch/apic.zig"); // modern interrupt controller (LAPIC + IO APIC)
 const pmm = @import("mm/pmm.zig"); // physical frame allocator
 const vmm = @import("mm/vmm.zig"); // page tables / virtual memory
 const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
 const console = @import("drivers/console.zig"); // on-screen framebuffer text console
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
+const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const shell = @import("shell.zig"); // interactive serial command shell
 
 // Limine scans the kernel for "requests": structs (tagged by magic IDs) that ask
@@ -32,6 +34,8 @@ export var memmap_request: limine.MemoryMapRequest linksection(".limine_requests
 export var hhdm_request: limine.HhdmRequest linksection(".limine_requests") = .{};
 // Ask where our kernel was physically/virtually loaded (for the VMM's mappings).
 export var executable_address_request: limine.ExecutableAddressRequest linksection(".limine_requests") = .{};
+// Ask for the RSDP (root pointer to the ACPI tables).
+export var rsdp_request: limine.RsdpRequest linksection(".limine_requests") = .{};
 // Force 4-level paging so the VMM's table walk is correct regardless of CPU.
 export var paging_mode_request: limine.PagingModeRequest linksection(".limine_requests") = .{
     .mode = .@"4lvl", // preferred mode
@@ -150,6 +154,17 @@ export fn _start() noreturn {
     if (fb_info) |info| {
         console.init(info);
         serial.setMirror(&console.writeString);
+    }
+
+    // Parse the ACPI tables. Do this BEFORE reclaiming bootloader memory: the
+    // RSDP *response* struct lives there (the tables themselves are in firmware
+    // memory and survive). The parsed data feeds the APIC driver next.
+    if (rsdp_request.response) |r| {
+        acpi.init(r.address); // r.address is the RSDP's physical address
+        // Retire the 8259 PIC and route interrupts through the LAPIC + I/O APIC.
+        apic.init();
+    } else {
+        serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable, staying on PIC)\n", .{});
     }
 
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
