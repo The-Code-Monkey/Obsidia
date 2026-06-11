@@ -4,7 +4,7 @@ const std = @import("std");
 const PORT: u16 = 0x3F8;
 
 // Write a single byte to an I/O port
-inline fn outb(port: u16, data: u8) void {
+pub inline fn outb(port: u16, data: u8) void {
     asm volatile ("outb %al, %dx"
         :
         : [data] "{al}" (data),
@@ -13,7 +13,7 @@ inline fn outb(port: u16, data: u8) void {
 }
 
 // Read a single byte from an I/O port
-inline fn inb(port: u16) u8 {
+pub inline fn inb(port: u16) u8 {
     var data: u8 = undefined;
     asm volatile ("inb %dx, %al"
         : [data] "={al}" (data),
