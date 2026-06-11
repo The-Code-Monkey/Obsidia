@@ -147,12 +147,14 @@ fi
 
 # --- Shell interaction -------------------------------------------------------
 echo "== Shell commands =="
-boot_shell "$TMP/shell.log" 512M 'help\rmem\ruptime\recho test123\rbogus\r'
+boot_shell "$TMP/shell.log" 512M 'help\rmem\ruptime\recho test123\rps\rbogus\r'
 assert_in "$TMP/shell.log" "commands: help, clear"        "shell: help"
 assert_in "$TMP/shell.log" "frames free"                  "shell: mem"
 assert_in "$TMP/shell.log" "ticks @ 100 Hz"               "shell: uptime"
 assert_in "$TMP/shell.log" "test123"                      "shell: echo"
 assert_in "$TMP/shell.log" "unknown command: bogus"       "shell: unknown command"
+assert_in "$TMP/shell.log" "running    shell"             "shell runs as a scheduled thread (ps)"
+assert_in "$TMP/shell.log" "ready      idle"              "ps lists the idle thread"
 
 # --- History recall (Up arrow re-runs a command) -----------------------------
 echo "== Shell history (Up arrow) =="
