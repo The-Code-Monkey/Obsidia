@@ -146,6 +146,25 @@ else
     echo "  (skipping UEFI: no OVMF firmware found)"
 fi
 
+# --- ATA PIO disk driver -----------------------------------------------------
+# Legacy ATA PIO needs the i440fx machine (-M pc) for its PIIX3 IDE controller;
+# the q35 machine used above has only AHCI/SATA, where this driver finds nothing.
+# We attach a raw disk with a known marker at sector 0 and check the driver
+# detects the disk (correct size) and reads that marker back.
+echo "== ATA PIO disk (i440fx / -M pc) =="
+ATADISK="$TMP/ata.img"
+truncate -s 16M "$ATADISK"
+printf 'OBSIDIA_ATA_OK\0\0' | dd of="$ATADISK" conv=notrunc bs=1 count=16 2>/dev/null
+timeout 15 qemu-system-x86_64 -M pc -m 512M -cdrom "$ISO" \
+    -drive file="$ATADISK",format=raw,if=ide \
+    -serial "file:$TMP/ata.log" -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/ata.log" "primary master present: 32768 sectors" "ATA: detects disk size via IDENTIFY (16 MiB)"
+assert_in "$TMP/ata.log" "LBA0[0..16]='OBSIDIA_ATA_OK"           "ATA: reads sector 0 contents correctly"
+assert_in "$TMP/ata.log" "self-test: read LBA 0 OK"              "ATA: PIO sector read succeeds"
+# And confirm a disk-less boot stays graceful (the q35 BIOS marker boot has no
+# disk attached, so the driver must report "no disk" there and still reach BOOT_OK).
+assert_in "$TMP/bios.log" "no device (floating bus" "ATA: disk-less boot reports no disk and continues"
+
 # --- Shell interaction -------------------------------------------------------
 echo "== Shell commands =="
 boot_shell "$TMP/shell.log" 512M 'help\rmem\ruptime\recho test123\rps\rbogus\r'

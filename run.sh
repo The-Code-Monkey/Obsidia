@@ -28,13 +28,28 @@ xorriso -as mkisofs -R -r -J \
 # Install Limine onto the generated ISO
 ./limine/limine bios-install obsidia.iso
 
+# Persistent scratch disk for the ATA driver / filesystem. Created once (64 MiB)
+# and kept across runs so its contents survive reboots. Attached as a legacy IDE
+# disk, which is why we boot the i440fx machine (-M pc): the q35 chipset only has
+# AHCI/SATA, so our legacy ATA PIO driver wouldn't find a disk there.
+DISK=obsidia-disk.img
+if [ ! -f "$DISK" ]; then
+    echo "Creating $DISK (64 MiB scratch disk)..."
+    truncate -s 64M "$DISK"
+    # A human-readable marker at sector 0 so the ATA self-test prints something
+    # recognizable on first boot (the filesystem will overwrite this later).
+    printf 'OBSIDIA_ATA_OK\0\0' | dd of="$DISK" conv=notrunc bs=1 count=16 2>/dev/null
+fi
+
 echo "Booting Obsidia..."
-# Launch QEMU utilizing KVM and passing the host architecture straight through
+# Launch QEMU utilizing KVM and passing the host architecture straight through.
+# -M pc (i440fx) gives us the legacy PIIX3 IDE controller our ATA PIO driver uses.
 qemu-system-x86_64 \
-    -M q35 \
+    -M pc \
     -enable-kvm \
     -cpu host \
     -m 2G \
     -bios /usr/share/ovmf/OVMF.fd \
     -cdrom obsidia.iso \
+    -drive file="$DISK",format=raw,if=ide \
     -serial stdio

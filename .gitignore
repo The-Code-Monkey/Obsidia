@@ -11,3 +11,6 @@ iso_root/
 # output files
 *.log
 CLAUDE.md
+
+# Scratch disk image for the ATA driver / filesystem (local, not committed)
+obsidia-disk.img
