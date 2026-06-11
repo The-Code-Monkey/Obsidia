@@ -37,18 +37,67 @@ jobs:
       - name: Build Zig Kernel
         run: zig build
 
+      # - name: Assemble Bootable ISO
+      #   run: |
+      #     mkdir -p iso_root/EFI/BOOT
+      #     cp zig-out/bin/kernel.elf iso_root/
+      #     cp limine.conf iso_root/
+      #     cp limine/BOOTX64.EFI iso_root/EFI/BOOT/
+
+      #     xorriso -as mkisofs \
+      #       -e EFI/BOOT/BOOTX64.EFI \
+      #       -no-emul-boot \
+      #       -o obsidia.iso \
+      #       iso_root
+
       - name: Assemble Bootable ISO
         run: |
+          mkdir -p iso_root/boot/limine
           mkdir -p iso_root/EFI/BOOT
-          cp zig-out/bin/kernel.elf iso_root/
-          cp limine.conf iso_root/
-          cp limine/BOOTX64.EFI iso_root/EFI/BOOT/
 
-          xorriso -as mkisofs \
-            -e EFI/BOOT/BOOTX64.EFI \
-            -no-emul-boot \
-            -o obsidia.iso \
-            iso_root
+          # Kernel
+          cp zig-out/bin/kernel.elf iso_root/boot/
+
+          # Config + Limine boot files (docs: limine.conf and limine-bios.sys
+          # must be in root, limine, boot, or boot/limine)
+          cp limine.conf                 iso_root/boot/limine/
+          cp limine/limine-bios.sys      iso_root/boot/limine/
+          cp limine/limine-bios-cd.bin   iso_root/boot/limine/
+          cp limine/limine-uefi-cd.bin   iso_root/boot/limine/
+
+          # UEFI executable
+          cp limine/BOOTX64.EFI          iso_root/EFI/BOOT/
+
+          # Hybrid BIOS+UEFI ISO — Limine's documented xorriso invocation
+          xorriso -as mkisofs -R -r -J \
+            -b boot/limine/limine-bios-cd.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+            -apm-block-size 2048 \
+            --efi-boot boot/limine/limine-uefi-cd.bin \
+            -efi-boot-part --efi-boot-image --protective-msdos-label \
+            iso_root -o obsidia.iso
+
+          # Install the BIOS stage into the ISO (required)
+          ./limine/limine bios-install obsidia.iso
+
+      - name: Verify ISO Boots (UEFI CD)
+        run: |
+          sudo apt-get install -y qemu-system-x86 ovmf
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/OVMF_VARS.fd
+
+          timeout 25 qemu-system-x86_64 \
+            -M q35 -m 512M \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
+            -cdrom obsidia.iso \
+            -chardev stdio,id=char0,logfile=iso-boot.log,signal=off \
+            -serial chardev:char0 \
+            -display none -no-reboot \
+            2>&1 || true
+
+          echo "=== ISO boot log ==="
+          cat iso-boot.log
+          grep -q "BOOT_OK" iso-boot.log
 
       - name: Verify Kernel Boot
         run: |
