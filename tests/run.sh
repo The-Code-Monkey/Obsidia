@@ -109,6 +109,8 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[KBD] Keyboard ready (IRQ1)."               "$p PS/2 keyboard init"
     assert_in "$log" "BOOT_OK"                                    "$p BOOT_OK"
     assert_in "$log" "Reclaiming bootloader-reclaimable memory"   "$p reclaim bootloader memory"
+    assert_in "$log" "APIC @ 0x"                                  "$p ACPI MADT table found"
+    assert_in "$log" "[ACPI] ACPI parsed."                        "$p ACPI parsing complete"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
