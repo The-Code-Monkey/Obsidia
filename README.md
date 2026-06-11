@@ -85,11 +85,14 @@ accelerated):
 ```
 
 > **Machine type & disk:** `run.sh` boots the **i440fx** machine (`-M pc`) rather
-> than q35, and attaches a persistent 64 MiB scratch disk (`obsidia-disk.img`,
-> created on first run, git-ignored) as a legacy IDE drive. The ATA PIO disk
-> driver needs the PIIX3 IDE controller that i440fx provides; q35 has only
-> AHCI/SATA, where the driver finds no disk. The kernel itself boots identically
-> on either machine — only the legacy disk requires `-M pc`.
+> than q35, and attaches a persistent 64 MiB disk (`obsidia-disk.img`, created on
+> first run, git-ignored) as a legacy IDE drive. On first run it's formatted
+> **FAT32** with a couple of sample files, so you can `ls` and `cat` from the
+> shell; its contents persist across reboots. The ATA PIO disk driver needs the
+> PIIX3 IDE controller that i440fx provides; q35 has only AHCI/SATA, where the
+> driver finds no disk. The kernel itself boots identically on either machine —
+> only the legacy disk requires `-M pc`. (`-boot d` forces CD boot, since a FAT32
+> disk carries a 0x55AA signature the BIOS would otherwise try to boot.)
 
 > **OVMF path:** `run.sh` points `-bios` at the combined `/usr/share/ovmf/OVMF.fd`
 > (lowercase dir — the single-file image). The uppercase `/usr/share/OVMF/` dir

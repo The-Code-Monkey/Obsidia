@@ -1,0 +1,368 @@
+// FAT32 filesystem — read-only.
+//
+// FAT32 lays a disk out as: [reserved sectors | FAT(s) | data region]. The very
+// first sector (the "boot sector" / BPB) describes the geometry. Files and
+// directories live in "clusters" (groups of sectors); each cluster points to the
+// next via the File Allocation Table, forming a singly linked chain. A directory
+// is just a file whose data is an array of 32-byte entries.
+//
+// This module mounts a raw FAT32 volume (no partition table — the whole disk is
+// one filesystem), walks paths, lists directories (short 8.3 + long names), and
+// reads file contents. It reads sectors through the ATA PIO driver.
+
+const std = @import("std");
+const serial = @import("../drivers/serial.zig");
+const ata = @import("../drivers/ata.zig");
+
+const SECTOR = 512; // bytes per sector (we only support 512-byte-sector disks)
+const EOC = 0x0FFFFFF8; // FAT entries >= this mark the end of a cluster chain
+const ATTR_DIRECTORY = 0x10; // directory-entry attribute bit
+const ATTR_VOLUME_ID = 0x08; // volume-label entry (skip these)
+const ATTR_LFN = 0x0F; // a "long file name" component entry (RO|HID|SYS|VOL)
+
+// Geometry read from the boot sector, plus the derived first-data-sector.
+const BootInfo = struct {
+    bytes_per_sector: u16,
+    sectors_per_cluster: u8,
+    reserved_sectors: u16,
+    num_fats: u8,
+    fat_size: u32, // sectors per FAT
+    root_cluster: u32,
+    total_sectors: u32,
+    first_data_sector: u32, // where the data region (cluster 2) begins
+};
+
+var bi: BootInfo = undefined;
+var mounted: bool = false;
+
+// One resolved directory entry, handed to scan callbacks. `name` points into a
+// caller-owned stack buffer that is only valid for the duration of the callback.
+const Entry = struct {
+    name: []const u8,
+    first_cluster: u32,
+    size: u32,
+    is_dir: bool,
+};
+
+// A resolved path: which cluster its data starts at, its size, and whether it's
+// a directory. The root directory is {root_cluster, 0, dir}.
+pub const Node = struct {
+    cluster: u32,
+    size: u32,
+    is_dir: bool,
+};
+
+// --- Little-endian field readers --------------------------------------------
+// FAT structures store multi-byte numbers little-endian (low byte first).
+fn rd16(b: []const u8, o: usize) u16 {
+    return @as(u16, b[o]) | (@as(u16, b[o + 1]) << 8);
+}
+fn rd32(b: []const u8, o: usize) u32 {
+    return @as(u32, b[o]) | (@as(u32, b[o + 1]) << 8) |
+        (@as(u32, b[o + 2]) << 16) | (@as(u32, b[o + 3]) << 24);
+}
+
+pub fn isMounted() bool {
+    return mounted;
+}
+
+// --- One-sector FAT cache ----------------------------------------------------
+// Following a cluster chain re-reads the FAT a lot; caching the last FAT sector
+// makes walking a chain that stays within one FAT sector free after the first.
+var fat_cache_sector: u32 = 0xFFFFFFFF; // which FAT sector is cached (invalid = none)
+var fat_cache: [SECTOR]u8 = undefined; // the cached FAT sector bytes
+
+// Look up the next cluster after `cluster` in the chain (or >= EOC at the end).
+fn nextCluster(cluster: u32) u32 {
+    const fat_offset = cluster * 4; // each FAT32 entry is 4 bytes
+    const fat_sector = bi.reserved_sectors + (fat_offset / @as(u32, bi.bytes_per_sector));
+    const entry_offset = fat_offset % @as(u32, bi.bytes_per_sector);
+    if (fat_sector != fat_cache_sector) { // not cached -> fetch it
+        if (!ata.read(fat_sector, 1, &fat_cache)) return EOC; // read error: stop the chain
+        fat_cache_sector = fat_sector;
+    }
+    return rd32(&fat_cache, entry_offset) & 0x0FFFFFFF; // top 4 bits are reserved
+}
+
+// The first LBA sector of a given cluster's data.
+fn clusterToSector(c: u32) u32 {
+    return bi.first_data_sector + (c - 2) * bi.sectors_per_cluster;
+}
+
+// Is `c` a valid in-use data cluster (not free, not end-of-chain, not bad)?
+fn isDataCluster(c: u32) bool {
+    return c >= 2 and c < EOC;
+}
+
+// --- Mount -------------------------------------------------------------------
+// Read and validate the boot sector, then compute the geometry we need. Safe to
+// call with no disk or an unformatted disk: it reports why and returns false.
+pub fn mount() bool {
+    if (!ata.isPresent()) {
+        serial.print("[FAT32] no disk present — nothing to mount.\n", .{});
+        return false;
+    }
+    var bs: [SECTOR]u8 = undefined;
+    if (!ata.read(0, 1, &bs)) {
+        serial.print("[FAT32] failed to read the boot sector.\n", .{});
+        return false;
+    }
+    if (rd16(&bs, 510) != 0xAA55) { // the boot-sector signature every FAT volume has
+        serial.print("[FAT32] no boot signature (disk not formatted FAT?).\n", .{});
+        return false;
+    }
+    bi.bytes_per_sector = rd16(&bs, 11);
+    bi.sectors_per_cluster = bs[13];
+    bi.reserved_sectors = rd16(&bs, 14);
+    bi.num_fats = bs[16];
+    bi.fat_size = rd32(&bs, 36); // BPB_FATSz32
+    bi.root_cluster = rd32(&bs, 44); // BPB_RootClus
+    bi.total_sectors = rd32(&bs, 32); // BPB_TotSec32
+
+    if (bi.bytes_per_sector != SECTOR) {
+        serial.print("[FAT32] unsupported sector size {d} (need 512).\n", .{bi.bytes_per_sector});
+        return false;
+    }
+    if (bi.sectors_per_cluster == 0 or bi.fat_size == 0) {
+        serial.print("[FAT32] not a FAT32 volume (cluster/FAT size zero).\n", .{});
+        return false;
+    }
+    // Data region begins after the reserved sectors and all FAT copies.
+    bi.first_data_sector = bi.reserved_sectors + @as(u32, bi.num_fats) * bi.fat_size;
+    fat_cache_sector = 0xFFFFFFFF; // invalidate the FAT cache for the new volume
+    mounted = true;
+    serial.print("[FAT32] mounted: {d}-byte sectors, {d} sec/cluster, {d} FAT(s), root cluster {d}, data @ sector {d}.\n", .{ bi.bytes_per_sector, bi.sectors_per_cluster, bi.num_fats, bi.root_cluster, bi.first_data_sector });
+    return true;
+}
+
+// --- Directory scanning ------------------------------------------------------
+// Long file names are stored as a run of ATTR_LFN entries that PRECEDE the real
+// 8.3 entry, ordered from the last name-chunk to the first. Each holds 13 UTF-16
+// chars at these (scattered) byte offsets within the 32-byte entry.
+const LFN_OFFSETS = [_]u8{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+
+// Fold one LFN entry's 13 chars into the assembly buffer at its sequenced slot.
+fn accumulateLfn(ent: []const u8, lfn: *[256]u8, lfn_len: *usize) void {
+    const seq = ent[0] & 0x1F; // 1-based position of this chunk in the name
+    if (seq == 0 or seq > 19) return; // ignore odd sequences (cap ~247 chars)
+    const base = (@as(usize, seq) - 1) * 13; // where this chunk's chars start
+    var i: usize = 0;
+    while (i < 13) : (i += 1) {
+        const o = LFN_OFFSETS[i];
+        const ch = @as(u16, ent[o]) | (@as(u16, ent[o + 1]) << 8);
+        if (ch == 0x0000 or ch == 0xFFFF) continue; // name terminator / padding
+        const pos = base + i;
+        if (pos < lfn.len) {
+            lfn[pos] = if (ch < 0x80) @intCast(ch) else '?'; // we only render ASCII
+            if (pos + 1 > lfn_len.*) lfn_len.* = pos + 1;
+        }
+    }
+}
+
+// Render an 8.3 short name ("FOO     TXT") as "FOO.TXT" into `out`. Honors the
+// Windows/NT "lowercase" flags in the reserved byte (offset 0x0C): bit 0x08
+// means the base name is really lowercase, bit 0x10 means the extension is —
+// that's how an all-lowercase name like "docs" is stored without a long-name.
+fn shortName(ent: []const u8, out: *[256]u8) []const u8 {
+    const flags = ent[0x0C];
+    const base_lower = (flags & 0x08) != 0;
+    const ext_lower = (flags & 0x10) != 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < 8 and ent[i] != ' ') : (i += 1) { // base name, stop at padding space
+        out[n] = if (base_lower) std.ascii.toLower(ent[i]) else ent[i];
+        n += 1;
+    }
+    var ext_len: usize = 0; // count non-space extension chars
+    while (ext_len < 3 and ent[8 + ext_len] != ' ') ext_len += 1;
+    if (ext_len > 0) {
+        out[n] = '.';
+        n += 1;
+        var j: usize = 0;
+        while (j < ext_len) : (j += 1) {
+            out[n] = if (ext_lower) std.ascii.toLower(ent[8 + j]) else ent[8 + j];
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+// Walk every entry in the directory chain starting at `start_cluster`, calling
+// `onEntry(ctx, entry)` for each real file/subdirectory. The callback returns
+// true to stop early. LFNs are assembled and used in place of the 8.3 name.
+fn scanDir(start_cluster: u32, ctx: anytype, comptime onEntry: fn (@TypeOf(ctx), Entry) bool) void {
+    var sector: [SECTOR]u8 = undefined; // one directory sector at a time
+    var lfn: [256]u8 = undefined; // assembled long-name buffer
+    var lfn_len: usize = 0; // current assembled long-name length (0 = none)
+    var cluster = start_cluster;
+    while (isDataCluster(cluster)) { // each cluster in the directory's chain
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster) : (s += 1) { // each sector in the cluster
+            if (!ata.read(clusterToSector(cluster) + s, 1, &sector)) return;
+            var e: usize = 0;
+            while (e < SECTOR / 32) : (e += 1) { // 16 entries per 512-byte sector
+                const ent = sector[e * 32 .. e * 32 + 32];
+                const first = ent[0];
+                if (first == 0x00) return; // 0x00 = no entries follow, anywhere
+                if (first == 0xE5) { // deleted entry: drop any pending LFN
+                    lfn_len = 0;
+                    continue;
+                }
+                const attr = ent[0x0B];
+                if (attr == ATTR_LFN) { // part of a long name -> accumulate
+                    accumulateLfn(ent, &lfn, &lfn_len);
+                    continue;
+                }
+                if (attr & ATTR_VOLUME_ID != 0) { // volume label -> not a file
+                    lfn_len = 0;
+                    continue;
+                }
+                // Real 8.3 entry. Use the assembled long name if we have one.
+                var shortbuf: [256]u8 = undefined;
+                const name = if (lfn_len > 0) lfn[0..lfn_len] else shortName(ent, &shortbuf);
+                const fc = (@as(u32, rd16(ent, 0x14)) << 16) | rd16(ent, 0x1A);
+                const entry = Entry{
+                    .name = name,
+                    .first_cluster = fc,
+                    .size = rd32(ent, 0x1C),
+                    .is_dir = (attr & ATTR_DIRECTORY) != 0,
+                };
+                lfn_len = 0; // consume the long name
+                if (onEntry(ctx, entry)) return; // callback asked to stop
+            }
+        }
+        cluster = nextCluster(cluster); // advance to the next directory cluster
+    }
+}
+
+// --- Path resolution ---------------------------------------------------------
+const FindCtx = struct { target: []const u8, result: ?Node = null };
+fn findCallback(ctx: *FindCtx, e: Entry) bool {
+    if (std.ascii.eqlIgnoreCase(e.name, ctx.target)) { // FAT names are case-insensitive
+        ctx.result = .{ .cluster = e.first_cluster, .size = e.size, .is_dir = e.is_dir };
+        return true; // found it — stop scanning
+    }
+    return false;
+}
+
+// Find `name` directly inside the directory at `cluster`.
+fn findInDir(cluster: u32, name: []const u8) ?Node {
+    var ctx = FindCtx{ .target = name };
+    scanDir(cluster, &ctx, findCallback);
+    return ctx.result;
+}
+
+// Resolve an absolute path like "/docs/notes.txt" to a Node, walking each
+// component from the root directory. Returns null if any component is missing.
+pub fn resolve(path: []const u8) ?Node {
+    if (!mounted) return null;
+    var node = Node{ .cluster = bi.root_cluster, .size = 0, .is_dir = true };
+    var it = std.mem.tokenizeScalar(u8, path, '/'); // split on '/', skipping empties
+    while (it.next()) |comp| {
+        if (!node.is_dir) return null; // a path component under a non-directory
+        node = findInDir(node.cluster, comp) orelse return null;
+    }
+    return node;
+}
+
+// --- Public operations -------------------------------------------------------
+const ListCtx = struct {};
+fn listCallback(_: *ListCtx, e: Entry) bool {
+    if (std.mem.eql(u8, e.name, ".") or std.mem.eql(u8, e.name, "..")) return false; // skip self/parent
+    if (e.is_dir) {
+        serial.print("  <DIR>          {s}\n", .{e.name});
+    } else {
+        serial.print("  {d:>10}  {s}\n", .{ e.size, e.name });
+    }
+    return false; // keep listing
+}
+
+// List a directory (or print a single file's size if `path` is a file).
+pub fn ls(path: []const u8) void {
+    if (!mounted) {
+        serial.print("fat32: no filesystem mounted\n", .{});
+        return;
+    }
+    const node = resolve(path) orelse {
+        serial.print("ls: no such path: {s}\n", .{path});
+        return;
+    };
+    if (!node.is_dir) {
+        serial.print("  {d:>10}  {s}\n", .{ node.size, path });
+        return;
+    }
+    var ctx = ListCtx{};
+    scanDir(node.cluster, &ctx, listCallback);
+}
+
+// Stream a file's contents to serial (used by the shell's `cat`).
+pub fn cat(path: []const u8) void {
+    if (!mounted) {
+        serial.print("fat32: no filesystem mounted\n", .{});
+        return;
+    }
+    const node = resolve(path) orelse {
+        serial.print("cat: no such file: {s}\n", .{path});
+        return;
+    };
+    if (node.is_dir) {
+        serial.print("cat: {s} is a directory\n", .{path});
+        return;
+    }
+    var remaining = node.size;
+    var cluster = node.cluster;
+    var buf: [SECTOR]u8 = undefined;
+    while (remaining > 0 and isDataCluster(cluster)) {
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster and remaining > 0) : (s += 1) {
+            if (!ata.read(clusterToSector(cluster) + s, 1, &buf)) return;
+            const n = @min(remaining, @as(u32, bi.bytes_per_sector)); // don't print past EOF
+            serial.print("{s}", .{buf[0..n]});
+            remaining -= n;
+        }
+        cluster = nextCluster(cluster);
+    }
+}
+
+// Read a whole file into `dst` (up to dst.len bytes). Returns the number of
+// bytes read, or null on error / file-too-big-for-buffer. This is the primitive
+// the next milestone (loading an init binary) will build on.
+pub fn readFile(path: []const u8, dst: []u8) ?usize {
+    if (!mounted) return null;
+    const node = resolve(path) orelse return null;
+    if (node.is_dir) return null;
+    if (node.size > dst.len) return null; // caller's buffer is too small
+    var remaining = node.size;
+    var cluster = node.cluster;
+    var written: usize = 0;
+    var buf: [SECTOR]u8 = undefined;
+    while (remaining > 0 and isDataCluster(cluster)) {
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster and remaining > 0) : (s += 1) {
+            if (!ata.read(clusterToSector(cluster) + s, 1, &buf)) return null;
+            const n = @min(remaining, @as(u32, bi.bytes_per_sector));
+            @memcpy(dst[written .. written + n], buf[0..n]);
+            written += n;
+            remaining -= n;
+        }
+        cluster = nextCluster(cluster);
+    }
+    return written;
+}
+
+// --- Boot self-test ----------------------------------------------------------
+// Mount the disk, list the root directory, and read a known file — proving the
+// whole read path end to end. No-op (with a clear log line) if there's no disk
+// or it isn't FAT32, so disk-less boots are unaffected.
+pub fn selfTest() void {
+    serial.print("[FAT32] Filesystem self-test...\n", .{});
+    if (!mount()) {
+        serial.print("[FAT32] self-test skipped (nothing to mount).\n", .{});
+        return;
+    }
+    serial.print("[FAT32]   root directory:\n", .{});
+    ls("/");
+    serial.print("[FAT32]   contents of /HELLO.TXT:\n", .{});
+    cat("/HELLO.TXT");
+    serial.print("[FAT32] self-test complete.\n", .{});
+}

@@ -34,22 +34,29 @@ xorriso -as mkisofs -R -r -J \
 # AHCI/SATA, so our legacy ATA PIO driver wouldn't find a disk there.
 DISK=obsidia-disk.img
 if [ ! -f "$DISK" ]; then
-    echo "Creating $DISK (64 MiB scratch disk)..."
+    echo "Creating $DISK (64 MiB FAT32 disk with sample files)..."
     truncate -s 64M "$DISK"
-    # A human-readable marker at sector 0 so the ATA self-test prints something
-    # recognizable on first boot (the filesystem will overwrite this later).
-    printf 'OBSIDIA_ATA_OK\0\0' | dd of="$DISK" conv=notrunc bs=1 count=16 2>/dev/null
+    # Format FAT32 and seed a few files (mtools only — no root / loop mounts).
+    mformat -i "$DISK" -F -v OBSIDIA ::
+    tmpf=$(mktemp)
+    printf 'Hello from FAT32 on Obsidia!\n'                 > "$tmpf"; mcopy -i "$DISK" "$tmpf" ::/HELLO.TXT
+    mmd -i "$DISK" ::/docs
+    printf 'Files on the FAT32 disk persist across reboots.\n' > "$tmpf"; mcopy -i "$DISK" "$tmpf" ::/docs/NOTES.TXT
+    rm -f "$tmpf"
 fi
 
 echo "Booting Obsidia..."
 # Launch QEMU utilizing KVM and passing the host architecture straight through.
 # -M pc (i440fx) gives us the legacy PIIX3 IDE controller our ATA PIO driver uses.
+# -boot d forces booting the CD-ROM: a FAT32-formatted disk carries a 0x55AA boot
+# signature, so without this the BIOS may try to boot the (OS-less) data disk.
 qemu-system-x86_64 \
     -M pc \
     -enable-kvm \
     -cpu host \
     -m 2G \
     -bios /usr/share/ovmf/OVMF.fd \
+    -boot d \
     -cdrom obsidia.iso \
     -drive file="$DISK",format=raw,if=ide \
     -serial stdio
