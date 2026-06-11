@@ -99,6 +99,19 @@ jobs:
           cat iso-boot.log
           grep -q "BOOT_OK" iso-boot.log
 
+      - name: Verify ISO Boots (Legacy BIOS)
+        run: |
+          timeout 25 qemu-system-x86_64 \
+            -M q35 -m 512M \
+            -cdrom obsidia.iso \
+            -chardev stdio,id=char0,logfile=bios-boot.log,signal=off \
+            -serial chardev:char0 \
+            -display none -no-reboot \
+            2>&1 || true
+          echo "=== BIOS boot log ==="
+          cat bios-boot.log
+          grep -q "BOOT_OK" bios-boot.log
+
       - name: Verify Kernel Boot
         run: |
           sudo apt-get install -y qemu-system-x86 ovmf mtools
