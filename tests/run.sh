@@ -108,6 +108,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[CON] Framebuffer console initialized."     "$p framebuffer console init"
     assert_in "$log" "[KBD] Keyboard ready (IRQ1)."               "$p PS/2 keyboard init"
     assert_in "$log" "BOOT_OK"                                    "$p BOOT_OK"
+    assert_in "$log" "Reclaiming bootloader-reclaimable memory"   "$p reclaim bootloader memory"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

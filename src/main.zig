@@ -3,6 +3,7 @@
 // requests we need, then brings up each subsystem in order, logging as it goes.
 
 const builtin = @import("builtin"); // compile-time target info (CPU arch, etc.)
+const std = @import("std"); // for the panic-handler wiring
 const limine = @import("limine"); // Limine boot-protocol bindings (48cf/limine-zig)
 const serial = @import("drivers/serial.zig"); // COM1 logging
 const gdt = @import("arch/gdt.zig"); // segment descriptors + TSS
@@ -37,6 +38,27 @@ export var paging_mode_request: limine.PagingModeRequest linksection(".limine_re
     .max_mode = .@"4lvl", // never give us 5-level
     .min_mode = .@"4lvl", // never give us less than 4-level
 };
+
+// Custom panic handler. The Zig compiler routes all safety-check panics (index
+// out of bounds, integer overflow in Debug, reaching `unreachable`, `@panic`,
+// etc.) here. Instead of the default trap, we print a clear message + the
+// faulting address to serial (mirrored to the framebuffer) and halt.
+pub const panic = std.debug.FullPanic(kernelPanic);
+
+fn kernelPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold); // tell the optimizer this path is rarely taken
+    asm volatile ("cli"); // no interrupts while we report and stop
+    serial.print("\n==================== KERNEL PANIC ====================\n", .{});
+    serial.print(" {s}\n", .{msg}); // the panic message
+    if (first_trace_addr) |addr| serial.print(" at 0x{x}\n", .{addr}); // where it happened
+    serial.print("=====================================================\n", .{});
+    while (true) asm volatile ("hlt"); // stop forever
+}
+
+// Our own kernel stack. Limine's boot stack lives in bootloader-reclaimable
+// memory, so we switch to this one before reclaiming that memory.
+const KERNEL_STACK_SIZE = 0x10000; // 64 KiB
+var kernel_stack: [KERNEL_STACK_SIZE]u8 align(16) = undefined;
 
 // "Halt and Catch Fire": stop the CPU forever. Used after a fatal error or once
 // initialization is complete and there's nothing left to do.
@@ -134,12 +156,30 @@ export fn _start() noreturn {
     serial.print("BOOT_OK\n", .{}); // the marker our test harness greps for
     serial.print("========================================\n", .{});
 
-    // Hand off to the interactive shell. It enables serial-RX interrupts and
-    // loops forever processing typed commands, so it never returns. We also bring
-    // up the PS/2 keyboard and point it at the shell's input, so commands can be
-    // typed locally (on the framebuffer) as well as over serial.
-    shell.init();
-    keyboard.init();
-    keyboard.setSink(&shell.feed);
-    shell.run();
+    // Switch off Limine's boot stack (which lives in bootloader-reclaimable
+    // memory) onto our own kernel stack, then reclaim that memory and start the
+    // shell. runAfterReclaim never returns, so the old stack is never touched
+    // again and its frames are safe to free.
+    const stack_top = @intFromPtr(&kernel_stack) + kernel_stack.len;
+    asm volatile (
+        \\ movq %[sp], %rsp
+        \\ callq *%[entry]
+        :
+        : [sp] "r" (stack_top), // new stack top (16-byte aligned)
+          [entry] "r" (&runAfterReclaim), // function to run on the new stack
+        : "memory"
+    );
+    unreachable; // runAfterReclaim never returns
+}
+
+// Runs on the kernel-owned stack: reclaim Limine's boot memory, then bring up
+// the PS/2 keyboard and the interactive shell. Never returns. Commands can be
+// typed locally (on the framebuffer) as well as over serial.
+fn runAfterReclaim() callconv(.C) noreturn {
+    pmm.reclaimBootloader(); // safe now: we're off Limine's boot stack
+
+    shell.init(); // enable serial-RX interrupts (IRQ4)
+    keyboard.init(); // enable the PS/2 keyboard (IRQ1)
+    keyboard.setSink(&shell.feed); // route keystrokes into the shell
+    shell.run(); // the command loop (never returns)
 }
