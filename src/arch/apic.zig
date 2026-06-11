@@ -233,3 +233,15 @@ pub fn initTimer(hz: u32) void {
     lapicWrite(TIMER_INIT, count);
     serial.print("[APIC]   PIT retired; LAPIC timer periodic @ {d} Hz (vector {d}).\n", .{ hz, TIMER_VECTOR });
 }
+
+// Pause the LAPIC timer by masking its LVT entry. This stops the periodic timer
+// interrupt — which is the kernel's preemption + timekeeping source — so the
+// system effectively goes quiet (a "full-system sleep"). resumeTimer() reverses
+// it. The init count is left untouched, so the timer picks up where it left off.
+pub fn pauseTimer() void {
+    lapicWrite(LVT_TIMER, lapicRead(LVT_TIMER) | TIMER_MASKED); // set the mask bit
+}
+
+pub fn resumeTimer() void {
+    lapicWrite(LVT_TIMER, lapicRead(LVT_TIMER) & ~@as(u32, TIMER_MASKED)); // clear it
+}

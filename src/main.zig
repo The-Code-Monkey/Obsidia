@@ -198,6 +198,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
 
     scheduler.selfTest(); // demo cooperative kernel-thread context switching
     scheduler.preemptDemo(); // demo timer-driven preemption (threads that never yield)
+    scheduler.blockSleepDemo(); // demo blocking sleep (a thread sleeps, the timer wakes it)
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
@@ -208,7 +209,6 @@ fn runAfterReclaim() callconv(.C) noreturn {
     scheduler.init(); // adopt this context as the idle thread (thread 0)
     scheduler.spawn("shell", &shellThread); // the shell runs as thread 1
     scheduler.startPreemption(); // permanent timer-driven preemption
-    scheduler.startHeartbeat(); // a background thread that blocks/sleeps (thread 2)
     scheduler.idle(); // idle forever; the scheduler runs the shell. never returns
 }
 

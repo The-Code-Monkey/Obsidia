@@ -13,6 +13,7 @@ const pmm = @import("mm/pmm.zig"); // for the `mem` command
 const console = @import("drivers/console.zig"); // to blink the on-screen cursor
 const power = @import("arch/power.zig"); // restart / shutdown
 const scheduler = @import("sched/scheduler.zig"); // for the `ps` command
+const apic = @import("arch/apic.zig"); // pause/resume the timer for `sleep`
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -38,36 +39,45 @@ fn ringPop() ?u8 {
     return c;
 }
 
-// A thread that has hibernated waiting for a keypress (the `sleep` command).
-var input_waiter: ?usize = null;
-
 // Public input sink: push one byte into the shell's input ring. The keyboard
 // driver registers this as its sink, so keystrokes feed the same buffer as
 // serial input. (Both callers are IRQ handlers, which are serialized on a single
 // core, so the single-producer invariant still holds.)
 pub fn feed(c: u8) void {
     ringPush(c);
-    if (input_waiter) |id| { // wake a thread hibernating for a key
-        input_waiter = null;
-        scheduler.wake(id);
-    }
 }
 
-// Block the current thread until any key is pressed (used by `sleep`). The key
-// that wakes us is consumed, not echoed.
-fn waitForKey() void {
-    asm volatile ("cli"); // register + block atomically vs the input IRQ
-    input_waiter = scheduler.currentId();
-    scheduler.block(); // resumes here when feed() wakes us (interrupts still off)
-    input_waiter = null;
+// True if the input ring currently holds no bytes. Reads ring_head atomically
+// since the producer (an IRQ) advances it.
+fn ringEmpty() bool {
+    return ring_tail == @atomicLoad(usize, &ring_head, .acquire);
+}
+
+// Full-system sleep: halt the whole machine until a key is pressed. We mask the
+// LAPIC timer (the kernel's preemption + timekeeping source), so nothing runs —
+// no thread switching, no tick counting — and the CPU deep-halts. Only an input
+// interrupt (keyboard/serial) can wake it. The waking key is consumed, not echoed.
+fn systemSleep() void {
+    asm volatile ("cli"); // set up the sleep atomically vs. input IRQs
+    while (ringPop() != null) {} // drain stale input so we don't wake immediately
+    apic.pauseTimer(); // stop the timer: the whole system goes quiet
+
+    // Sleep until a byte arrives. `sti; hlt` is atomic (no interrupt is taken
+    // between them), so a key that arrives right here can't be lost; the `cli`
+    // after the wakeup re-masks for the next ring check.
+    while (ringEmpty()) {
+        asm volatile ("sti; hlt; cli");
+    }
+
+    apic.resumeTimer(); // timer back -> preemption + timekeeping resume
     asm volatile ("sti");
-    _ = ringPop(); // discard the wake key
+    _ = ringPop(); // discard the key that woke us
 }
 
 // IRQ4 handler: drain everything the UART has buffered into the ring.
 fn onSerialIrq() void {
     while (serial.dataAvailable()) { // while bytes are waiting
-        feed(serial.readByteRaw()); // enqueue (and wake a hibernating thread)
+        feed(serial.readByteRaw()); // enqueue (also clears the IRQ)
     }
 }
 
@@ -268,7 +278,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          sleep (hibernate til keypress), restart, shutdown, crash\n", .{});
+        serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
         serial.print("restarting...\n", .{});
@@ -276,9 +286,9 @@ fn execute(raw: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "shutdown") or std.mem.eql(u8, cmd, "poweroff")) { // power off
         serial.print("shutting down...\n", .{});
         power.shutdown();
-    } else if (std.mem.eql(u8, cmd, "sleep")) { // hibernate until a key is pressed
-        serial.print("hibernating... press any key to wake.\n", .{});
-        waitForKey(); // the shell thread blocks; the heartbeat + idle keep running
+    } else if (std.mem.eql(u8, cmd, "sleep")) { // full-system sleep until a keypress
+        serial.print("system sleep... press a key to wake.\n", .{});
+        systemSleep(); // halt the whole machine (timer off) until input arrives
         serial.print("awake.\n", .{});
     } else if (std.mem.eql(u8, cmd, "history")) { // list recent commands
         var k = hist_size;

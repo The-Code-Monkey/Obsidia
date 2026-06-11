@@ -289,17 +289,21 @@ pub fn dump() void {
     }
 }
 
-// --- A background thread demonstrating blocking sleep ------------------------
-var beats: u64 = 0;
-fn heartbeat() void {
-    while (true) {
-        sleep(300); // blocked for ~3 s — the CPU runs other threads / halts
-        beats += 1;
-        serial.print("[SCHED]   heartbeat: beat {d} (slept, did not busy-wait)\n", .{beats});
-    }
+// --- One-shot blocking-sleep self-test ---------------------------------------
+fn sleepWorker() void {
+    sleep(20); // block for ~200 ms (the timer wakes us; we don't busy-wait)
+    serial.print("[SCHED]   blocking-sleep self-test: slept, woke OK (no busy-wait).\n", .{});
+    // returns -> threadExit
 }
 
-// Spawn the heartbeat thread (call after startPreemption is set up).
-pub fn startHeartbeat() void {
-    spawn("heartbeat", &heartbeat);
+pub fn blockSleepDemo() void {
+    serial.print("[SCHED] Blocking-sleep self-test...\n", .{});
+    setupMain();
+    spawn("sleeper", &sleepWorker);
+    preempting = true;
+    pic.on_tick = &tick; // the timer wakes sleepers
+    while (aliveCount() > 0) {} // main waits; the sleeper blocks then wakes + exits
+    pic.on_tick = null;
+    preempting = false;
+    serial.print("[SCHED] Blocking-sleep self-test complete.\n", .{});
 }
