@@ -155,7 +155,7 @@ echo "== ATA PIO disk (i440fx / -M pc) =="
 ATADISK="$TMP/ata.img"
 truncate -s 16M "$ATADISK"
 printf 'OBSIDIA_ATA_OK\0\0' | dd of="$ATADISK" conv=notrunc bs=1 count=16 2>/dev/null
-timeout 15 qemu-system-x86_64 -M pc -m 512M -cdrom "$ISO" \
+timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
     -drive file="$ATADISK",format=raw,if=ide \
     -serial "file:$TMP/ata.log" -display none -no-reboot >/dev/null 2>&1 || true
 assert_in "$TMP/ata.log" "primary master present: 32768 sectors" "ATA: detects disk size via IDENTIFY (16 MiB)"
@@ -164,6 +164,34 @@ assert_in "$TMP/ata.log" "self-test: read LBA 0 OK"              "ATA: PIO secto
 # And confirm a disk-less boot stays graceful (the q35 BIOS marker boot has no
 # disk attached, so the driver must report "no disk" there and still reach BOOT_OK).
 assert_in "$TMP/bios.log" "no device (floating bus" "ATA: disk-less boot reports no disk and continues"
+
+# --- FAT32 filesystem (read-only) --------------------------------------------
+# Format a FAT32 disk (mtools only — no root needed), seed known files including
+# a subdirectory and a long-name file, then boot and drive `ls`/`cat` to confirm
+# the kernel mounts it, lists directories (8.3 + LFN), and reads file contents.
+# -boot d forces CD boot since a FAT32 disk carries a 0x55AA boot signature.
+echo "== FAT32 filesystem (read-only, -M pc) =="
+FATDISK="$TMP/fat.img"
+truncate -s 64M "$FATDISK"
+mformat -i "$FATDISK" -F -v OBSIDIA :: 2>/dev/null
+fattmp=$(mktemp)
+printf 'Hello from FAT32 on Obsidia!\n' > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/HELLO.TXT
+mmd -i "$FATDISK" ::/docs 2>/dev/null
+printf 'nested file contents ok\n'      > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/docs/NOTES.TXT
+printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" "::/a-long-filename.txt"
+rm -f "$fattmp"
+( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
+  printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 1 ) \
+    | timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+      -drive file="$FATDISK",format=raw,if=ide \
+      -chardev stdio,id=c0,logfile="$TMP/fat.log",signal=off -serial chardev:c0 \
+      -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/fat.log" "[FAT32] mounted:"                "FAT32: mounts the volume (reads the BPB)"
+assert_in "$TMP/fat.log" "HELLO.TXT"                       "FAT32: lists root directory (8.3 name)"
+assert_in "$TMP/fat.log" "a-long-filename.txt"             "FAT32: assembles long file names (LFN)"
+assert_in "$TMP/fat.log" "Hello from FAT32 on Obsidia!"    "FAT32: reads a file's contents (cat)"
+assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a nested path (/docs/notes.txt)"
+assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
 
 # --- Shell interaction -------------------------------------------------------
 echo "== Shell commands =="

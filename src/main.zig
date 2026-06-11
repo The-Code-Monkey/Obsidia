@@ -16,6 +16,7 @@ const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
 const console = @import("drivers/console.zig"); // on-screen framebuffer text console
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
+const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
 const shell = @import("shell.zig"); // interactive serial command shell
@@ -176,6 +177,9 @@ export fn _start() noreturn {
     // reports "no disk" and the kernel carries on.
     ata.init();
     ata.selfTest();
+
+    // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
+    fat32.selfTest();
 
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
     serial.print("BOOT_OK\n", .{}); // the marker our test harness greps for
