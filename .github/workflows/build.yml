@@ -37,19 +37,6 @@ jobs:
       - name: Build Zig Kernel
         run: zig build
 
-      # - name: Assemble Bootable ISO
-      #   run: |
-      #     mkdir -p iso_root/EFI/BOOT
-      #     cp zig-out/bin/kernel.elf iso_root/
-      #     cp limine.conf iso_root/
-      #     cp limine/BOOTX64.EFI iso_root/EFI/BOOT/
-
-      #     xorriso -as mkisofs \
-      #       -e EFI/BOOT/BOOTX64.EFI \
-      #       -no-emul-boot \
-      #       -o obsidia.iso \
-      #       iso_root
-
       - name: Assemble Bootable ISO
         run: |
           mkdir -p iso_root/boot/limine
@@ -111,44 +98,6 @@ jobs:
           echo "=== BIOS boot log ==="
           cat bios-boot.log
           grep -q "BOOT_OK" bios-boot.log
-
-      - name: Verify Kernel Boot
-        run: |
-          sudo apt-get install -y qemu-system-x86 ovmf mtools
-
-          dd if=/dev/zero of=boot.img bs=1M count=64
-          mformat -i boot.img -F ::
-          mmd -i boot.img ::/EFI
-          mmd -i boot.img ::/EFI/BOOT
-          mmd -i boot.img ::/boot
-          mcopy -i boot.img limine/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-          mcopy -i boot.img limine.conf ::/limine.conf
-          mcopy -i boot.img zig-out/bin/kernel.elf ::/boot/kernel.elf
-
-          cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/OVMF_VARS.fd
-
-          timeout 25 qemu-system-x86_64 \
-            -M q35 -m 512M \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
-            -drive id=boot,file=boot.img,format=raw,if=none \
-            -device qemu-xhci \
-            -device usb-storage,drive=boot,bootindex=0 \
-            -chardev stdio,id=char0,logfile=boot.log,signal=off \
-            -serial chardev:char0 \
-            -display none \
-            -no-reboot \
-            2>&1 || true
-
-          echo "=== Boot log ==="
-          cat boot.log
-
-          if grep -q "BOOT_OK" boot.log; then
-            echo "✅ Kernel booted and reached stable state."
-          else
-            echo "::error::BOOT_OK not found — kernel did not boot cleanly."
-            exit 1
-          fi
 
       - name: Upload boot log
         if: always()
