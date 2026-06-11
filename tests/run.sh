@@ -118,6 +118,9 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "B: iteration 3"                             "$p scheduler round-robin (threads interleave)"
     assert_in "$log" "back in main; all threads finished"         "$p scheduler returns to main"
     assert_in "$log" "Scheduler self-test complete."              "$p cooperative context switching"
+    assert_in "$log" "preempt P1: finished"                      "$p preemption: worker P1 ran without yielding"
+    assert_in "$log" "preempt P2: finished"                      "$p preemption: worker P2 ran without yielding"
+    assert_in "$log" "Preemptive demo complete."                 "$p timer-driven preemption"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

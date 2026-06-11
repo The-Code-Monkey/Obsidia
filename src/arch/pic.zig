@@ -127,6 +127,9 @@ fn pitInit(hz: u32) void {
 
 var tick_count: u64 = 0; // total timer interrupts seen since boot
 
+// Optional per-tick hook (the scheduler sets this to preempt on each timer IRQ).
+pub var on_tick: ?*const fn () void = null;
+
 // Public accessor so other code can read uptime in ticks. Atomic load so a
 // busy-wait reader (e.g. the LAPIC-timer calibration) sees the IRQ's updates and
 // the compiler can't hoist the read out of a spin loop.
@@ -139,6 +142,7 @@ pub fn ticks() u64 {
 // command and the cursor blink read this counter.
 fn timerTick() void {
     _ = @atomicRmw(u64, &tick_count, .Add, 1, .monotonic); // one more tick
+    if (on_tick) |f| f(); // optional preemption hook (runs in IRQ context)
 }
 
 // --- IRQ dispatch ------------------------------------------------------------
@@ -167,13 +171,17 @@ pub fn handleIrq(vector: u8) void {
         return;
     }
 
+    // Acknowledge BEFORE running the handler. Our IRQs are edge-triggered (the
+    // device data persists until read), and crucially the timer handler may
+    // context-switch away — so the EOI must already be sent, or the controller
+    // wouldn't deliver the next interrupt to the thread we switch to.
+    eoi(irq);
+
     if (handlers[irq]) |h| { // do we have a handler?
-        h(); // run it
+        h(); // run it (may not return here if it preempts us)
     } else {
         serial.print("[PIC] Unhandled IRQ{d} (vector {d}).\n", .{ irq, vector });
     }
-
-    eoi(irq); // tell the PIC we're done so it can deliver the next one
 }
 
 // --- Init --------------------------------------------------------------------

@@ -197,6 +197,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     pmm.reclaimBootloader(); // safe now: we're off Limine's boot stack
 
     scheduler.selfTest(); // demo cooperative kernel-thread context switching
+    scheduler.preemptDemo(); // demo timer-driven preemption (threads that never yield)
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)

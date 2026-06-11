@@ -10,6 +10,7 @@
 
 const serial = @import("../drivers/serial.zig");
 const heap = @import("../mm/heap.zig");
+const pic = @import("../arch/pic.zig"); // timer tick hook + tick counter
 
 const STACK_SIZE = 16 * 1024; // 16 KiB per thread
 const MAX_THREADS = 16;
@@ -50,12 +51,19 @@ const Thread = struct {
     stack: []u8, // the thread's kernel stack (empty for the main thread)
     state: State,
     name: []const u8,
+    entry: *const fn () void = undefined, // the function the thread runs
 };
 
 var threads: [MAX_THREADS]Thread = undefined;
 var thread_count: usize = 0;
 var current: usize = 0; // index of the running thread
-var alive: usize = 0; // number of non-finished worker threads
+var alive: usize = 0; // number of non-finished worker threads (atomic)
+var preempting: bool = false; // true while timer-driven preemption is enabled
+
+// Atomic accessor for `alive` so a busy-wait reader sees worker updates.
+pub fn aliveCount() usize {
+    return @atomicLoad(usize, &alive, .monotonic);
+}
 
 // Adopt the current (boot) context as thread 0. Its rsp gets filled in by the
 // first switchContext that leaves it.
@@ -80,13 +88,21 @@ fn spawn(name: []const u8, func: *const fn () void) void {
     // (top - 8), i.e. 8 mod 16 — the alignment the ABI expects at a call entry.
     const top = (@intFromPtr(stack.ptr) + stack.len) & ~@as(usize, 0xF);
     var sp: usize = top;
-    push(&sp, @intFromPtr(&threadExit)); // where func returns to if it returns
-    push(&sp, @intFromPtr(func)); // switchContext's `ret` jumps here
+    push(&sp, @intFromPtr(&threadExit)); // where the thread lands if it returns
+    push(&sp, @intFromPtr(&threadStart)); // switchContext's `ret` enters the trampoline
     for (0..6) |_| push(&sp, 0); // saved rbp, rbx, r12, r13, r14, r15
 
-    threads[thread_count] = .{ .rsp = sp, .stack = stack, .state = .ready, .name = name };
+    threads[thread_count] = .{ .rsp = sp, .stack = stack, .state = .ready, .name = name, .entry = func };
     thread_count += 1;
-    alive += 1;
+    _ = @atomicRmw(usize, &alive, .Add, 1, .monotonic);
+}
+
+// First thing a new thread runs: enable interrupts (so it's preemptible — a
+// preemptive switch enters here with interrupts masked), then call its function.
+// If the function returns, we fall through to threadExit (the address above us).
+fn threadStart() void {
+    asm volatile ("sti"); // become preemptible
+    threads[current].entry(); // run the thread's body
 }
 
 // Push a value onto a hand-built stack (grows down).
@@ -115,8 +131,11 @@ pub fn yield() void {
 // Where a thread lands if its entry function returns: mark it finished and yield
 // away forever (a finished thread is never switched back to).
 fn threadExit() noreturn {
+    // When preempting, mask interrupts so a timer tick can't preempt us mid-exit
+    // (the thread we switch to restores its own interrupt flag via iretq/sti).
+    if (preempting) asm volatile ("cli");
     threads[current].state = .finished;
-    alive -= 1;
+    _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic);
     yield();
     unreachable;
 }
@@ -139,7 +158,38 @@ pub fn selfTest() void {
     spawn("A", &worker);
     spawn("B", &worker);
     serial.print("[SCHED]   spawned 2 threads; running round-robin...\n", .{});
-    while (alive > 0) yield(); // run the workers to completion
+    while (aliveCount() > 0) yield(); // run the workers to completion
     serial.print("[SCHED]   back in main; all threads finished.\n", .{});
     serial.print("[SCHED] Scheduler self-test complete.\n", .{});
+}
+
+// --- Preemptive demo: workers that NEVER yield, switched only by the timer ----
+fn pworker() void {
+    const name = threads[current].name; // "P1" or "P2"
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        const target = pic.ticks() + 20; // ~200 ms; busy-wait, NO yield
+        while (pic.ticks() < target) {} // the timer preempts us out of this loop
+        // Print atomically (serial is slow; masking avoids preemption mid-line).
+        asm volatile ("cli");
+        serial.print("[SCHED]   preempt {s}: round {d}\n", .{ name, round });
+        asm volatile ("sti");
+    }
+    asm volatile ("cli");
+    serial.print("[SCHED]   preempt {s}: finished (never called yield)\n", .{name});
+    asm volatile ("sti");
+}
+
+pub fn preemptDemo() void {
+    serial.print("[SCHED] Preemptive scheduler demo (timer-driven)...\n", .{});
+    setupMain(); // reset: adopt the current context as thread 0
+    spawn("P1", &pworker);
+    spawn("P2", &pworker);
+    preempting = true;
+    pic.on_tick = &yield; // each timer tick now preempts to the next thread
+    serial.print("[SCHED]   preemption ON; 2 workers busy-loop without yielding.\n", .{});
+    while (aliveCount() > 0) {} // main busy-waits; the timer schedules the workers
+    pic.on_tick = null; // stop preempting
+    preempting = false;
+    serial.print("[SCHED] Preemptive demo complete.\n", .{});
 }
