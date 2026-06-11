@@ -48,9 +48,35 @@ pub fn clearMask(irq: u8) void {
     serial.outb(port, serial.inb(port) & ~bit); // clear the bit (unmask = enable)
 }
 
+// --- APIC takeover hooks -----------------------------------------------------
+// When the APIC driver takes over, it sets these so our dispatch acknowledges
+// interrupts at the LAPIC and unmasks them at the I/O APIC instead of the PIC.
+// (Hooks rather than an import, to avoid a pic<->apic dependency cycle.)
+pub var eoi_hook: ?*const fn () void = null; // LAPIC EOI
+pub var route_hook: ?*const fn (u8) void = null; // I/O APIC unmask/route
+
+// Fully mask the PIC (used by the APIC driver to retire it).
+pub fn disable() void {
+    serial.outb(MASTER_DATA, 0xFF);
+    serial.outb(SLAVE_DATA, 0xFF);
+}
+
+// Re-route every already-registered IRQ through the new route_hook (the APIC).
+pub fn rerouteRegistered() void {
+    for (handlers, 0..) |h, i| {
+        if (h != null) {
+            if (route_hook) |f| f(@intCast(i));
+        }
+    }
+}
+
 // --- End of interrupt --------------------------------------------------------
 // The PIC won't deliver another IRQ on a line until it gets an EOI.
 fn eoi(irq: u8) void {
+    if (eoi_hook) |f| { // APIC active -> EOI goes to the LAPIC
+        f();
+        return;
+    }
     if (irq >= 8) serial.outb(SLAVE_CMD, EOI); // slave first for IRQ8-15
     serial.outb(MASTER_CMD, EOI); // always EOI the master
 }
@@ -117,10 +143,11 @@ fn timerTick() void {
 const IrqHandler = *const fn () void; // a handler is just a function pointer
 var handlers: [16]?IrqHandler = [_]?IrqHandler{null} ** 16; // one slot per IRQ line
 
-// Register a handler for an IRQ line and unmask it.
+// Register a handler for an IRQ line and unmask it. With the APIC active, the
+// unmask happens at the I/O APIC (route_hook); otherwise at the PIC.
 pub fn register(irq: u4, handler: IrqHandler) void {
     handlers[irq] = handler; // remember the handler
-    clearMask(irq); // and let the IRQ through
+    if (route_hook) |f| f(irq) else clearMask(irq); // let the IRQ through
 }
 
 // Called by the IDT for vectors 32-47. Handles spurious IRQs correctly, then

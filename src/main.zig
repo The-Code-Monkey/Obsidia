@@ -9,6 +9,7 @@ const serial = @import("drivers/serial.zig"); // COM1 logging
 const gdt = @import("arch/gdt.zig"); // segment descriptors + TSS
 const idt = @import("arch/idt.zig"); // interrupt/exception handlers
 const pic = @import("arch/pic.zig"); // legacy interrupt controller + timer
+const apic = @import("arch/apic.zig"); // modern interrupt controller (LAPIC + IO APIC)
 const pmm = @import("mm/pmm.zig"); // physical frame allocator
 const vmm = @import("mm/vmm.zig"); // page tables / virtual memory
 const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
@@ -160,8 +161,10 @@ export fn _start() noreturn {
     // memory and survive). The parsed data feeds the APIC driver next.
     if (rsdp_request.response) |r| {
         acpi.init(r.address); // r.address is the RSDP's physical address
+        // Retire the 8259 PIC and route interrupts through the LAPIC + I/O APIC.
+        apic.init();
     } else {
-        serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable)\n", .{});
+        serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable, staying on PIC)\n", .{});
     }
 
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});

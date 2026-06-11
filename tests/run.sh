@@ -111,6 +111,9 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "Reclaiming bootloader-reclaimable memory"   "$p reclaim bootloader memory"
     assert_in "$log" "APIC @ 0x"                                  "$p ACPI MADT table found"
     assert_in "$log" "[ACPI] ACPI parsed."                        "$p ACPI parsing complete"
+    assert_in "$log" "8259 PIC disabled."                         "$p PIC retired"
+    assert_in "$log" "IRQ0 -> GSI"                                "$p APIC routes timer via I/O APIC"
+    assert_in "$log" "[APIC] APIC initialized."                   "$p APIC initialized"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

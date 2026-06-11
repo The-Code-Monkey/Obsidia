@@ -254,8 +254,10 @@ export fn isrHandler(frame: *InterruptFrame) callconv(.C) void {
         serial.print(" Unrecoverable exception — halting.\n", .{});
         hang();
     } else if (frame.vector >= 32 and frame.vector <= 47) {
-        // Hardware IRQ from the (remapped) PIC: dispatch + EOI.
+        // Hardware IRQ from the (remapped) PIC / I/O APIC: dispatch + EOI.
         pic.handleIrq(@intCast(frame.vector));
+    } else if (frame.vector == 0xFF) {
+        // LAPIC spurious interrupt: by definition it needs no handler and no EOI.
     } else {
         // Any other software interrupt: just log it.
         serial.print("[IDT] Unhandled interrupt vector {d}\n", .{frame.vector & 0xFF});
