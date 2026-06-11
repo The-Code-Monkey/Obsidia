@@ -48,4 +48,3 @@ export fn _start() noreturn {
 
     hcf();
 }
-}
