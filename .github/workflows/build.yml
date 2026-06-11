@@ -75,11 +75,16 @@ jobs:
             -chardev stdio,id=char0,logfile=boot.log,signal=off \
             -serial chardev:char0 \
             -display none \
-            -no-reboot \
+            -no-reboot -no-shutdown \
+            -d int,cpu_reset -D qemu-debug.log \
             2>&1 || true
 
-          echo "=== boot.log ==="
+          echo "=== SERIAL (boot.log) ==="
           cat boot.log
+          echo ""
+          echo "=== QEMU DEBUG (qemu-debug.log, last 80 lines) ==="
+          tail -n 80 qemu-debug.log
+          echo ""
           grep -q "BOOT_OK" boot.log
 
       - name: Upload boot log
