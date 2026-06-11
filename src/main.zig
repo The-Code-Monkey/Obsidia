@@ -208,6 +208,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     scheduler.init(); // adopt this context as the idle thread (thread 0)
     scheduler.spawn("shell", &shellThread); // the shell runs as thread 1
     scheduler.startPreemption(); // permanent timer-driven preemption
+    scheduler.startHeartbeat(); // a background thread that blocks/sleeps (thread 2)
     scheduler.idle(); // idle forever; the scheduler runs the shell. never returns
 }
 

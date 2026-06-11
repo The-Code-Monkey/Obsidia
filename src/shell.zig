@@ -38,18 +38,36 @@ fn ringPop() ?u8 {
     return c;
 }
 
+// A thread that has hibernated waiting for a keypress (the `sleep` command).
+var input_waiter: ?usize = null;
+
 // Public input sink: push one byte into the shell's input ring. The keyboard
 // driver registers this as its sink, so keystrokes feed the same buffer as
 // serial input. (Both callers are IRQ handlers, which are serialized on a single
 // core, so the single-producer invariant still holds.)
 pub fn feed(c: u8) void {
     ringPush(c);
+    if (input_waiter) |id| { // wake a thread hibernating for a key
+        input_waiter = null;
+        scheduler.wake(id);
+    }
+}
+
+// Block the current thread until any key is pressed (used by `sleep`). The key
+// that wakes us is consumed, not echoed.
+fn waitForKey() void {
+    asm volatile ("cli"); // register + block atomically vs the input IRQ
+    input_waiter = scheduler.currentId();
+    scheduler.block(); // resumes here when feed() wakes us (interrupts still off)
+    input_waiter = null;
+    asm volatile ("sti");
+    _ = ringPop(); // discard the wake key
 }
 
 // IRQ4 handler: drain everything the UART has buffered into the ring.
 fn onSerialIrq() void {
     while (serial.dataAvailable()) { // while bytes are waiting
-        ringPush(serial.readByteRaw()); // read + enqueue (also clears the IRQ)
+        feed(serial.readByteRaw()); // enqueue (and wake a hibernating thread)
     }
 }
 
@@ -250,7 +268,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          sleep [secs], restart, shutdown, crash\n", .{});
+        serial.print("          sleep (hibernate til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
         serial.print("restarting...\n", .{});
@@ -258,12 +276,9 @@ fn execute(raw: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "shutdown") or std.mem.eql(u8, cmd, "poweroff")) { // power off
         serial.print("shutting down...\n", .{});
         power.shutdown();
-    } else if (std.mem.eql(u8, cmd, "sleep")) { // low-power halt for N seconds
-        const secs = std.fmt.parseInt(u64, args, 10) catch 1; // default 1s
-        const capped = if (secs > 3600) 3600 else secs; // clamp to an hour
-        serial.print("sleeping for {d}s (low-power halt)...\n", .{capped});
-        const target = pic.ticks() + capped * 100; // 100 Hz timer
-        while (pic.ticks() < target) asm volatile ("hlt"); // wake each tick to re-check
+    } else if (std.mem.eql(u8, cmd, "sleep")) { // hibernate until a key is pressed
+        serial.print("hibernating... press any key to wake.\n", .{});
+        waitForKey(); // the shell thread blocks; the heartbeat + idle keep running
         serial.print("awake.\n", .{});
     } else if (std.mem.eql(u8, cmd, "history")) { // list recent commands
         var k = hist_size;

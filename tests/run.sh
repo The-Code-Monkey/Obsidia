@@ -121,6 +121,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "preempt P1: finished"                      "$p preemption: worker P1 ran without yielding"
     assert_in "$log" "preempt P2: finished"                      "$p preemption: worker P2 ran without yielding"
     assert_in "$log" "Preemptive demo complete."                 "$p timer-driven preemption"
+    assert_in "$log" "heartbeat: beat"                           "$p background thread blocking sleep (wakes)"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
@@ -155,6 +156,7 @@ assert_in "$TMP/shell.log" "test123"                      "shell: echo"
 assert_in "$TMP/shell.log" "unknown command: bogus"       "shell: unknown command"
 assert_in "$TMP/shell.log" "running    shell"             "shell runs as a scheduled thread (ps)"
 assert_in "$TMP/shell.log" "ready      idle"              "ps lists the idle thread"
+assert_in "$TMP/shell.log" "heartbeat"                    "ps lists the background heartbeat thread"
 
 # --- History recall (Up arrow re-runs a command) -----------------------------
 echo "== Shell history (Up arrow) =="
@@ -163,11 +165,19 @@ boot_shell "$TMP/hist.log" 512M 'echo zqx\r\x1b[A\r'
 runs=$(tr -d '\r' < "$TMP/hist.log" | grep -c '^zqx$')
 if [ "$runs" -ge 2 ]; then ok "history: Up arrow recalled + re-ran command (zqx printed ${runs}x)"; else bad "history: recall (zqx printed ${runs}x, expected >=2)"; fi
 
+# --- Hibernate (sleep) -------------------------------------------------------
+echo "== Hibernate (sleep) =="
+# `sleep` hibernates the shell thread until a key is pressed. The wake key must
+# arrive AFTER it has hibernated, so it can't be part of one input burst.
+( sleep "$BOOT_WAIT"; printf 'sleep\r'; sleep 1.5; printf 'w'; sleep 1 ) \
+    | timeout 15 qemu-system-x86_64 -M q35 -m 512M -cdrom "$ISO" \
+      -chardev stdio,id=c0,logfile="$TMP/sleep.log",signal=off -serial chardev:c0 \
+      -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/sleep.log" "hibernating" "sleep: hibernates the shell thread"
+assert_in "$TMP/sleep.log" "awake."      "sleep: a keypress wakes it"
+
 # --- Power commands ----------------------------------------------------------
 echo "== Power commands =="
-# sleep: a 1-second low-power halt that then resumes the shell.
-boot_shell "$TMP/sleep.log" 512M 'sleep 1\r'
-assert_in "$TMP/sleep.log" "awake." "sleep: low-power halt resumes"
 
 # shutdown: QEMU should power off (qemu exits cleanly, not killed by timeout=124).
 ( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 15 qemu-system-x86_64 \
