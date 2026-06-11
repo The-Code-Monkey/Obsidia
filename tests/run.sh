@@ -114,6 +114,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "8259 PIC disabled."                         "$p PIC retired"
     assert_in "$log" "IRQ0 -> GSI"                                "$p APIC routes timer via I/O APIC"
     assert_in "$log" "[APIC] APIC initialized."                   "$p APIC initialized"
+    assert_in "$log" "PIT retired; LAPIC timer periodic"          "$p LAPIC timer (PIT retired)"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

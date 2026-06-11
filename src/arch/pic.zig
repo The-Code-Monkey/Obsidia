@@ -127,16 +127,18 @@ fn pitInit(hz: u32) void {
 
 var tick_count: u64 = 0; // total timer interrupts seen since boot
 
-// Public accessor so other code can read uptime in ticks.
+// Public accessor so other code can read uptime in ticks. Atomic load so a
+// busy-wait reader (e.g. the LAPIC-timer calibration) sees the IRQ's updates and
+// the compiler can't hoist the read out of a spin loop.
 pub fn ticks() u64 {
-    return tick_count;
+    return @atomicLoad(u64, &tick_count, .monotonic);
 }
 
-// The IRQ0 handler: just count the tick. (We used to log once per second to
-// prove interrupts fire, but that would spam the shell prompt; the `uptime`
-// command reads this counter instead.)
+// The timer-IRQ handler: just count the tick. (Originally driven by the PIT on
+// IRQ0; once the LAPIC timer is calibrated it drives this instead.) The `uptime`
+// command and the cursor blink read this counter.
 fn timerTick() void {
-    tick_count += 1; // one more 10 ms tick
+    _ = @atomicRmw(u64, &tick_count, .Add, 1, .monotonic); // one more tick
 }
 
 // --- IRQ dispatch ------------------------------------------------------------
