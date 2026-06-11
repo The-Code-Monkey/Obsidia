@@ -11,6 +11,7 @@
 const serial = @import("../drivers/serial.zig");
 const heap = @import("../mm/heap.zig");
 const pic = @import("../arch/pic.zig"); // timer tick hook + tick counter
+const sync = @import("sync.zig"); // honor the print lock (don't switch mid-print)
 
 const STACK_SIZE = 32 * 1024; // 32 KiB per thread (the shell uses std.fmt etc.)
 const MAX_THREADS = 16;
@@ -44,7 +45,7 @@ comptime {
     );
 }
 
-const State = enum { ready, running, finished };
+const State = enum { ready, running, finished, blocked };
 
 const Thread = struct {
     rsp: u64, // saved stack pointer (points at the saved context)
@@ -52,6 +53,7 @@ const Thread = struct {
     state: State,
     name: []const u8,
     entry: *const fn () void = undefined, // the function the thread runs
+    wake_tick: u64 = 0, // if sleeping, the tick at which to wake (0 = not sleeping)
 };
 
 var threads: [MAX_THREADS]Thread = undefined;
@@ -111,8 +113,20 @@ fn push(sp: *usize, value: usize) void {
     @as(*usize, @ptrFromInt(sp.*)).* = value;
 }
 
-// Voluntarily give up the CPU to the next ready thread (round-robin).
+// Switch to the next ready thread (round-robin). Interrupt-flag-aware: it
+// captures the caller's IF, masks interrupts across the switch (so the thread
+// table isn't touched re-entrantly), and restores IF when this thread resumes.
+// This lets blocking code (sleep/mutex) call yield cooperatively while
+// preemption is on; it's also safe when called from the timer IRQ (IF already 0).
 pub fn yield() void {
+    var flags: u64 = undefined;
+    asm volatile ("pushfq; popq %[f]; cli"
+        : [f] "=r" (flags),
+        :
+        : "memory"
+    );
+    const if_was = (flags & 0x200) != 0; // bit 9 = interrupt-enable flag
+
     const prev = current;
     var i: usize = 1;
     while (i <= thread_count) : (i += 1) {
@@ -122,10 +136,57 @@ pub fn yield() void {
             threads[cand].state = .running;
             current = cand;
             switchContext(&threads[prev].rsp, threads[cand].rsp);
-            return; // resumes here when we're switched back to
+            break; // resumes here when we're switched back to
         }
     }
-    // No other ready thread: keep running prev.
+    // If only the current thread is ready we keep running it; either way restore
+    // the interrupt flag we came in with.
+    if (if_was) asm volatile ("sti");
+}
+
+// The timer-tick hook: wake any sleepers whose deadline has passed, then preempt
+// (unless the print lock forbids switching right now). Runs in the timer IRQ.
+fn tick() void {
+    const now = pic.ticks();
+    for (threads[0..thread_count]) |*t| {
+        if (t.state == .blocked and t.wake_tick != 0 and now >= t.wake_tick) {
+            t.state = .ready; // its sleep is over
+            t.wake_tick = 0;
+        }
+    }
+    if (!sync.preemptDisabled()) yield(); // don't switch mid-print
+}
+
+// Block the current thread for `ticks` timer ticks (100 Hz). It gives up the CPU
+// entirely (the idle thread / other threads run) and the timer wakes it.
+pub fn sleep(ticks: u64) void {
+    asm volatile ("cli"); // set our wake time + state atomically vs the timer
+    threads[current].wake_tick = pic.ticks() + ticks;
+    threads[current].state = .blocked;
+    yield(); // switch away (IF is 0, so yield won't re-enable); we resume when woken
+    asm volatile ("sti"); // back on the CPU; re-enable interrupts
+}
+
+// The running thread's id (e.g. so it can register itself to be woken later).
+pub fn currentId() usize {
+    return current;
+}
+
+// Block the current thread indefinitely until wake() is called on it (event
+// wait — e.g. hibernating until a key is pressed). The caller MUST hold
+// interrupts disabled so the wakeup can't be lost between deciding to block and
+// blocking; on resume interrupts are still disabled and the caller re-enables.
+pub fn block() void {
+    threads[current].state = .blocked;
+    yield();
+}
+
+// Make a blocked thread runnable again. Safe to call from interrupt context.
+pub fn wake(id: usize) void {
+    if (id < thread_count and threads[id].state == .blocked) {
+        threads[id].state = .ready;
+        threads[id].wake_tick = 0;
+    }
 }
 
 // Where a thread lands if its entry function returns: mark it finished and yield
@@ -186,7 +247,7 @@ pub fn preemptDemo() void {
     spawn("P1", &pworker);
     spawn("P2", &pworker);
     preempting = true;
-    pic.on_tick = &yield; // each timer tick now preempts to the next thread
+    pic.on_tick = &tick; // each timer tick now preempts to the next thread
     serial.print("[SCHED]   preemption ON; 2 workers busy-loop without yielding.\n", .{});
     while (aliveCount() > 0) {} // main busy-waits; the timer schedules the workers
     pic.on_tick = null; // stop preempting
@@ -201,10 +262,11 @@ pub fn init() void {
     threads[0].name = "idle";
 }
 
-// Turn on timer-driven preemption for good: every timer tick switches threads.
+// Turn on timer-driven preemption for good: every timer tick wakes sleepers and
+// switches threads.
 pub fn startPreemption() void {
     preempting = true;
-    pic.on_tick = &yield;
+    pic.on_tick = &tick;
 }
 
 // The idle thread's body: halt until an interrupt; the timer preempts us to any
@@ -221,7 +283,27 @@ pub fn dump() void {
             .ready => "ready",
             .running => "running",
             .finished => "finished",
+            .blocked => "blocked",
         };
         serial.print("  {d:>2}  {s:<9}  {s}\n", .{ i, st, t.name });
     }
+}
+
+// --- One-shot blocking-sleep self-test ---------------------------------------
+fn sleepWorker() void {
+    sleep(20); // block for ~200 ms (the timer wakes us; we don't busy-wait)
+    serial.print("[SCHED]   blocking-sleep self-test: slept, woke OK (no busy-wait).\n", .{});
+    // returns -> threadExit
+}
+
+pub fn blockSleepDemo() void {
+    serial.print("[SCHED] Blocking-sleep self-test...\n", .{});
+    setupMain();
+    spawn("sleeper", &sleepWorker);
+    preempting = true;
+    pic.on_tick = &tick; // the timer wakes sleepers
+    while (aliveCount() > 0) {} // main waits; the sleeper blocks then wakes + exits
+    pic.on_tick = null;
+    preempting = false;
+    serial.print("[SCHED] Blocking-sleep self-test complete.\n", .{});
 }

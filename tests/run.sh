@@ -121,6 +121,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "preempt P1: finished"                      "$p preemption: worker P1 ran without yielding"
     assert_in "$log" "preempt P2: finished"                      "$p preemption: worker P2 ran without yielding"
     assert_in "$log" "Preemptive demo complete."                 "$p timer-driven preemption"
+    assert_in "$log" "blocking-sleep self-test: slept, woke OK"  "$p blocking sleep (thread sleeps, timer wakes it)"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
@@ -163,11 +164,35 @@ boot_shell "$TMP/hist.log" 512M 'echo zqx\r\x1b[A\r'
 runs=$(tr -d '\r' < "$TMP/hist.log" | grep -c '^zqx$')
 if [ "$runs" -ge 2 ]; then ok "history: Up arrow recalled + re-ran command (zqx printed ${runs}x)"; else bad "history: recall (zqx printed ${runs}x, expected >=2)"; fi
 
+# --- Full-system sleep (sleep) -----------------------------------------------
+echo "== Full-system sleep (sleep) =="
+# `sleep` halts the whole machine (masks the LAPIC timer) until a key is pressed,
+# so preemption AND timekeeping stop. We read uptime, sleep ~3 s, wake with a
+# key, read uptime again: the tick counter must barely advance (the timer was
+# off). The wake key must arrive AFTER it sleeps, so it can't be one input burst.
+( sleep "$BOOT_WAIT"; printf 'uptime\r'; sleep 0.3; printf 'sleep\r'; sleep 3; \
+  printf 'w'; sleep 0.3; printf 'uptime\r'; sleep 1 ) \
+    | timeout 15 qemu-system-x86_64 -M q35 -m 512M -cdrom "$ISO" \
+      -chardev stdio,id=c0,logfile="$TMP/sleep.log",signal=off -serial chardev:c0 \
+      -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/sleep.log" "system sleep" "sleep: halts the system"
+assert_in "$TMP/sleep.log" "awake."       "sleep: a keypress wakes it"
+# Freeze proof: the two uptime tick readings must differ by little. A live timer
+# would add hundreds of ticks across the ~3 s sleep; a frozen one adds ~none.
+ticks=( $(sed 's/\r//' "$TMP/sleep.log" | grep -aoE '\([0-9]+ ticks' | grep -oE '[0-9]+') )
+if [ "${#ticks[@]}" -ge 2 ]; then
+    delta=$(( ${ticks[${#ticks[@]}-1]} - ${ticks[0]} ))
+    if [ "$delta" -ge 0 ] && [ "$delta" -lt 250 ]; then
+        ok "sleep: timer frozen while asleep (uptime advanced only ${delta} ticks over a ~3s sleep)"
+    else
+        bad "sleep: timer NOT frozen while asleep (uptime advanced ${delta} ticks)"
+    fi
+else
+    bad "sleep: could not read two uptime samples (got ${#ticks[@]})"
+fi
+
 # --- Power commands ----------------------------------------------------------
 echo "== Power commands =="
-# sleep: a 1-second low-power halt that then resumes the shell.
-boot_shell "$TMP/sleep.log" 512M 'sleep 1\r'
-assert_in "$TMP/sleep.log" "awake." "sleep: low-power halt resumes"
 
 # shutdown: QEMU should power off (qemu exits cleanly, not killed by timeout=124).
 ( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 15 qemu-system-x86_64 \

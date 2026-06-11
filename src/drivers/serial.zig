@@ -3,6 +3,7 @@
 // file talks to the legacy 16550 UART through x86 port I/O.
 
 const std = @import("std"); // standard library, used for std.fmt + std.io.Writer
+const sync = @import("../sched/sync.zig"); // the print lock (preemption disable)
 
 // COM1's base I/O port. The UART exposes 8 consecutive registers at PORT..PORT+7.
 const PORT: u16 = 0x3F8;
@@ -91,8 +92,11 @@ pub fn setMirror(f: ?*const fn ([]const u8) void) void {
     mirror = f;
 }
 
-// Public printf-style logger used everywhere in the kernel.
+// Public printf-style logger used everywhere in the kernel. Holds the print lock
+// so a thread can't be preempted mid-line (which would interleave output).
 pub fn print(comptime format: []const u8, args: anytype) void {
+    sync.preemptDisable();
+    defer sync.preemptEnable();
     // Format into the serial writer; our writeFn can't fail, so `catch unreachable`.
     std.fmt.format(writer, format, args) catch unreachable;
 }
@@ -118,6 +122,8 @@ pub fn enableRxInterrupt() void {
 
 // Echo a single character to the port (used by the shell's line editor).
 pub fn putc(c: u8) void {
+    sync.preemptDisable();
+    defer sync.preemptEnable();
     writeByte(c); // out the serial port
     if (mirror) |m| { // and to the framebuffer console, if registered
         const tmp = [_]u8{c};

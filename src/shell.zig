@@ -13,6 +13,7 @@ const pmm = @import("mm/pmm.zig"); // for the `mem` command
 const console = @import("drivers/console.zig"); // to blink the on-screen cursor
 const power = @import("arch/power.zig"); // restart / shutdown
 const scheduler = @import("sched/scheduler.zig"); // for the `ps` command
+const apic = @import("arch/apic.zig"); // pause/resume the timer for `sleep`
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -46,10 +47,37 @@ pub fn feed(c: u8) void {
     ringPush(c);
 }
 
+// True if the input ring currently holds no bytes. Reads ring_head atomically
+// since the producer (an IRQ) advances it.
+fn ringEmpty() bool {
+    return ring_tail == @atomicLoad(usize, &ring_head, .acquire);
+}
+
+// Full-system sleep: halt the whole machine until a key is pressed. We mask the
+// LAPIC timer (the kernel's preemption + timekeeping source), so nothing runs —
+// no thread switching, no tick counting — and the CPU deep-halts. Only an input
+// interrupt (keyboard/serial) can wake it. The waking key is consumed, not echoed.
+fn systemSleep() void {
+    asm volatile ("cli"); // set up the sleep atomically vs. input IRQs
+    while (ringPop() != null) {} // drain stale input so we don't wake immediately
+    apic.pauseTimer(); // stop the timer: the whole system goes quiet
+
+    // Sleep until a byte arrives. `sti; hlt` is atomic (no interrupt is taken
+    // between them), so a key that arrives right here can't be lost; the `cli`
+    // after the wakeup re-masks for the next ring check.
+    while (ringEmpty()) {
+        asm volatile ("sti; hlt; cli");
+    }
+
+    apic.resumeTimer(); // timer back -> preemption + timekeeping resume
+    asm volatile ("sti");
+    _ = ringPop(); // discard the key that woke us
+}
+
 // IRQ4 handler: drain everything the UART has buffered into the ring.
 fn onSerialIrq() void {
     while (serial.dataAvailable()) { // while bytes are waiting
-        ringPush(serial.readByteRaw()); // read + enqueue (also clears the IRQ)
+        feed(serial.readByteRaw()); // enqueue (also clears the IRQ)
     }
 }
 
@@ -250,7 +278,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          sleep [secs], restart, shutdown, crash\n", .{});
+        serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
         serial.print("restarting...\n", .{});
@@ -258,12 +286,9 @@ fn execute(raw: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "shutdown") or std.mem.eql(u8, cmd, "poweroff")) { // power off
         serial.print("shutting down...\n", .{});
         power.shutdown();
-    } else if (std.mem.eql(u8, cmd, "sleep")) { // low-power halt for N seconds
-        const secs = std.fmt.parseInt(u64, args, 10) catch 1; // default 1s
-        const capped = if (secs > 3600) 3600 else secs; // clamp to an hour
-        serial.print("sleeping for {d}s (low-power halt)...\n", .{capped});
-        const target = pic.ticks() + capped * 100; // 100 Hz timer
-        while (pic.ticks() < target) asm volatile ("hlt"); // wake each tick to re-check
+    } else if (std.mem.eql(u8, cmd, "sleep")) { // full-system sleep until a keypress
+        serial.print("system sleep... press a key to wake.\n", .{});
+        systemSleep(); // halt the whole machine (timer off) until input arrives
         serial.print("awake.\n", .{});
     } else if (std.mem.eql(u8, cmd, "history")) { // list recent commands
         var k = hist_size;

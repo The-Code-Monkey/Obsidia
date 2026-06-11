@@ -12,6 +12,7 @@
 const std = @import("std"); // for std.fmt + std.mem.copyForwards
 const serial = @import("serial.zig"); // for logging during init
 const pic = @import("../arch/pic.zig"); // timer ticks, to pace the cursor blink
+const sync = @import("../sched/sync.zig"); // print lock (atomic console updates)
 
 // The font file, embedded directly into the kernel binary.
 const psf = @embedFile("../fonts/Tamzen8x16.psf");
@@ -294,6 +295,8 @@ pub fn cursorBlinkTick() void {
     if (!ready) return;
     const t = pic.ticks();
     if (t -% last_toggle < BLINK_TICKS) return; // not time to toggle yet
+    sync.preemptDisable(); // don't let a printing thread cut in mid-draw
+    defer sync.preemptEnable();
     last_toggle = t;
     blink_phase = !blink_phase; // flip on/off
     if (blink_phase) drawCursor() else eraseCursor();
@@ -303,6 +306,8 @@ pub fn cursorBlinkTick() void {
 // Write a string to the framebuffer console.
 pub fn writeString(s: []const u8) void {
     if (!ready) return; // ignore until initialized
+    sync.preemptDisable(); // atomic w.r.t. other threads drawing to the console
+    defer sync.preemptEnable();
     eraseCursor(); // remove the blinking cursor before drawing text over it
     for (s) |c| putcharRaw(c); // it reappears at the new position on the next blink
 }
