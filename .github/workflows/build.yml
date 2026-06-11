@@ -75,17 +75,18 @@ jobs:
             -chardev stdio,id=char0,logfile=boot.log,signal=off \
             -serial chardev:char0 \
             -display none \
-            -no-reboot -no-shutdown \
-            -d int,cpu_reset -D qemu-debug.log \
+            -no-reboot \
             2>&1 || true
 
-          echo "=== SERIAL (boot.log) ==="
+          echo "=== Boot log ==="
           cat boot.log
-          echo ""
-          echo "=== QEMU DEBUG (qemu-debug.log, last 80 lines) ==="
-          tail -n 80 qemu-debug.log
-          echo ""
-          grep -q "BOOT_OK" boot.log
+
+          if grep -q "BOOT_OK" boot.log; then
+            echo "✅ Kernel booted and reached stable state."
+          else
+            echo "::error::BOOT_OK not found — kernel did not boot cleanly."
+            exit 1
+          fi
 
       - name: Upload boot log
         if: always()
