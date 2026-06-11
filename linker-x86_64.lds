@@ -1,68 +1,81 @@
-/* Tell the linker that we want an x86_64 ELF64 output file */
+/* Linker script: controls where each part of the kernel lands in memory.
+   We place the kernel in the higher half and emit page-aligned sections with
+   their own program headers so the bootloader can map them with correct
+   permissions and the VMM can re-map them per section (W^X). */
+
+/* Produce a 64-bit x86 ELF. */
 OUTPUT_FORMAT(elf64-x86-64)
 
-/* We want the symbol _start to be our entry point */
+/* The kernel's entry symbol (defined in main.zig as `export fn _start`). */
 ENTRY(_start)
 
-/* Define the program headers we want so the bootloader gives us the right */
-/* MMU permissions; this also allows us to exert more control over the linking */
-/* process. */
+/* Program headers (segments). Each PT_LOAD becomes a loadable segment; giving
+   each section its own segment lets us control its mapping/permissions. */
 PHDRS
 {
-    limine_requests PT_LOAD;
-    text PT_LOAD;
-    rodata PT_LOAD;
-    data PT_LOAD;
+    limine_requests PT_LOAD; /* the Limine request structs */
+    text PT_LOAD;            /* executable code */
+    rodata PT_LOAD;          /* read-only constants */
+    data PT_LOAD;            /* read-write data + .bss */
 }
 
 SECTIONS
 {
-    /* We want to be placed in the topmost 2GiB of the address space, for optimisations */
-    /* and because that is what the Limine spec mandates. */
-    /* Any address in this region will do, but often 0xffffffff80000000 is chosen as */
-    /* that is the beginning of the region. */
+    /* Higher half: top 2 GiB of the 64-bit address space. The Limine spec
+       mandates this region; 0xffffffff80000000 is its base. */
     . = 0xffffffff80000000;
+    __kernel_start = .; /* VMM uses this as the image start */
 
-    /* Define a section to contain the Limine requests and assign it to its own PHDR */
+    /* The Limine requests, kept (KEEP) so the linker doesn't garbage-collect
+       them, and given their own segment. */
     .limine_requests : {
-        KEEP(*(.limine_requests_start))
-        KEEP(*(.limine_requests))
-        KEEP(*(.limine_requests_end))
+        KEEP(*(.limine_requests_start)) /* start marker */
+        KEEP(*(.limine_requests))       /* the request structs */
+        KEEP(*(.limine_requests_end))   /* end marker */
     } :limine_requests
 
-    /* Move to the next memory page for .text */
+    /* Page-align before .text so it can be mapped with its own permissions. */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_start = .; /* VMM maps [__text_start, __text_end) as execute + read-only */
 
     .text : {
-        *(.text .text.*)
+        *(.text .text.*) /* all code */
     } :text
 
-    /* Move to the next memory page for .rodata */
+    /* Page-align before .rodata. */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_end = .;     /* end of code */
+    __rodata_start = .; /* VMM maps [__rodata_start, __rodata_end) as read-only + NX */
 
     .rodata : {
-        *(.rodata .rodata.*)
+        *(.rodata .rodata.*) /* constants, string literals, etc. */
     } :rodata
 
-    /* Move to the next memory page for .data */
+    /* Page-align before .data. */
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_end = .;  /* end of rodata */
+    __data_start = .;  /* VMM maps [__data_start, __kernel_end) as read-write + NX */
 
     .data : {
-        *(.data .data.*)
+        *(.data .data.*) /* initialized writable data */
     } :data
 
-    /* NOTE: .bss needs to be the last thing mapped to :data, otherwise lots of */
-    /* unnecessary zeros will be written to the binary. */
-    /* If you need, for example, .init_array and .fini_array, those should be placed */
-    /* above this. */
+    /* NOTE: .bss needs to be the last thing mapped to :data, otherwise lots of
+       unnecessary zeros will be written to the binary.
+       If you need, for example, .init_array and .fini_array, those should be
+       placed above this. */
     .bss : {
-        *(.bss .bss.*)
-        *(COMMON)
+        *(.bss .bss.*) /* zero-initialized data (GDT/IDT/TSS/stacks live here) */
+        *(COMMON)      /* common symbols */
     } :data
 
-    /* Discard .note.* and .eh_frame* since they may cause issues on some hosts. */
+    /* Page-aligned end of the kernel image, so the VMM can map [start, end). */
+    . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __kernel_end = .;
+
+    /* Drop sections that can cause issues on some hosts and that we don't use. */
     /DISCARD/ : {
-        *(.eh_frame*)
-        *(.note .note.*)
+        *(.eh_frame*)       /* unwind info */
+        *(.note .note.*)    /* build notes */
     }
 }

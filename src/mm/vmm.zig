@@ -1,0 +1,307 @@
+// Virtual memory manager: build our own x86-64 4-level page tables and take
+// over paging from Limine by loading CR3.
+//
+// Limine leaves us in long mode with its own tables: the kernel mapped in the
+// higher half and all of physical RAM mapped through the HHDM. To own our
+// address space we construct a fresh PML4 (frames from the PMM, accessed via the
+// HHDM), replicate the two mappings we cannot run without, and switch CR3:
+//
+//   1. The HHDM  - so the stack (which lives in the HHDM), the PMM bitmap, and
+//      MMIO below 4 GiB stay reachable. Mapped with 2 MiB pages.
+//   2. The kernel image - so RIP keeps pointing at valid code. Mapped 4 KiB.
+//
+// The instant CR3 loads, the MMU uses our tables; if either mapping is wrong we
+// fault immediately - but the IDT from step 2 turns that into a readable dump
+// instead of a triple fault.
+//
+// Permissions enforce W^X (write XOR execute): .text is executable + read-only,
+// everything else (data, rodata, HHDM, heap) is non-executable. The NX bit is
+// unlocked via EFER.NXE before any NX entry is used.
+
+const pmm = @import("pmm.zig"); // frames for page tables + HHDM translation
+const serial = @import("../drivers/serial.zig"); // logging
+
+const PAGE_SIZE: u64 = 4096; // 4 KiB page
+const TWO_MIB: u64 = 0x200000; // 2 MiB huge page (used for the HHDM)
+const FOUR_GIB: u64 = 0x100000000; // minimum HHDM span (covers RAM + MMIO)
+
+// Page-table entry flags (bit positions in a 64-bit entry).
+const PRESENT: u64 = 1 << 0; // entry is valid
+const WRITE: u64 = 1 << 1; // writes allowed
+const HUGE: u64 = 1 << 7; // PS bit (2 MiB page when set at PD level)
+const NX: u64 = 1 << 63; // No-eXecute (usable only once EFER.NXE is set)
+const ADDR_MASK: u64 = 0x000FFFFFFFFFF000; // bits 12..51 hold the physical address
+
+// Extended Feature Enable Register: bit 11 (NXE) unlocks the NX page-table bit.
+const IA32_EFER: u32 = 0xC0000080; // the EFER model-specific register number
+const EFER_NXE: u64 = 1 << 11; // the NXE bit within EFER
+
+// Kernel image + per-section bounds, provided by the linker script. Each is
+// page-aligned, so [start, end) ranges map cleanly with no partial pages.
+extern var __kernel_start: u8; // start of the whole image (.limine_requests)
+extern var __kernel_end: u8; // end of the whole image (after .bss)
+extern var __text_start: u8; // start of .text
+extern var __text_end: u8; // end of .text
+extern var __rodata_start: u8; // start of .rodata
+extern var __rodata_end: u8; // end of .rodata
+extern var __data_start: u8; // start of .data (.data + .bss run to __kernel_end)
+
+var pml4_phys: u64 = 0; // physical address of our top-level page table
+
+// Print a fatal message and halt — used when a mapping can't be built.
+fn fail(comptime msg: []const u8) noreturn {
+    serial.print("[VMM] FATAL: " ++ msg ++ "\n", .{});
+    while (true) asm volatile ("cli; hlt");
+}
+
+// Round an address up / down to a multiple of `a` (a must be a power of two).
+fn alignUp(x: u64, a: u64) u64 {
+    return (x + a - 1) & ~(a - 1);
+}
+fn alignDown(x: u64, a: u64) u64 {
+    return x & ~(a - 1);
+}
+
+// Read CR4 (we check the LA57 bit to confirm 4-level paging).
+fn readCr4() u64 {
+    return asm volatile ("mov %cr4, %[r]"
+        : [r] "=r" (-> u64),
+    );
+}
+
+// Read a model-specific register: rdmsr returns the 64-bit value in EDX:EAX.
+fn rdmsr(msr: u32) u64 {
+    var lo: u32 = undefined; // low 32 bits (EAX)
+    var hi: u32 = undefined; // high 32 bits (EDX)
+    asm volatile ("rdmsr"
+        : [lo] "={eax}" (lo), // capture EAX
+          [hi] "={edx}" (hi), // capture EDX
+        : [msr] "{ecx}" (msr), // MSR number goes in ECX
+    );
+    return (@as(u64, hi) << 32) | @as(u64, lo); // recombine into 64 bits
+}
+
+// Write a model-specific register: wrmsr takes the value in EDX:EAX, number in ECX.
+fn wrmsr(msr: u32, value: u64) void {
+    asm volatile ("wrmsr"
+        :
+        : [msr] "{ecx}" (msr), // MSR number
+          [lo] "{eax}" (@as(u32, @truncate(value))), // low 32 bits -> EAX
+          [hi] "{edx}" (@as(u32, @truncate(value >> 32))), // high 32 bits -> EDX
+    );
+}
+
+// Enable NX before any NX-bearing page-table entry is used for translation,
+// otherwise the NX bit is reserved and using it faults.
+fn enableNxe() void {
+    wrmsr(IA32_EFER, rdmsr(IA32_EFER) | EFER_NXE); // read EFER, set NXE, write back
+}
+
+// Invalidate one page's cached translation after we change its mapping.
+fn flushTlb(virt: u64) void {
+    asm volatile ("invlpg (%[v])"
+        :
+        : [v] "r" (virt), // the address whose TLB entry to drop
+        : "memory"
+    );
+}
+
+// View a physical table frame through the HHDM (valid under both Limine's CR3
+// and ours, since both map the HHDM identically).
+fn tableAt(phys: u64) [*]u64 {
+    return @ptrFromInt(pmm.physToVirt(phys)); // 512 u64 entries per table
+}
+
+// Descend one level, allocating and linking a fresh table if absent.
+fn nextTable(table: [*]u64, index: usize) [*]u64 {
+    const entry = table[index]; // the entry at this level
+    if (entry & PRESENT != 0) { // already points to a table?
+        return tableAt(entry & ADDR_MASK); // follow it
+    }
+    const frame = pmm.allocZeroed() orelse fail("out of memory building page tables"); // make a new table
+    table[index] = frame | PRESENT | WRITE; // link it in (intermediate tables are RW)
+    return tableAt(frame);
+}
+
+// Extract the 9-bit page-table index at the given shift from a virtual address.
+fn idx(virt: u64, comptime shift: u6) usize {
+    return @intCast((virt >> shift) & 0x1FF); // shifts: 39=PML4, 30=PDPT, 21=PD, 12=PT
+}
+
+// Map a single 4 KiB page virt -> phys with the given flags.
+fn mapPage(pml4: [*]u64, virt: u64, phys: u64, flags: u64) void {
+    const pdpt = nextTable(pml4, idx(virt, 39)); // level 4 -> 3
+    const pd = nextTable(pdpt, idx(virt, 30)); // level 3 -> 2
+    const pt = nextTable(pd, idx(virt, 21)); // level 2 -> 1
+    pt[idx(virt, 12)] = (phys & ADDR_MASK) | flags | PRESENT; // leaf entry
+}
+
+// Map a single 2 MiB huge page (used for the HHDM, where 4 KiB would be wasteful).
+fn map2MiB(pml4: [*]u64, virt: u64, phys: u64, flags: u64) void {
+    const pdpt = nextTable(pml4, idx(virt, 39)); // level 4 -> 3
+    const pd = nextTable(pdpt, idx(virt, 30)); // level 3 -> 2
+    pd[idx(virt, 21)] = (phys & ADDR_MASK) | flags | PRESENT | HUGE; // PD entry, HUGE = stop here
+}
+
+// Clear the leaf entry for `virt` (a non-creating walk; bails if unmapped).
+fn unmapPage(pml4: [*]u64, virt: u64) void {
+    if (pml4[idx(virt, 39)] & PRESENT == 0) return; // no PDPT
+    const pdpt = tableAt(pml4[idx(virt, 39)] & ADDR_MASK);
+    if (pdpt[idx(virt, 30)] & PRESENT == 0) return; // no PD
+    const pd = tableAt(pdpt[idx(virt, 30)] & ADDR_MASK);
+    if (pd[idx(virt, 21)] & PRESENT == 0) return; // no PT
+    const pt = tableAt(pd[idx(virt, 21)] & ADDR_MASK);
+    pt[idx(virt, 12)] = 0; // clear the leaf
+}
+
+// Public mapping API for later subsystems (e.g. the heap).
+pub fn map(virt: u64, phys: u64, flags: u64) void {
+    mapPage(tableAt(pml4_phys), virt, phys, flags); // map into the live tables
+    flushTlb(virt); // drop any stale TLB entry
+}
+pub fn unmap(virt: u64) void {
+    unmapPage(tableAt(pml4_phys), virt); // remove the mapping
+    flushTlb(virt);
+}
+pub const FLAG_WRITE = WRITE; // re-exported so callers can request writable pages
+pub const FLAG_NX = NX; // ...and non-executable pages
+
+// Walk to the leaf entry mapping `virt` (stopping at a huge page), or null if
+// unmapped. Used to verify applied permissions without triggering a fault.
+fn queryEntry(pml4: [*]u64, virt: u64) ?u64 {
+    if (pml4[idx(virt, 39)] & PRESENT == 0) return null; // unmapped at PML4
+    const pdpt = tableAt(pml4[idx(virt, 39)] & ADDR_MASK);
+    if (pdpt[idx(virt, 30)] & PRESENT == 0) return null; // unmapped at PDPT
+    if (pdpt[idx(virt, 30)] & HUGE != 0) return pdpt[idx(virt, 30)]; // 1 GiB leaf
+    const pd = tableAt(pdpt[idx(virt, 30)] & ADDR_MASK);
+    if (pd[idx(virt, 21)] & PRESENT == 0) return null; // unmapped at PD
+    if (pd[idx(virt, 21)] & HUGE != 0) return pd[idx(virt, 21)]; // 2 MiB leaf
+    const pt = tableAt(pd[idx(virt, 21)] & ADDR_MASK);
+    if (pt[idx(virt, 12)] & PRESENT == 0) return null; // unmapped at PT
+    return pt[idx(virt, 12)]; // 4 KiB leaf
+}
+
+// Map every page in [vstart, vend) to its kernel-slide physical address.
+fn mapKernelRange(pml4: [*]u64, vstart: u64, vend: u64, flags: u64, virt_base: u64, phys_base: u64) usize {
+    var v = vstart; // current virtual page
+    var n: usize = 0; // count of pages mapped
+    while (v < vend) : (v += PAGE_SIZE) {
+        mapPage(pml4, v, v - virt_base + phys_base, flags); // phys = virt - slide
+        n += 1;
+    }
+    return n;
+}
+
+// Confirm the W^X flags actually landed in the live tables, by reading the leaf
+// entry for one address in each region. Non-faulting: it inspects bits, it does
+// not try to execute/write anything illegal.
+fn verifyWX(pml4: [*]u64) void {
+    // For each region: is it writable (WRITE set) and is it executable (NX clear)?
+    const text = queryEntry(pml4, @intFromPtr(&__text_start)) orelse 0; // a .text page
+    const rodata = queryEntry(pml4, @intFromPtr(&__rodata_start)) orelse 0; // a .rodata page
+    const data = queryEntry(pml4, @intFromPtr(&__data_start)) orelse 0; // a .data page
+    const hhdm = queryEntry(pml4, pmm.physToVirt(0x1000)) orelse 0; // an HHDM page
+
+    const text_x = text & NX == 0; // executable if NX is clear
+    const text_w = text & WRITE != 0; // writable if WRITE is set
+    const rodata_x = rodata & NX == 0;
+    const data_x = data & NX == 0;
+    const hhdm_x = hhdm & NX == 0;
+
+    serial.print("[VMM]   W^X: .text(x={},w={}) .rodata(x={}) .data(x={}) hhdm(x={})\n", .{ text_x, text_w, rodata_x, data_x, hhdm_x });
+    // Ideal: .text executable & not writable; everything else non-executable.
+    const ok = text_x and !text_w and !rodata_x and !data_x and !hhdm_x;
+    serial.print("[VMM]   W^X enforced: {s}\n", .{if (ok) "OK" else "FAIL"});
+}
+
+// --- Self-test: prove our live tables translate correctly --------------------
+fn selfTest(pml4: [*]u64) void {
+    serial.print("[VMM]   Self-test: mapping a scratch page...\n", .{});
+    const scratch: u64 = 0xffffffffd0000000; // unused higher-half address
+    const frame = pmm.allocZeroed() orelse { // a physical frame to back it
+        serial.print("[VMM]     FAILED: no frame for scratch page\n", .{});
+        return;
+    };
+    mapPage(pml4, scratch, frame, PRESENT | WRITE | NX); // map it RW + non-exec
+    flushTlb(scratch); // ensure the new mapping is visible
+
+    const p: [*]volatile u64 = @ptrFromInt(scratch); // access via the NEW mapping
+    p[0] = 0xCAFEBABEDEADBEEF; // write two markers
+    p[1] = 0x1234567890ABCDEF;
+    const wrote_ok = p[0] == 0xCAFEBABEDEADBEEF and p[1] == 0x1234567890ABCDEF; // read back
+    serial.print("[VMM]     wrote/read via new mapping 0x{x} -> phys 0x{x}: {s}\n", .{ scratch, frame, if (wrote_ok) "OK" else "MISMATCH" });
+
+    // The same physical frame, viewed through the HHDM, must show the same data
+    // - this proves our new virtual mapping really points where we think.
+    const alias: [*]volatile u64 = @ptrFromInt(pmm.physToVirt(frame)); // HHDM alias of the frame
+    const alias_ok = alias[0] == 0xCAFEBABEDEADBEEF; // same bytes?
+    serial.print("[VMM]     HHDM alias of that frame agrees: {s}\n", .{if (alias_ok) "OK" else "MISMATCH"});
+
+    unmapPage(pml4, scratch); // tear down the scratch mapping
+    flushTlb(scratch);
+    pmm.free(frame); // return the frame
+    serial.print("[VMM]     unmapped scratch + freed frame.\n", .{});
+
+    verifyWX(pml4); // finally, confirm the W^X permission bits
+}
+
+pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
+    serial.print("[VMM] Initializing virtual memory manager...\n", .{});
+    serial.print("[VMM]   kernel phys_base=0x{x} virt_base=0x{x}\n", .{ phys_base, virt_base });
+
+    // Tripwire: we assume 4-level paging (CR4.LA57 == 0).
+    if (readCr4() & (@as(u64, 1) << 12) != 0) fail("5-level paging active; VMM assumes 4-level");
+
+    // Unlock the NX bit so the W^X mappings below are legal.
+    enableNxe();
+    serial.print("[VMM]   EFER.NXE enabled (NX bit usable).\n", .{});
+
+    pml4_phys = pmm.allocZeroed() orelse fail("cannot allocate PML4"); // top-level table
+    const pml4 = tableAt(pml4_phys); // its HHDM view
+    serial.print("[VMM]   PML4 at phys 0x{x}\n", .{pml4_phys});
+
+    // 1. HHDM: map [0, top) -> hhdm_offset + phys with 2 MiB pages. Pure data:
+    //    writable, never executable.
+    const hhdm_top = @max(FOUR_GIB, alignUp(pmm.highestAddress(), TWO_MIB)); // at least 4 GiB
+    var p: u64 = 0; // current physical address
+    while (p < hhdm_top) : (p += TWO_MIB) { // one 2 MiB page at a time
+        map2MiB(pml4, hhdm_offset + p, p, PRESENT | WRITE | NX);
+    }
+    serial.print("[VMM]   Mapped HHDM: 0x{x} + [0, 0x{x}) ({d} MiB, 2 MiB pages, RW+NX)\n", .{ hhdm_offset, hhdm_top, hhdm_top / (1024 * 1024) });
+
+    // 2. Kernel image, per section, enforcing W^X:
+    //      .limine_requests : RW + NX (data the bootloader filled in)
+    //      .text            : RX, read-only (executable, NOT writable)
+    //      .rodata          : RO + NX (constants)
+    //      .data + .bss     : RW + NX
+    const rq_start = alignDown(@intFromPtr(&__kernel_start), PAGE_SIZE); // requests + image start
+    const tx_start = @intFromPtr(&__text_start); // .text bounds
+    const tx_end = @intFromPtr(&__text_end);
+    const ro_start = @intFromPtr(&__rodata_start); // .rodata bounds
+    const ro_end = @intFromPtr(&__rodata_end);
+    const da_start = @intFromPtr(&__data_start); // .data start
+    const kend = alignUp(@intFromPtr(&__kernel_end), PAGE_SIZE); // image end
+
+    const n_rq = mapKernelRange(pml4, rq_start, tx_start, PRESENT | WRITE | NX, virt_base, phys_base); // requests: RW NX
+    const n_tx = mapKernelRange(pml4, tx_start, tx_end, PRESENT, virt_base, phys_base); // text: RX read-only
+    const n_ro = mapKernelRange(pml4, ro_start, ro_end, PRESENT | NX, virt_base, phys_base); // rodata: RO NX
+    const n_da = mapKernelRange(pml4, da_start, kend, PRESENT | WRITE | NX, virt_base, phys_base); // data/bss: RW NX
+    serial.print("[VMM]   Mapped kernel W^X: requests={d} text(RX)={d} rodata(RO)={d} data(RW)={d} pages\n", .{ n_rq, n_tx, n_ro, n_da });
+
+    // 3. Switch CR3. Mask interrupts across the swap so a timer IRQ can't land
+    //    in the middle; everything it touches is mapped in both table sets, but
+    //    this keeps the transition clean.
+    serial.print("[VMM]   Loading CR3 = 0x{x}...\n", .{pml4_phys});
+    asm volatile ("cli"); // disable interrupts during the switch
+    asm volatile ("mov %[p], %cr3" // load our PML4 -> MMU now uses our tables
+        :
+        : [p] "r" (pml4_phys),
+        : "memory"
+    );
+    serial.print("[VMM]   CR3 loaded - now running on our own page tables.\n", .{});
+
+    selfTest(pml4); // verify translation + W^X on the live tables
+    asm volatile ("sti"); // re-enable interrupts
+
+    serial.print("[VMM] Virtual memory manager initialized.\n", .{});
+}

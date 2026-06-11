@@ -1,116 +1,52 @@
-name: Build Obsidia ISO
+name: Build & Test Obsidia
 
-# Trigger the workflow on every push to any branch
+# Trigger on every push to any branch, and on pull requests.
 on:
   push:
     branches: [ "**" ]
   pull_request:
 
 jobs:
-  build:
-    name: Compile and Package ISO
+  build-and-test:
+    name: Build, test, package
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # Install the Zig compiler 
-      # (Using 0.13.0, but you can change this to 'master' if you want bleeding edge)
+      # Pin Zig to the version the project targets.
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
           version: 0.14.0
 
-      # We need xorriso and mtools to assemble the bootable disk image
-      - name: Install ISO Tooling
+      # Everything the test harness needs: ISO assembly (xorriso/mtools),
+      # emulation (qemu + ovmf), and the framebuffer screenshot check
+      # (socat + imagemagick).
+      - name: Install tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y xorriso mtools
+          sudo apt-get install -y xorriso mtools qemu-system-x86 ovmf socat imagemagick
 
-      # Pull the Limine binaries and compile the installer utility
-      - name: Fetch Limine Binaries
+      # Limine binaries + the host installer utility.
+      - name: Fetch Limine binaries
         run: |
           git clone https://github.com/limine-bootloader/limine.git --branch=v8.x-binary --depth=1
           make -C limine
 
-      - name: Build Zig Kernel
-        run: zig build
+      # The harness builds the kernel, runs host unit tests, assembles the ISO,
+      # boots it under BIOS + UEFI asserting every subsystem marker, drives the
+      # shell over serial, and screenshots the framebuffer. Non-zero exit fails
+      # the job (and it prints the serial log on failure).
+      - name: Run test harness
+        run: ./tests/run.sh
 
-      - name: Assemble Bootable ISO
-        run: |
-          mkdir -p iso_root/boot/limine
-          mkdir -p iso_root/EFI/BOOT
-
-          # Kernel
-          cp zig-out/bin/kernel.elf iso_root/boot/
-
-          # Config + Limine boot files (docs: limine.conf and limine-bios.sys
-          # must be in root, limine, boot, or boot/limine)
-          cp limine.conf                 iso_root/boot/limine/
-          cp limine/limine-bios.sys      iso_root/boot/limine/
-          cp limine/limine-bios-cd.bin   iso_root/boot/limine/
-          cp limine/limine-uefi-cd.bin   iso_root/boot/limine/
-
-          # UEFI executable
-          cp limine/BOOTX64.EFI          iso_root/EFI/BOOT/
-
-          # Hybrid BIOS+UEFI ISO — Limine's documented xorriso invocation
-          xorriso -as mkisofs -R -r -J \
-            -b boot/limine/limine-bios-cd.bin \
-            -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
-            -apm-block-size 2048 \
-            --efi-boot boot/limine/limine-uefi-cd.bin \
-            -efi-boot-part --efi-boot-image --protective-msdos-label \
-            iso_root -o obsidia.iso
-
-          # Install the BIOS stage into the ISO (required)
-          ./limine/limine bios-install obsidia.iso
-
-      - name: Verify ISO Boots (UEFI CD)
-        run: |
-          sudo apt-get install -y qemu-system-x86 ovmf
-          cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/OVMF_VARS.fd
-
-          timeout 25 qemu-system-x86_64 \
-            -M q35 -m 512M \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-            -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd \
-            -cdrom obsidia.iso \
-            -chardev stdio,id=char0,logfile=iso-boot.log,signal=off \
-            -serial chardev:char0 \
-            -display none -no-reboot \
-            2>&1 || true
-
-          echo "=== ISO boot log ==="
-          cat iso-boot.log
-          grep -q "BOOT_OK" iso-boot.log
-
-      - name: Verify ISO Boots (Legacy BIOS)
-        run: |
-          timeout 25 qemu-system-x86_64 \
-            -M q35 -m 512M \
-            -cdrom obsidia.iso \
-            -chardev stdio,id=char0,logfile=bios-boot.log,signal=off \
-            -serial chardev:char0 \
-            -display none -no-reboot \
-            2>&1 || true
-          echo "=== BIOS boot log ==="
-          cat bios-boot.log
-          grep -q "BOOT_OK" bios-boot.log
-
-      - name: Upload boot log
+      # Attach the built ISO to the run (even on failure, if it got that far).
+      - name: Upload ISO artifact
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: boot-log
-          path: boot.log
-          if-no-files-found: warn
-          
-      # Attach the final obsidia.iso to the GitHub Actions run
-      - name: Upload ISO Artifact
         uses: actions/upload-artifact@v4
         with:
           name: obsidia-os
           path: obsidia.iso
-          if-no-files-found: error
+          if-no-files-found: warn

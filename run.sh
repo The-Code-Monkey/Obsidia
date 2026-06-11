@@ -5,20 +5,23 @@ echo "Compiling Obsidia..."
 zig build
 
 echo "Preparing ISO directory..."
-mkdir -p iso_root
-cp zig-out/bin/kernel.elf iso_root/
-cp limine.conf iso_root/
+# Layout must match limine.conf, which loads boot():/boot/kernel.elf
+rm -rf iso_root
+mkdir -p iso_root/boot/limine iso_root/EFI/BOOT
+cp zig-out/bin/kernel.elf iso_root/boot/
+cp limine.conf            iso_root/boot/limine/
 
-# Copy the necessary Limine bootloader files into our ISO root
-cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/
-mkdir -p iso_root/EFI/BOOT
+# Copy the necessary Limine bootloader files into the ISO
+cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/boot/limine/
 cp limine/BOOTX64.EFI iso_root/EFI/BOOT/
 cp limine/BOOTIA32.EFI iso_root/EFI/BOOT/
 
 echo "Generating obsidia.iso..."
-xorriso -as mkisofs -b limine-bios-cd.bin \
-        -no-emul-boot -boot-load-size 4 -boot-info-table \
-        --efi-boot limine-uefi-cd.bin \
+xorriso -as mkisofs -R -r -J \
+        -b boot/limine/limine-bios-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+        -apm-block-size 2048 \
+        --efi-boot boot/limine/limine-uefi-cd.bin \
         -efi-boot-part --efi-boot-image --protective-msdos-label \
         iso_root -o obsidia.iso > /dev/null 2>&1
 
@@ -32,6 +35,6 @@ qemu-system-x86_64 \
     -enable-kvm \
     -cpu host \
     -m 2G \
-    -bios /usr/share/OVMF/OVMF_CODE.fd \
+    -bios /usr/share/ovmf/OVMF.fd \
     -cdrom obsidia.iso \
     -serial stdio
