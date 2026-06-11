@@ -43,5 +43,9 @@ export fn _start() noreturn {
     serial.print("BOOT_OK\n", .{});
     serial.print("========================================\n", .{});
 
+    // Signal success to the CI harness and exit QEMU cleanly.
+    serial.outb(0xf4, 0x10); // exits QEMU with status (0x10<<1)|1 = 33
+
     hcf();
+}
 }
