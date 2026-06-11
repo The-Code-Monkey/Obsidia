@@ -115,6 +115,9 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "IRQ0 -> GSI"                                "$p APIC routes timer via I/O APIC"
     assert_in "$log" "[APIC] APIC initialized."                   "$p APIC initialized"
     assert_in "$log" "PIT retired; LAPIC timer periodic"          "$p LAPIC timer (PIT retired)"
+    assert_in "$log" "B: iteration 3"                             "$p scheduler round-robin (threads interleave)"
+    assert_in "$log" "back in main; all threads finished"         "$p scheduler returns to main"
+    assert_in "$log" "Scheduler self-test complete."              "$p cooperative context switching"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

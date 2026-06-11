@@ -16,6 +16,7 @@ const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
 const console = @import("drivers/console.zig"); // on-screen framebuffer text console
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
+const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
 const shell = @import("shell.zig"); // interactive serial command shell
 
 // Limine scans the kernel for "requests": structs (tagged by magic IDs) that ask
@@ -194,6 +195,8 @@ export fn _start() noreturn {
 // typed locally (on the framebuffer) as well as over serial.
 fn runAfterReclaim() callconv(.C) noreturn {
     pmm.reclaimBootloader(); // safe now: we're off Limine's boot stack
+
+    scheduler.selfTest(); // demo cooperative kernel-thread context switching
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
