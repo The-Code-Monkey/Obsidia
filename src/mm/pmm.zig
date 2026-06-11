@@ -26,6 +26,14 @@ var usable_bytes: u64 = 0; // total usable RAM (for reporting)
 var next_hint: usize = 0; // where the next alloc scan starts (a small speedup)
 var ready: bool = false; // true once init succeeded
 
+// Bootloader-reclaimable regions, recorded at init. We can't re-read the memory
+// map later (it lives in this very memory), so we save the regions now and free
+// them in reclaimBootloader() once nothing depends on them anymore.
+const Region = struct { base: u64, length: u64 };
+const MAX_RECLAIM = 64;
+var reclaim_regions: [MAX_RECLAIM]Region = undefined;
+var reclaim_count: usize = 0;
+
 // Translate a physical address to its HHDM virtual address.
 pub inline fn physToVirt(phys: u64) u64 {
     return hhdm + phys;
@@ -124,6 +132,33 @@ pub fn highestAddress() u64 {
     return highest_addr;
 }
 
+// Return bootloader-reclaimable memory (Limine's structures, old page tables,
+// boot stack, etc.) to the allocator. MUST be called only after the kernel no
+// longer touches anything Limine left there — in particular, after switching
+// off Limine's boot stack, which lives in this memory.
+pub fn reclaimBootloader() void {
+    if (!ready) return;
+    serial.print("[PMM] Reclaiming bootloader-reclaimable memory...\n", .{});
+    const before = freeFrames();
+    for (reclaim_regions[0..reclaim_count]) |r| { // free each recorded region
+        const start = r.base / PAGE_SIZE;
+        const count = r.length / PAGE_SIZE;
+        for (0..count) |i| {
+            const frame = start + i;
+            if (frame < total_frames) markFree(frame); // (bounds guard, just in case)
+        }
+    }
+    // Belt and braces: never hand out frame 0 or the bitmap's own frames (a
+    // reclaim region shouldn't overlap them, but markUsed is idempotent).
+    markUsed(0);
+    const bm_start = bitmap_phys / PAGE_SIZE;
+    const bm_frames = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (0..bm_frames) |i| markUsed(bm_start + i);
+
+    const gained_mib = (freeFrames() - before) * PAGE_SIZE / (1024 * 1024);
+    serial.print("[PMM]   reclaimed {d} regions, +{d} MiB; free now {d} MiB ({d}/{d} frames)\n", .{ reclaim_count, gained_mib, freeFrames() * PAGE_SIZE / (1024 * 1024), freeFrames(), total_frames });
+}
+
 // --- Self-test ---------------------------------------------------------------
 // Proves alloc/free bookkeeping and HHDM read/write before anything depends on
 // the PMM.
@@ -163,9 +198,17 @@ pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
     serial.print("[PMM]   Memory map ({d} entries):\n", .{entries.len});
     for (entries) |e| { // walk every region
         if (e.type == .usable) usable_bytes += e.length; // tally usable RAM
-        if (e.type == .usable) {
-            const top = e.base + e.length; // end of this usable region
+        // The bitmap must cover every frame we might ever hand out — that
+        // includes bootloader-reclaimable regions, which we free later (and one
+        // of which can sit ABOVE the highest usable region).
+        if (e.type == .usable or e.type == .bootloader_reclaimable) {
+            const top = e.base + e.length; // end of this region
             if (top > highest_addr) highest_addr = top; // track the highest
+        }
+        // Record reclaimable regions so reclaimBootloader() can free them later.
+        if (e.type == .bootloader_reclaimable and reclaim_count < MAX_RECLAIM) {
+            reclaim_regions[reclaim_count] = .{ .base = e.base, .length = e.length };
+            reclaim_count += 1;
         }
         serial.print("[PMM]     0x{x:0>16}-0x{x:0>16}  {s}\n", .{ e.base, e.base + e.length, typeName(e.type) }); // dump it
     }
