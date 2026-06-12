@@ -405,23 +405,23 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     std.fmt.format(cwriter, fmt, args) catch unreachable;
 }
 
-// --- Scrollback control (driven by PageUp/PageDown via the shell) ------------
+// --- Scrollback control ------------------------------------------------------
 // How many lines one PageUp/PageDown moves: a screenful minus one line, so a
 // line of context carries over (the usual terminal feel).
 fn page() usize {
     return if (rows > 1) rows - 1 else 1;
 }
 
-// Scroll the view UP toward older history by one page, repainting from the grid.
+// Scroll the view UP toward older history by `lines`, repainting from the grid.
 // Status goes to the serial log only (serial.note), never onto the screen.
-pub fn scrollUp() void {
-    if (!ready) return;
+pub fn scrollUpBy(lines: usize) void {
+    if (!ready or lines == 0) return;
     sync.preemptDisable();
     defer sync.preemptEnable();
     const oldest = oldestAbs();
     const cur_view = if (scrolled) view_top else top_abs; // where row 0 is right now
     if (cur_view <= oldest) { // already as far back as the buffer goes
-        if (!scrolled) { // first PageUp at a screen that hasn't filled history yet
+        if (!scrolled) { // first scroll on a screen that hasn't filled history yet
             scrolled = true;
             view_top = oldest;
             renderWindow(view_top);
@@ -429,27 +429,36 @@ pub fn scrollUp() void {
         serial.note("[CON] scrollback: at oldest line\n", .{});
         return;
     }
-    view_top = if (cur_view >= oldest + page()) cur_view - page() else oldest;
+    view_top = if (cur_view >= oldest + lines) cur_view - lines else oldest;
     scrolled = true;
     renderWindow(view_top);
     serial.note("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
 }
 
-// Scroll the view DOWN toward the live bottom by one page. Reaching the bottom
+// Scroll the view DOWN toward the live bottom by `lines`. Reaching the bottom
 // drops back into live mode (the cursor reappears on the next blink).
-pub fn scrollDown() void {
-    if (!ready or !scrolled) return; // already live: nothing to do
+pub fn scrollDownBy(lines: usize) void {
+    if (!ready or !scrolled or lines == 0) return; // already live: nothing to do
     sync.preemptDisable();
     defer sync.preemptEnable();
-    if (view_top + page() >= top_abs) { // would reach (or pass) the live bottom
+    if (view_top + lines >= top_abs) { // would reach (or pass) the live bottom
         scrolled = false;
         renderWindow(top_abs); // restore the live screen from the grid
         serial.note("[CON] scrollback: live (bottom)\n", .{});
     } else {
-        view_top += page();
+        view_top += lines;
         renderWindow(view_top);
         serial.note("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
     }
+}
+
+// Page Up / Page Down: move a full screenful (minus a line of context). The
+// mouse wheel uses scrollUpBy/scrollDownBy directly with a small line count.
+pub fn scrollUp() void {
+    scrollUpBy(page());
+}
+pub fn scrollDown() void {
+    scrollDownBy(page());
 }
 
 // Snap straight back to the live bottom (called when the user types, so they

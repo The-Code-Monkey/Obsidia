@@ -37,6 +37,10 @@ const CB_TRANSLATE: u8 = 0x40; // 1 = translate scancodes to set 1 (our keyboard
 var has_wheel: bool = false; // did the IntelliMouse handshake enable the Z (wheel) byte?
 var ready: bool = false; // true once init() succeeded
 
+// Lines scrolled per wheel notch (one notch reports |z| = 1 -> one line). Capped
+// so a fast flick reporting a larger delta still only nudges a few lines.
+const MAX_WHEEL_LINES: usize = 3;
+
 // --- 8042 access helpers (all bounded so a quirky controller can't hang us) ---
 fn waitWrite() bool {
     var spins: u32 = 0;
@@ -101,14 +105,17 @@ fn onIrq() void {
         index = 0; // full packet assembled
 
         if (has_wheel) {
-            // byte3 is a signed wheel delta (one notch -> +/-1). Map a notch to a
-            // page of scrollback. NOTE: the sign convention here is a guess for
-            // QEMU; if the wheel scrolls the wrong way, swap scrollUp/scrollDown.
+            // byte3 is a signed wheel delta: one notch is +/-1. Scroll a line per
+            // notch (capped, so a fast flick can't leap pages) — a wheel should
+            // nudge a line or two, unlike PageUp/PageDown which move a screenful.
             const z: i8 = @bitCast(packet[3]);
-            if (z < 0) {
-                console.scrollUp(); // wheel up -> older output
-            } else if (z > 0) {
-                console.scrollDown(); // wheel down -> toward the live bottom
+            if (z != 0) {
+                const lines: usize = @min(@as(usize, @intCast(@abs(@as(i16, z)))), MAX_WHEEL_LINES);
+                if (z < 0) {
+                    console.scrollUpBy(lines); // wheel up -> older output
+                } else {
+                    console.scrollDownBy(lines); // wheel down -> toward the live bottom
+                }
             }
         }
     }
