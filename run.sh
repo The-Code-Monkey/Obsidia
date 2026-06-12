@@ -45,6 +45,17 @@ if [ ! -f "$DISK" ]; then
     rm -f "$tmpf"
 fi
 
+# /INIT: a flat x86-64 binary the kernel loads and runs at boot (and via the
+# shell's `exec /INIT`). It prints a marker to COM1 and returns the magic
+# 0xB017B007. Its bytes come from the shared canonical producer (the single
+# source of truth, also used by the test harness; see tests/make-init.sh for the
+# annotated instruction listing). Refreshed on every run so an existing disk
+# image picks up contract changes.
+tmpf=$(mktemp)
+tests/make-init.sh "$tmpf"
+mcopy -o -i "$DISK" "$tmpf" ::/INIT
+rm -f "$tmpf"
+
 echo "Booting Obsidia..."
 # Launch QEMU utilizing KVM and passing the host architecture straight through.
 # -M pc (i440fx) gives us the legacy PIIX3 IDE controller our ATA PIO driver uses.

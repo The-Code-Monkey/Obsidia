@@ -174,14 +174,19 @@ echo "== FAT32 filesystem (read-only, -M pc) =="
 FATDISK="$TMP/fat.img"
 truncate -s 64M "$FATDISK"
 mformat -i "$FATDISK" -F -v OBSIDIA :: 2>/dev/null
+
 fattmp=$(mktemp)
 printf 'Hello from FAT32 on Obsidia!\n' > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/HELLO.TXT
 mmd -i "$FATDISK" ::/docs 2>/dev/null
 printf 'nested file contents ok\n'      > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/docs/NOTES.TXT
 printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" "::/a-long-filename.txt"
+# /INIT is produced by the shared canonical helper (one source of truth for the
+# binary's bytes, see tests/make-init.sh) so it can't drift from run.sh's copy.
+tests/make-init.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/INIT
 rm -f "$fattmp"
 ( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
-  printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 1 ) \
+  printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 0.4; \
+  printf 'exec /INIT\r'; sleep 1 ) \
     | timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$FATDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/fat.log",signal=off -serial chardev:c0 \
@@ -192,6 +197,23 @@ assert_in "$TMP/fat.log" "a-long-filename.txt"             "FAT32: assembles lon
 assert_in "$TMP/fat.log" "Hello from FAT32 on Obsidia!"    "FAT32: reads a file's contents (cat)"
 assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a nested path (/docs/notes.txt)"
 assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
+
+# --- Init loader (flat binary off the FAT32 disk) -----------------------------
+# The boot self-test execs /INIT once; the shell `exec /INIT` above runs it a
+# second time. The marker can only appear if the loaded code itself executed
+# (the string lives inside the binary and is printed by its own loop), and the
+# magic return value proves it came back to the kernel cleanly.
+echo "== Init loader (flat binary off the FAT32 disk) =="
+assert_in "$TMP/fat.log" "INIT: hello from FAT32!"                 "init: the binary's own code ran (marker on serial)"
+assert_in "$TMP/fat.log" "init returned 0xb017b007 (magic OK)"     "init: returned the magic value to the kernel"
+assert_in "$TMP/fat.log" "[LOADER] init ran and exited cleanly."   "init: full pipeline (map RW+NX -> copy -> remap RX -> run -> unmap)"
+# Count clean RETURNS (magic-OK log lines), not greetings: this proves the
+# binary both ran and returned to the kernel cleanly on each of the two paths.
+inits=$(grep -ac "init returned 0xb017b007 (magic OK)" "$TMP/fat.log")
+if [ "$inits" -ge 2 ]; then ok "init: re-runnable (boot self-test + shell exec = ${inits} runs)"; else bad "init: expected >=2 runs (boot + shell exec), saw ${inits}"; fi
+# A disk-less boot must skip the loader gracefully (and still reach BOOT_OK,
+# which the marker checks above already proved).
+assert_in "$TMP/bios.log" "[LOADER] self-test skipped"             "init: disk-less boot skips the loader gracefully"
 
 # --- Shell interaction -------------------------------------------------------
 echo "== Shell commands =="
