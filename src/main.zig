@@ -17,7 +17,7 @@ const console = @import("drivers/console.zig"); // on-screen framebuffer text co
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
-const loader = @import("loader.zig"); // flat-binary program loader (runs /INIT)
+const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
 const shell = @import("shell.zig"); // interactive serial command shell
@@ -182,8 +182,9 @@ export fn _start() noreturn {
     // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
     fat32.selfTest();
 
-    // Load and execute the /INIT flat binary off the disk (if present) — the
-    // first code this kernel runs that came from a filesystem.
+    // Load and execute the init binary off the disk (if present) — an ELF64 at
+    // /INIT.ELF, else a flat /INIT. The first code this kernel runs that came
+    // from a filesystem.
     loader.selfTest();
 
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
