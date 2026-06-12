@@ -350,6 +350,241 @@ pub fn readFile(path: []const u8, dst: []u8) ?usize {
     return written;
 }
 
+// === Write path ==============================================================
+// Enough FAT32 write support for a text editor to save: overwrite an existing
+// file (growing/shrinking its cluster chain) or create a new one with an 8.3
+// name. Long-name creation and subdirectory creation are not supported.
+
+// Little-endian field writers (mirror rd16/rd32).
+fn wr16(b: []u8, o: usize, v: u16) void {
+    b[o] = @truncate(v);
+    b[o + 1] = @truncate(v >> 8);
+}
+fn wr32(b: []u8, o: usize, v: u32) void {
+    b[o] = @truncate(v);
+    b[o + 1] = @truncate(v >> 8);
+    b[o + 2] = @truncate(v >> 16);
+    b[o + 3] = @truncate(v >> 24);
+}
+
+// Number of data clusters (valid clusters are 2 .. clusterCount()+1).
+fn clusterCount() u32 {
+    return (bi.total_sectors - bi.first_data_sector) / bi.sectors_per_cluster;
+}
+
+// Set the FAT entry for `cluster` to `value` in every FAT copy. Invalidates the
+// read cache so subsequent reads see the change.
+fn writeFatEntry(cluster: u32, value: u32) bool {
+    const fat_offset = cluster * 4;
+    const ent_off = fat_offset % @as(u32, bi.bytes_per_sector);
+    const within = fat_offset / @as(u32, bi.bytes_per_sector);
+    var sec: [SECTOR]u8 = undefined;
+    var fi: u8 = 0;
+    while (fi < bi.num_fats) : (fi += 1) {
+        const fat_sector = bi.reserved_sectors + @as(u32, fi) * bi.fat_size + within;
+        if (!ata.read(fat_sector, 1, &sec)) return false;
+        const top = rd32(&sec, ent_off) & 0xF0000000; // keep the 4 reserved high bits
+        wr32(&sec, ent_off, top | (value & 0x0FFFFFFF));
+        if (!ata.write(fat_sector, 1, &sec)) return false;
+    }
+    fat_cache_sector = 0xFFFFFFFF; // the cached FAT sector may now be stale
+    return true;
+}
+
+// Overwrite every data sector of a cluster with zeros.
+fn zeroCluster(c: u32) bool {
+    const zero = [_]u8{0} ** SECTOR;
+    var s: u32 = 0;
+    while (s < bi.sectors_per_cluster) : (s += 1) {
+        if (!ata.write(clusterToSector(c) + s, 1, &zero)) return false;
+    }
+    return true;
+}
+
+// Find a free cluster, mark it end-of-chain, zero it, and return it.
+fn allocCluster() ?u32 {
+    const count = clusterCount();
+    var c: u32 = 2;
+    while (c < count + 2) : (c += 1) {
+        if (nextCluster(c) == 0) { // a 0 FAT entry means free
+            if (!writeFatEntry(c, EOC)) return null;
+            if (!zeroCluster(c)) return null;
+            return c;
+        }
+    }
+    return null; // disk full
+}
+
+// Free an entire cluster chain (mark every entry free).
+fn freeChain(start: u32) void {
+    var c = start;
+    while (isDataCluster(c)) {
+        const nxt = nextCluster(c);
+        _ = writeFatEntry(c, 0);
+        c = nxt;
+    }
+}
+
+// On-disk location of a directory entry, plus the file fields we may rewrite.
+const DirLoc = struct { lba: u32, off: usize, first_cluster: u32 };
+
+// Locate the 32-byte directory entry for `name` inside the directory at
+// `parent_cluster`, returning where it lives on disk (so we can rewrite its size
+// and first-cluster fields). Matches assembled long names and 8.3 names.
+fn findDirLoc(parent_cluster: u32, name: []const u8) ?DirLoc {
+    var sector: [SECTOR]u8 = undefined;
+    var lfn: [256]u8 = undefined;
+    var lfn_len: usize = 0;
+    var cluster = parent_cluster;
+    while (isDataCluster(cluster)) {
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster) : (s += 1) {
+            const lba = clusterToSector(cluster) + s;
+            if (!ata.read(lba, 1, &sector)) return null;
+            var e: usize = 0;
+            while (e < SECTOR / 32) : (e += 1) {
+                const ent = sector[e * 32 .. e * 32 + 32];
+                if (ent[0] == 0x00) return null; // no more entries anywhere
+                if (ent[0] == 0xE5) {
+                    lfn_len = 0;
+                    continue;
+                }
+                const attr = ent[0x0B];
+                if (attr == ATTR_LFN) {
+                    accumulateLfn(ent, &lfn, &lfn_len);
+                    continue;
+                }
+                if (attr & ATTR_VOLUME_ID != 0) {
+                    lfn_len = 0;
+                    continue;
+                }
+                var shortbuf: [256]u8 = undefined;
+                const ename = if (lfn_len > 0) lfn[0..lfn_len] else shortName(ent, &shortbuf);
+                if (std.ascii.eqlIgnoreCase(ename, name)) {
+                    const fc = (@as(u32, rd16(ent, 0x14)) << 16) | rd16(ent, 0x1A);
+                    return .{ .lba = lba, .off = e * 32, .first_cluster = fc };
+                }
+                lfn_len = 0;
+            }
+        }
+        cluster = nextCluster(cluster);
+    }
+    return null;
+}
+
+// Render `name` into an 11-byte 8.3 field (uppercased, space-padded). Returns
+// false if it doesn't fit 8.3 (so we don't silently truncate a name).
+fn to83(name: []const u8, out: *[11]u8) bool {
+    @memset(out, ' ');
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.');
+    const base = if (dot) |d| name[0..d] else name;
+    const ext = if (dot) |d| name[d + 1 ..] else "";
+    if (base.len == 0 or base.len > 8 or ext.len > 3) return false;
+    for (base, 0..) |c, i| out[i] = std.ascii.toUpper(c);
+    for (ext, 0..) |c, i| out[8 + i] = std.ascii.toUpper(c);
+    return true;
+}
+
+// Create a new 8.3 directory entry in `parent_cluster` for `name`, pointing at
+// `first_cluster` with `size` bytes. Fails if the name isn't 8.3 or the
+// directory has no free slot in its existing clusters.
+fn createDirEntry(parent_cluster: u32, name: []const u8, first_cluster: u32, size: u32) bool {
+    var sfn: [11]u8 = undefined;
+    if (!to83(name, &sfn)) return false;
+    var sector: [SECTOR]u8 = undefined;
+    var cluster = parent_cluster;
+    while (isDataCluster(cluster)) {
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster) : (s += 1) {
+            const lba = clusterToSector(cluster) + s;
+            if (!ata.read(lba, 1, &sector)) return false;
+            var e: usize = 0;
+            while (e < SECTOR / 32) : (e += 1) {
+                const first = sector[e * 32];
+                if (first == 0x00 or first == 0xE5) { // a free slot
+                    const ent = sector[e * 32 .. e * 32 + 32];
+                    @memset(ent, 0);
+                    @memcpy(ent[0..11], &sfn);
+                    ent[0x0B] = 0x20; // attribute: archive (a normal file)
+                    wr16(ent, 0x14, @intCast(first_cluster >> 16));
+                    wr16(ent, 0x1A, @intCast(first_cluster & 0xFFFF));
+                    wr32(ent, 0x1C, size);
+                    return ata.write(lba, 1, &sector);
+                }
+            }
+        }
+        cluster = nextCluster(cluster);
+    }
+    return false; // directory full (extending it is unsupported)
+}
+
+// Write `data` to `path`, creating or overwriting the file. Grows/shrinks the
+// cluster chain to fit and updates the directory entry. Returns false on any
+// error (no FS, bad path, disk full, non-8.3 new name, directory full).
+pub fn writeFile(path: []const u8, data: []const u8) bool {
+    if (!mounted) return false;
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return false;
+    const parent_path = if (slash == 0) "/" else path[0..slash];
+    const name = path[slash + 1 ..];
+    if (name.len == 0) return false;
+    const parent = resolve(parent_path) orelse return false;
+    if (!parent.is_dir) return false;
+
+    const cluster_bytes = @as(usize, bi.sectors_per_cluster) * SECTOR;
+    const needed = (data.len + cluster_bytes - 1) / cluster_bytes; // clusters to hold data
+
+    const loc = findDirLoc(parent.cluster, name);
+    const old_first: u32 = if (loc) |l| l.first_cluster else 0;
+
+    // Build a chain of exactly `needed` clusters, reusing the file's existing one.
+    var chain_first: u32 = old_first;
+    if (needed == 0) {
+        if (isDataCluster(old_first)) freeChain(old_first);
+        chain_first = 0;
+    } else {
+        if (!isDataCluster(chain_first)) chain_first = allocCluster() orelse return false;
+        var prev = chain_first;
+        var have: usize = 1;
+        while (have < needed) : (have += 1) {
+            var nxt = nextCluster(prev);
+            if (!isDataCluster(nxt)) {
+                nxt = allocCluster() orelse return false;
+                if (!writeFatEntry(prev, nxt)) return false;
+            }
+            prev = nxt;
+        }
+        const extra = nextCluster(prev); // clusters beyond what we need
+        if (!writeFatEntry(prev, EOC)) return false;
+        if (isDataCluster(extra)) freeChain(extra);
+    }
+
+    // Write the data into the chain, zero-padding the final sector.
+    var cluster = chain_first;
+    var written: usize = 0;
+    while (written < data.len and isDataCluster(cluster)) {
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster and written < data.len) : (s += 1) {
+            var buf = [_]u8{0} ** SECTOR;
+            const n = @min(data.len - written, @as(usize, SECTOR));
+            @memcpy(buf[0..n], data[written .. written + n]);
+            if (!ata.write(clusterToSector(cluster) + s, 1, &buf)) return false;
+            written += n;
+        }
+        cluster = nextCluster(cluster);
+    }
+
+    // Update the existing directory entry, or create a new one.
+    if (loc) |l| {
+        var sec: [SECTOR]u8 = undefined;
+        if (!ata.read(l.lba, 1, &sec)) return false;
+        wr32(&sec, l.off + 0x1C, @intCast(data.len)); // file size
+        wr16(&sec, l.off + 0x14, @intCast(chain_first >> 16)); // first cluster (high)
+        wr16(&sec, l.off + 0x1A, @intCast(chain_first & 0xFFFF)); // first cluster (low)
+        return ata.write(l.lba, 1, &sec);
+    }
+    return createDirEntry(parent.cluster, name, chain_first, @intCast(data.len));
+}
+
 // --- Boot self-test ----------------------------------------------------------
 // Mount the disk, list the root directory, and read a known file — proving the
 // whole read path end to end. No-op (with a clear log line) if there's no disk
