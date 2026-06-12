@@ -56,6 +56,49 @@ tests/make-init.sh "$tmpf"
 mcopy -o -i "$DISK" "$tmpf" ::/INIT
 rm -f "$tmpf"
 
+# /INIT.ELF: a real, statically linked ELF64 ET_EXEC built with the Zig
+# toolchain. The kernel's loader auto-detects the ELF magic and uses the ELF
+# path (parse header -> walk program headers -> map each PT_LOAD segment at its
+# linked address with per-segment W^X), and prefers this file over the flat
+# /INIT at boot. It prints a marker to COM1 and returns the same magic. Built in
+# a scratch dir; refreshed on every run.
+elfd=$(mktemp -d)
+cat > "$elfd/init.s" <<'ASM'
+.section .text
+.global _start
+_start:
+    lea     msg(%rip), %rsi      # rsi = &msg (RIP-relative: position-independent)
+    mov     $0x3f8, %dx          # COM1 data port
+.loop:
+    lodsb
+    testb   %al, %al
+    je      .done
+    outb    %al, %dx
+    jmp     .loop
+.done:
+    movl    $0xb017b007, %eax    # success magic in rax
+    ret
+.section .rodata
+msg:
+    .asciz "INIT.ELF: hello from a real ELF!\n"
+ASM
+cat > "$elfd/init.ld" <<'LDS'
+ENTRY(_start)
+SECTIONS {
+    . = 0xffffd00000001000;
+    .text   : { *(.text*) }
+    . = ALIGN(0x1000);
+    .rodata : { *(.rodata*) }
+}
+LDS
+if zig cc -target x86_64-freestanding-none -nostdlib -c "$elfd/init.s" -o "$elfd/init.o" 2>/dev/null \
+   && zig ld.lld -o "$elfd/init.elf" -T "$elfd/init.ld" --static -z max-page-size=0x1000 "$elfd/init.o" 2>/dev/null; then
+    mcopy -o -i "$DISK" "$elfd/init.elf" ::/INIT.ELF
+else
+    echo "  (note: could not build /INIT.ELF with the zig toolchain; the kernel will fall back to flat /INIT)"
+fi
+rm -rf "$elfd"
+
 echo "Booting Obsidia..."
 # Launch QEMU utilizing KVM and passing the host architecture straight through.
 # -M pc (i440fx) gives us the legacy PIIX3 IDE controller our ATA PIO driver uses.

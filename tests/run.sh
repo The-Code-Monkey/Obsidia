@@ -175,17 +175,80 @@ FATDISK="$TMP/fat.img"
 truncate -s 64M "$FATDISK"
 mformat -i "$FATDISK" -F -v OBSIDIA :: 2>/dev/null
 
+# make_init_elf <file> : build the /INIT.ELF test program — a real, statically
+# linked ELF64 ET_EXEC produced by the Zig toolchain (zig cc + zig ld.lld), so
+# the ELF loader path is exercised end-to-end against a genuine linked binary
+# rather than a hand-rolled header. The program is freestanding x86-64 asm that
+# prints a marker to COM1 and returns the magic 0xB017B007 in rax via `ret`,
+# matching the loader's binary contract. It is linked into LOAD_BASE's PML4 slot
+# (0xffffd0...) with two PAGE-DISJOINT load segments — .text (R+X) and .rodata
+# (R only, non-exec) — so the loader's PER-SEGMENT W^X mapping is tested: one
+# segment must come out executable, the other non-executable. Returns non-zero
+# (and leaves "$1" absent) if the toolchain can't build it, so the caller can
+# skip the ELF checks rather than fail spuriously.
+make_init_elf() {
+    local out="$1" d
+    d=$(mktemp -d) || return 1
+    cat > "$d/init.s" <<'ASM'
+# Freestanding ELF init: print a marker to COM1, then return the success magic.
+.section .text
+.global _start
+_start:
+    lea     msg(%rip), %rsi      # rsi = &msg (RIP-relative: position-independent)
+    mov     $0x3f8, %dx          # COM1 data port
+.loop:
+    lodsb                        # al = *rsi++
+    testb   %al, %al             # NUL terminator?
+    je      .done
+    outb    %al, %dx             # emit the byte to the serial port
+    jmp     .loop
+.done:
+    movl    $0xb017b007, %eax    # the success magic, returned in rax
+    ret                          # back into the kernel loader
+.section .rodata
+msg:
+    .asciz "INIT.ELF: hello from a real ELF!\n"
+ASM
+    # Linker script: load into LOAD_BASE's slot, .text and .rodata on separate
+    # pages so they become two distinct PT_LOAD segments with different perms.
+    cat > "$d/init.ld" <<'LDS'
+ENTRY(_start)
+SECTIONS {
+    . = 0xffffd00000001000;
+    .text   : { *(.text*) }
+    . = ALIGN(0x1000);
+    .rodata : { *(.rodata*) }
+}
+LDS
+    zig cc -target x86_64-freestanding-none -nostdlib -c "$d/init.s" -o "$d/init.o" 2>/dev/null || { rm -rf "$d"; return 1; }
+    # -z max-page-size=0x1000 keeps the two load segments page-disjoint so each
+    # gets its own permissions (rather than being merged into one R+E segment).
+    zig ld.lld -o "$out" -T "$d/init.ld" --static -z max-page-size=0x1000 "$d/init.o" 2>/dev/null || { rm -rf "$d"; return 1; }
+    rm -rf "$d"
+    [ -s "$out" ]   # success only if a non-empty ELF was produced
+}
+
 fattmp=$(mktemp)
 printf 'Hello from FAT32 on Obsidia!\n' > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/HELLO.TXT
 mmd -i "$FATDISK" ::/docs 2>/dev/null
 printf 'nested file contents ok\n'      > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/docs/NOTES.TXT
 printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" "::/a-long-filename.txt"
-# /INIT is produced by the shared canonical helper (one source of truth for the
-# binary's bytes, see tests/make-init.sh) so it can't drift from run.sh's copy.
+# /INIT (flat) is produced by the shared canonical helper (one source of truth
+# for the binary's bytes, see tests/make-init.sh) so it can't drift from run.sh.
 tests/make-init.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/INIT
+# Seed the real ELF init too (if the toolchain can build it). The boot self-test
+# prefers /INIT.ELF when present, so it exercises the ELF path automatically; we
+# also drive `exec /INIT.ELF` (ELF) and `exec /INIT` (flat) from the shell to
+# prove both loader paths are reachable and re-runnable.
+HAVE_ELF=0
+if make_init_elf "$fattmp"; then mcopy -i "$FATDISK" "$fattmp" ::/INIT.ELF; HAVE_ELF=1; else
+    echo "  (note: could not build /INIT.ELF with the zig toolchain; ELF-path checks will be skipped)"
+fi
 rm -f "$fattmp"
+elf_cmd=""; [ "$HAVE_ELF" -eq 1 ] && elf_cmd="exec /INIT.ELF\r"
 ( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
   printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 0.4; \
+  [ -n "$elf_cmd" ] && { printf '%b' "$elf_cmd"; sleep 1; }; \
   printf 'exec /INIT\r'; sleep 1 ) \
     | timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$FATDISK",format=raw,if=ide \
@@ -198,19 +261,44 @@ assert_in "$TMP/fat.log" "Hello from FAT32 on Obsidia!"    "FAT32: reads a file'
 assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a nested path (/docs/notes.txt)"
 assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
 
-# --- Init loader (flat binary off the FAT32 disk) -----------------------------
-# The boot self-test execs /INIT once; the shell `exec /INIT` above runs it a
-# second time. The marker can only appear if the loaded code itself executed
-# (the string lives inside the binary and is printed by its own loop), and the
-# magic return value proves it came back to the kernel cleanly.
-echo "== Init loader (flat binary off the FAT32 disk) =="
-assert_in "$TMP/fat.log" "INIT: hello from FAT32!"                 "init: the binary's own code ran (marker on serial)"
+# --- Init loader (ELF64 + flat binary off the FAT32 disk) ---------------------
+# Boot self-test execs /INIT.ELF (preferred when present); the shell then runs
+# `exec /INIT.ELF` (ELF path again) and `exec /INIT` (flat path). A marker can
+# only appear if the loaded code itself executed (the string lives inside the
+# binary and is printed by its own loop), and the magic return value proves it
+# came back to the kernel cleanly. We assert BOTH formats independently so the
+# auto-detect and both code paths are covered.
+echo "== Init loader (ELF64 + flat binary off the FAT32 disk) =="
+
+# Flat path (shell `exec /INIT`): hand-assembled raw binary, auto-detected as
+# non-ELF and loaded at LOAD_BASE.
+assert_in "$TMP/fat.log" "INIT: hello from FAT32!"                 "init(flat): the binary's own code ran (marker on serial)"
+assert_in "$TMP/fat.log" "flat binary -> "                        "init(flat): auto-detected as a flat binary"
 assert_in "$TMP/fat.log" "init returned 0xb017b007 (magic OK)"     "init: returned the magic value to the kernel"
-assert_in "$TMP/fat.log" "[LOADER] init ran and exited cleanly."   "init: full pipeline (map RW+NX -> copy -> remap RX -> run -> unmap)"
+assert_in "$TMP/fat.log" "[LOADER] init ran and exited cleanly."   "init: full pipeline (map RW+NX -> copy -> remap -> run -> unmap)"
+assert_in "$TMP/fat.log" "image unmapped,"                         "init: image unmapped + frames freed after run"
 # Count clean RETURNS (magic-OK log lines), not greetings: this proves the
-# binary both ran and returned to the kernel cleanly on each of the two paths.
+# binary both ran and returned to the kernel cleanly on each run (boot self-test
+# plus the shell exec(s) — >=2 across flat and/or ELF).
 inits=$(grep -ac "init returned 0xb017b007 (magic OK)" "$TMP/fat.log")
 if [ "$inits" -ge 2 ]; then ok "init: re-runnable (boot self-test + shell exec = ${inits} runs)"; else bad "init: expected >=2 runs (boot + shell exec), saw ${inits}"; fi
+
+if [ "$HAVE_ELF" -eq 1 ]; then
+    # ELF path: a real linked ELF64 ET_EXEC. Assert it was parsed as ELF, its two
+    # segments were mapped with PER-SEGMENT W^X (one R-X, one R--), the .text ran
+    # (its marker reached serial), and it returned the magic.
+    assert_in "$TMP/fat.log" "INIT.ELF: hello from a real ELF!"    "init(elf): the ELF's own code ran (marker on serial)"
+    assert_in "$TMP/fat.log" "ELF64 ET_EXEC, entry 0x"             "init(elf): parsed ELF64 header + entry point"
+    assert_in "$TMP/fat.log" "R-X"                                 "init(elf): a segment mapped executable read-only (W^X)"
+    assert_in "$TMP/fat.log" "R--"                                 "init(elf): a segment mapped non-executable read-only (W^X)"
+    assert_in "$TMP/fat.log" "PT_LOAD seg"                         "init(elf): walked program headers + mapped PT_LOAD segments"
+    # Re-runnable: boot self-test + shell `exec /INIT.ELF` = >=2 ELF runs.
+    elfs=$(grep -ac "INIT.ELF: hello from a real ELF!" "$TMP/fat.log")
+    if [ "$elfs" -ge 2 ]; then ok "init(elf): re-runnable (boot self-test + shell exec = ${elfs} runs)"; else bad "init(elf): expected >=2 runs (boot + shell exec), saw ${elfs}"; fi
+else
+    echo "  (skipping ELF-path checks: toolchain could not build /INIT.ELF)"
+fi
+
 # A disk-less boot must skip the loader gracefully (and still reach BOOT_OK,
 # which the marker checks above already proved).
 assert_in "$TMP/bios.log" "[LOADER] self-test skipped"             "init: disk-less boot skips the loader gracefully"
