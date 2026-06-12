@@ -16,8 +16,9 @@ const scheduler = @import("sched/scheduler.zig"); // for the `ps` command
 const apic = @import("arch/apic.zig"); // pause/resume the timer for `sleep`
 const fat32 = @import("fs/fat32.zig"); // for the `ls` / `cat` commands
 const loader = @import("loader.zig"); // for the `exec` command
-const auth = @import("auth.zig"); // Argon2id password verification (login)
-const heap = @import("mm/heap.zig"); // allocator for the Argon2 verify
+const auth = @import("auth.zig"); // scrypt password verification (login)
+const heap = @import("mm/heap.zig"); // allocator for the scrypt verify
+const install = @import("install.zig"); // the `install` command (in-guest installer)
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -290,6 +291,7 @@ fn execute(raw: []const u8) void {
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
         serial.print("          ls [path], cat <path>, exec <path> (run an ELF or flat binary),\n", .{});
+        if (install.available()) serial.print("          install (clone Obsidia onto the disk),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete,\n", .{});
         serial.print("   pageup/pagedown = scroll the screen back/forward)\n", .{});
@@ -314,6 +316,8 @@ fn execute(raw: []const u8) void {
         if (args.len == 0) serial.print("usage: cat <path>\n", .{}) else fat32.cat(args);
     } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary from the disk
         if (args.len == 0) serial.print("usage: exec <path>\n", .{}) else _ = loader.exec(args);
+    } else if (std.mem.eql(u8, cmd, "install")) { // clone the system image onto the disk
+        install.run();
     } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
         scheduler.dump();
     } else if (std.mem.eql(u8, cmd, "clear")) { // clear the terminal
