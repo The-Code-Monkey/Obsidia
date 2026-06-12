@@ -19,6 +19,7 @@ const loader = @import("loader.zig"); // for the `exec` command
 const auth = @import("auth.zig"); // scrypt password verification (login)
 const heap = @import("mm/heap.zig"); // allocator for the scrypt verify
 const install = @import("install.zig"); // the `install` command (in-guest installer)
+const editor = @import("editor.zig"); // the `edit` command (text editor)
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -56,6 +57,15 @@ pub fn feed(c: u8) void {
 // since the producer (an IRQ) advances it.
 fn ringEmpty() bool {
     return ring_tail == @atomicLoad(usize, &ring_head, .acquire);
+}
+
+// Block until one input byte is available and return it. Idles on `hlt` between
+// checks (woken by the input/timer IRQ). Used by the editor to read keystrokes.
+pub fn getKeyBlocking() u8 {
+    while (true) {
+        if (ringPop()) |b| return b;
+        asm volatile ("hlt");
+    }
 }
 
 // Full-system sleep: halt the whole machine until a key is pressed. We mask the
@@ -345,7 +355,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          cd [dir], ls [path], cat <path>, exec <path> (run a binary),\n", .{});
+        serial.print("          cd [dir], ls [path], cat <path>, edit <path>, exec <path>,\n", .{});
         if (install.available()) serial.print("          install (clone Obsidia onto the disk),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete,\n", .{});
@@ -397,6 +407,13 @@ fn execute(raw: []const u8) void {
         } else {
             var pbuf: [256]u8 = undefined;
             _ = loader.exec(resolvePath(args, &pbuf));
+        }
+    } else if (std.mem.eql(u8, cmd, "edit")) { // open a file in the text editor
+        if (args.len == 0) {
+            serial.print("usage: edit <path>\n", .{});
+        } else {
+            var pbuf: [256]u8 = undefined;
+            editor.run(resolvePath(args, &pbuf), &getKeyBlocking);
         }
     } else if (std.mem.eql(u8, cmd, "install")) { // clone the system image onto the disk
         install.run();
