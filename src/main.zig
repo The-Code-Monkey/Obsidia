@@ -216,6 +216,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     scheduler.selfTest(); // demo cooperative kernel-thread context switching
     scheduler.preemptDemo(); // demo timer-driven preemption (threads that never yield)
     scheduler.blockSleepDemo(); // demo blocking sleep (a thread sleeps, the timer wakes it)
+    scheduler.mutexDemo(); // demo the blocking Mutex (two threads contend; mutual exclusion)
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
