@@ -280,7 +280,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          ls [path], cat <path>, exec <path> (run a flat binary),\n", .{});
+        serial.print("          ls [path], cat <path>, exec <path> (run an ELF or flat binary),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
@@ -302,7 +302,7 @@ fn execute(raw: []const u8) void {
         fat32.ls(if (args.len > 0) args else "/"); // default to the root directory
     } else if (std.mem.eql(u8, cmd, "cat")) { // print a file from the FAT32 disk
         if (args.len == 0) serial.print("usage: cat <path>\n", .{}) else fat32.cat(args);
-    } else if (std.mem.eql(u8, cmd, "exec")) { // load + run a flat binary from the disk
+    } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary from the disk
         if (args.len == 0) serial.print("usage: exec <path>\n", .{}) else _ = loader.exec(args);
     } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
         scheduler.dump();
