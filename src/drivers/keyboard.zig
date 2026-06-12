@@ -82,6 +82,8 @@ fn emitExtended(code: u8) void {
         0x47 => emit("\x1b[H"), // Home
         0x4F => emit("\x1b[F"), // End
         0x53 => emit("\x1b[3~"), // Delete (forward)
+        0x49 => emit("\x1b[5~"), // Page Up (scroll the console back)
+        0x51 => emit("\x1b[6~"), // Page Down (scroll the console forward)
         else => {}, // ignore other extended keys
     }
 }
@@ -206,4 +208,28 @@ test "extended arrow keys emit escape sequences" {
     handle(0xE0); // extended prefix
     handle(0x48); // Up arrow (press)
     try t.expectEqualStrings("\x1b[A", Capture.buf[0..Capture.len]);
+}
+
+test "Page Up / Page Down emit scrollback escape sequences" {
+    const t = @import("std").testing;
+    const Capture = struct {
+        var buf: [8]u8 = undefined;
+        var len: usize = 0;
+        fn reset() void {
+            len = 0;
+        }
+        fn sinkFn(c: u8) void {
+            buf[len] = c;
+            len += 1;
+        }
+    };
+    setSink(&Capture.sinkFn);
+    Capture.reset();
+    handle(0xE0); // extended prefix
+    handle(0x49); // Page Up (press) -> ESC[5~
+    try t.expectEqualStrings("\x1b[5~", Capture.buf[0..Capture.len]);
+    Capture.reset();
+    handle(0xE0);
+    handle(0x51); // Page Down (press) -> ESC[6~
+    try t.expectEqualStrings("\x1b[6~", Capture.buf[0..Capture.len]);
 }

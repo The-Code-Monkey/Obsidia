@@ -211,13 +211,19 @@ fn submitLine() void {
     prompt();
 }
 
-// Interpret a CSI escape sequence (arrow keys, Home/End, Delete).
+// Interpret a CSI escape sequence (arrow keys, Home/End, Delete, Page Up/Down).
 fn handleCsi(c: u8) void {
     if (c >= '0' and c <= '9') { // accumulate the numeric parameter
         csi_param = csi_param * 10 + (c - '0');
         return;
     }
     in_esc = 0; // any non-digit is the final byte
+    // Page Up / Page Down (ESC[5~ / ESC[6~) drive the console's scrollback and
+    // leave the edited line alone. Every other key is line editing, so first snap
+    // the on-screen view back to the live bottom (no-op if already there).
+    if (c == '~' and csi_param == 5) return console.scrollUp();
+    if (c == '~' and csi_param == 6) return console.scrollDown();
+    console.scrollToBottom();
     switch (c) {
         'A' => historyUp(), // Up arrow
         'B' => historyDown(), // Down arrow
@@ -263,6 +269,7 @@ fn handleChar(c: u8) void {
         return;
     }
 
+    console.scrollToBottom(); // any real keystroke returns to the live bottom
     switch (c) {
         '\r', '\n' => submitLine(), // Enter: run the line
         0x08, 0x7f => backspace(), // Backspace / DEL
@@ -282,7 +289,8 @@ fn execute(raw: []const u8) void {
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
         serial.print("          ls [path], cat <path>, exec <path> (run an ELF or flat binary),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
-        serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
+        serial.print("  (up/down = history, left/right/home/end = move, del = delete,\n", .{});
+        serial.print("   pageup/pagedown = scroll the screen back/forward)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
         serial.print("restarting...\n", .{});
         power.reboot();
