@@ -134,10 +134,26 @@ fn handle(sc: u8) void {
     }
 }
 
-// IRQ1 handler: read the scancode and decode it.
+// IRQ1 handler: drain every scancode the controller has buffered and decode it.
+//
+// We must read ALL queued bytes, not just one: under KVM (and on real hardware)
+// the 8042 can have several scancodes waiting by the time we service the IRQ —
+// in particular the two bytes of an extended key (Page Up = 0xE0 0x49, arrows,
+// Home/End/Delete) often arrive together. Reading only one byte per interrupt
+// would leave the rest in the buffer and desynchronize the stream, so extended
+// keys and fast typing silently break. (Under TCG the bytes trickle in one IRQ
+// each, which is why this went unnoticed.)
+//
+// Status port bit 0 = output buffer full; bit 5 = the byte came from the mouse.
+// We consume keyboard bytes only and stop at a mouse byte, leaving it for a
+// future mouse IRQ handler rather than swallowing it here.
 fn onIrq() void {
-    const sc = serial.inb(DATA);
-    handle(sc);
+    while (true) {
+        const status = serial.inb(STATUS);
+        if (status & 0x01 == 0) break; // output buffer empty: nothing left
+        if (status & 0x20 != 0) break; // next byte is mouse data: not ours
+        handle(serial.inb(DATA)); // a keyboard scancode — decode it
+    }
 }
 
 pub fn init() void {
