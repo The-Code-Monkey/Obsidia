@@ -19,6 +19,7 @@ const loader = @import("loader.zig"); // for the `exec` command
 const auth = @import("auth.zig"); // scrypt password verification (login)
 const heap = @import("mm/heap.zig"); // allocator for the scrypt verify
 const install = @import("install.zig"); // the `install` command (in-guest installer)
+const editor = @import("editor.zig"); // the `edit` command (text editor)
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -56,6 +57,15 @@ pub fn feed(c: u8) void {
 // since the producer (an IRQ) advances it.
 fn ringEmpty() bool {
     return ring_tail == @atomicLoad(usize, &ring_head, .acquire);
+}
+
+// Block until one input byte is available and return it. Idles on `hlt` between
+// checks (woken by the input/timer IRQ). Used by the editor to read keystrokes.
+pub fn getKeyBlocking() u8 {
+    while (true) {
+        if (ringPop()) |b| return b;
+        asm volatile ("hlt");
+    }
 }
 
 // Full-system sleep: halt the whole machine until a key is pressed. We mask the
@@ -199,9 +209,64 @@ fn historyDown() void {
     if (browse == 0) replaceLine("") else replaceLine(histAt(browse));
 }
 
+// --- Working directory -------------------------------------------------------
+// The shell tracks a current directory so paths can be relative. ls/cat/exec/cd
+// all resolve their argument against it. Starts at the root "/".
+var cwd_buf: [256]u8 = [_]u8{'/'} ++ [_]u8{0} ** 255;
+var cwd_len: usize = 1;
+
+// Collapse "." and ".." in `raw` into a clean absolute path written to `out`.
+fn normalizePath(raw: []const u8, out: []u8) []const u8 {
+    var comps: [32][]const u8 = undefined; // path components after normalization
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, raw, '/');
+    while (it.next()) |c| {
+        if (std.mem.eql(u8, c, ".")) continue; // "." = stay here
+        if (std.mem.eql(u8, c, "..")) { // ".." = up one (no-op at root)
+            if (n > 0) n -= 1;
+            continue;
+        }
+        if (n < comps.len) {
+            comps[n] = c;
+            n += 1;
+        }
+    }
+    if (n == 0) { // everything collapsed away -> root
+        out[0] = '/';
+        return out[0..1];
+    }
+    var len: usize = 0;
+    for (comps[0..n]) |c| {
+        out[len] = '/';
+        len += 1;
+        @memcpy(out[len..][0..c.len], c);
+        len += c.len;
+    }
+    return out[0..len];
+}
+
+// Resolve `arg` to a normalized absolute path in `out`. An absolute arg is taken
+// as-is; a relative one is joined onto the current directory; "" means the cwd.
+fn resolvePath(arg: []const u8, out: []u8) []const u8 {
+    var raw: [512]u8 = undefined;
+    var rl: usize = 0;
+    if (arg.len > 0 and arg[0] == '/') {
+        @memcpy(raw[0..arg.len], arg);
+        rl = arg.len;
+    } else {
+        @memcpy(raw[0..cwd_len], cwd_buf[0..cwd_len]); // start from the cwd
+        rl = cwd_len;
+        raw[rl] = '/';
+        rl += 1;
+        @memcpy(raw[rl..][0..arg.len], arg);
+        rl += arg.len;
+    }
+    return normalizePath(raw[0..rl], out);
+}
+
 // --- Input handling ----------------------------------------------------------
 fn prompt() void {
-    serial.print("obsidia> ", .{});
+    serial.print("obsidia:{s}> ", .{cwd_buf[0..cwd_len]}); // show the current directory
 }
 
 fn submitLine() void {
@@ -290,7 +355,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          ls [path], cat <path>, exec <path> (run an ELF or flat binary),\n", .{});
+        serial.print("          cd [dir], ls [path], cat <path>, edit <path>, exec <path>,\n", .{});
         if (install.available()) serial.print("          install (clone Obsidia onto the disk),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete,\n", .{});
@@ -310,12 +375,46 @@ fn execute(raw: []const u8) void {
         while (k > 0) : (k -= 1) { // oldest first
             serial.print("  {d}: {s}\n", .{ hist_size - k + 1, histAt(k) });
         }
+    } else if (std.mem.eql(u8, cmd, "cd")) { // change the current directory
+        var pbuf: [256]u8 = undefined;
+        const target = resolvePath(if (args.len > 0) args else "/", &pbuf);
+        if (std.mem.eql(u8, target, "/")) { // root always exists
+            cwd_buf[0] = '/';
+            cwd_len = 1;
+        } else if (fat32.resolve(target)) |node| {
+            if (!node.is_dir) {
+                serial.print("cd: not a directory: {s}\n", .{target});
+            } else if (target.len > cwd_buf.len) {
+                serial.print("cd: path too long\n", .{});
+            } else {
+                @memcpy(cwd_buf[0..target.len], target);
+                cwd_len = target.len;
+            }
+        } else serial.print("cd: no such directory: {s}\n", .{target});
     } else if (std.mem.eql(u8, cmd, "ls")) { // list a directory on the FAT32 disk
-        fat32.ls(if (args.len > 0) args else "/"); // default to the root directory
+        var pbuf: [256]u8 = undefined;
+        fat32.ls(resolvePath(args, &pbuf)); // no arg -> the current directory
     } else if (std.mem.eql(u8, cmd, "cat")) { // print a file from the FAT32 disk
-        if (args.len == 0) serial.print("usage: cat <path>\n", .{}) else fat32.cat(args);
+        if (args.len == 0) {
+            serial.print("usage: cat <path>\n", .{});
+        } else {
+            var pbuf: [256]u8 = undefined;
+            fat32.cat(resolvePath(args, &pbuf));
+        }
     } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary from the disk
-        if (args.len == 0) serial.print("usage: exec <path>\n", .{}) else _ = loader.exec(args);
+        if (args.len == 0) {
+            serial.print("usage: exec <path>\n", .{});
+        } else {
+            var pbuf: [256]u8 = undefined;
+            _ = loader.exec(resolvePath(args, &pbuf));
+        }
+    } else if (std.mem.eql(u8, cmd, "edit")) { // open a file in the text editor
+        if (args.len == 0) {
+            serial.print("usage: edit <path>\n", .{});
+        } else {
+            var pbuf: [256]u8 = undefined;
+            editor.run(resolvePath(args, &pbuf), &getKeyBlocking);
+        }
     } else if (std.mem.eql(u8, cmd, "install")) { // clone the system image onto the disk
         install.run();
     } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
