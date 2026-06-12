@@ -24,7 +24,7 @@ pub fn main() !void {
     var buf: [256]u8 = undefined;
     const phc = try scrypt.strHash(
         args[2],
-        .{ .allocator = a, .params = .{ .ln = 14, .r = 8, .p = 1 }, .encoding = .phc },
+        .{ .allocator = a, .params = .{ .ln = 12, .r = 8, .p = 1 }, .encoding = .phc },
         &buf,
     );
 

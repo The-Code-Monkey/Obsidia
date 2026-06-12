@@ -331,9 +331,9 @@ mformat -i "$LOGINDISK" -F -v OBSIDIA :: 2>/dev/null
 mmd -i "$LOGINDISK" ::/OBSIDIA 2>/dev/null
 zig run tools/mkpasswd.zig -- root hunter2 > "$TMP/authline" 2>/dev/null
 mcopy -i "$LOGINDISK" "$TMP/authline" ::/OBSIDIA/AUTH
-( sleep "$BOOT_WAIT"; printf 'root\r'; sleep 1; printf 'wrongpw\r'; sleep 6; \
-  printf 'root\r'; sleep 1; printf 'hunter2\r'; sleep 6; printf 'mem\r'; sleep 2 ) \
-    | timeout 45 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+( sleep "$BOOT_WAIT"; printf 'root\r'; sleep 1; printf 'wrongpw\r'; sleep 8; \
+  printf 'root\r'; sleep 1; printf 'hunter2\r'; sleep 8; printf 'mem\r'; sleep 3 ) \
+    | timeout 90 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$LOGINDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/login.log",signal=off -serial chardev:c0 \
       -display none -no-reboot >/dev/null 2>&1 || true

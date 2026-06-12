@@ -15,11 +15,14 @@
 const std = @import("std");
 const scrypt = std.crypto.pwhash.scrypt;
 
-// Cost parameters for hashes WE create. ln=14 -> N=2^14, with r=8,p=1 that's the
-// classic "interactive" scrypt cost (~16 MiB working set) — a real memory-hard
-// barrier that stays responsive on a hobby kernel. Verification honors whatever
-// the stored hash embeds, so raising this later won't break existing credentials.
-pub const PARAMS = scrypt.Params{ .ln = 14, .r = 8, .p = 1 };
+// Cost parameters for hashes WE create. ln=12 -> N=2^12, with r=8,p=1 that's a
+// ~4 MiB memory-hard scrypt cost: a real barrier (orders of magnitude beyond any
+// plain hash), while staying responsive when verified under emulation (a hobby
+// kernel runs login in software, and CI runs it under TCG). Verification honors
+// whatever the stored hash embeds, so raising this later won't break existing
+// credentials. (The credential's cost is set by whoever creates it — see
+// tools/mkpasswd.zig — and verification uses that embedded cost.)
+pub const PARAMS = scrypt.Params{ .ln = 12, .r = 8, .p = 1 };
 
 // Largest PHC string we read/write (scrypt PHC is ~100 bytes; 256 is headroom).
 pub const MAX_HASH = 256;
