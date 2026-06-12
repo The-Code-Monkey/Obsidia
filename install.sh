@@ -21,7 +21,8 @@ cd "$(dirname "$0")"
 
 SYS=obsidia-system.img        # the bootable GPT system image we assemble
 ISO=obsidia-installer.iso     # installer ISO that carries $SYS as a module
-DISK=obsidia-disk.img         # the blank target disk the installer writes
+DISK=obsidia-install.img      # the blank target disk the installer writes
+                              # (kept separate from run.sh's obsidia-disk.img)
 SIZE=64M                      # size of both the system image and the target disk
 ESP_OFFSET=$((2048 * 512))    # ESP partition starts at LBA 2048 (1 MiB)
 
