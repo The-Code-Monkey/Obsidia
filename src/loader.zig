@@ -100,6 +100,15 @@ pub fn exec(path: []const u8) bool {
         teardown(pages);
         return false;
     };
+    // A short read means the cluster chain ended before the file's declared
+    // size (a truncated or corrupt file); readFile reports this as a byte count
+    // below node.size rather than an error. Running a partially-loaded image
+    // would execute garbage, so refuse and unwind instead.
+    if (got != node.size) {
+        serial.print("[LOADER] short read for {s}: got {d} of {d} bytes.\n", .{ path, got, node.size });
+        teardown(pages);
+        return false;
+    }
     serial.print("[LOADER]   copied {d} bytes (pages RW+NX while writing).\n", .{got});
 
     // Stage 3: flip every page to READ-ONLY + EXECUTABLE. vmm.map overwrites

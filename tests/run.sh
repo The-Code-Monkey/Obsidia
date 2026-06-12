@@ -175,33 +175,14 @@ FATDISK="$TMP/fat.img"
 truncate -s 64M "$FATDISK"
 mformat -i "$FATDISK" -F -v OBSIDIA :: 2>/dev/null
 
-# make_init <file> : write the /INIT test program — a hand-assembled flat
-# x86-64 binary (no assembler needed). The kernel's loader contract: loaded at
-# a fixed address, entered at byte 0, C calling convention, returns a magic in
-# rax. This one prints a marker string straight to COM1 (port 0x3F8) and
-# returns 0xB017B007. Position-independent via RIP-relative lea.
-#
-#   0:  48 8d 35 12 00 00 00   lea  rsi, [rip+0x12]   ; rsi = &msg (at 0x19)
-#   7:  66 ba f8 03            mov  dx, 0x3f8         ; COM1 data port
-#   b:  ac                     lodsb                  ; al = *rsi++
-#   c:  84 c0                  test al, al            ; NUL terminator?
-#   e:  74 03                  je   0x13              ; yes -> return
-#  10:  ee                     out  dx, al            ; emit the byte
-#  11:  eb f8                  jmp  0xb               ; next char
-#  13:  b8 07 b0 17 b0         mov  eax, 0xb017b007   ; the success magic
-#  18:  c3                     ret                    ; back into the kernel
-#  19:  msg: "INIT: hello from FAT32!\n\0"
-make_init() {
-    printf '\x48\x8d\x35\x12\x00\x00\x00\x66\xba\xf8\x03\xac\x84\xc0\x74\x03\xee\xeb\xf8\xb8\x07\xb0\x17\xb0\xc3' > "$1"
-    printf 'INIT: hello from FAT32!\n\0' >> "$1"
-}
-
 fattmp=$(mktemp)
 printf 'Hello from FAT32 on Obsidia!\n' > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/HELLO.TXT
 mmd -i "$FATDISK" ::/docs 2>/dev/null
 printf 'nested file contents ok\n'      > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/docs/NOTES.TXT
 printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" "::/a-long-filename.txt"
-make_init "$fattmp";                                 mcopy -i "$FATDISK" "$fattmp" ::/INIT
+# /INIT is produced by the shared canonical helper (one source of truth for the
+# binary's bytes, see tests/make-init.sh) so it can't drift from run.sh's copy.
+tests/make-init.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/INIT
 rm -f "$fattmp"
 ( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
   printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 0.4; \
@@ -226,7 +207,9 @@ echo "== Init loader (flat binary off the FAT32 disk) =="
 assert_in "$TMP/fat.log" "INIT: hello from FAT32!"                 "init: the binary's own code ran (marker on serial)"
 assert_in "$TMP/fat.log" "init returned 0xb017b007 (magic OK)"     "init: returned the magic value to the kernel"
 assert_in "$TMP/fat.log" "[LOADER] init ran and exited cleanly."   "init: full pipeline (map RW+NX -> copy -> remap RX -> run -> unmap)"
-inits=$(grep -ac "INIT: hello from FAT32!" "$TMP/fat.log")
+# Count clean RETURNS (magic-OK log lines), not greetings: this proves the
+# binary both ran and returned to the kernel cleanly on each of the two paths.
+inits=$(grep -ac "init returned 0xb017b007 (magic OK)" "$TMP/fat.log")
 if [ "$inits" -ge 2 ]; then ok "init: re-runnable (boot self-test + shell exec = ${inits} runs)"; else bad "init: expected >=2 runs (boot + shell exec), saw ${inits}"; fi
 # A disk-less boot must skip the loader gracefully (and still reach BOOT_OK,
 # which the marker checks above already proved).
