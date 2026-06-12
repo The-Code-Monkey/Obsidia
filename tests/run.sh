@@ -307,6 +307,32 @@ fi
 # which the marker checks above already proved).
 assert_in "$TMP/bios.log" "[LOADER] self-test skipped"             "init: disk-less boot skips the loader gracefully"
 
+# --- cd + editor (FAT32 write) -----------------------------------------------
+# Drive: cd into a subdir (prompt should show it), edit a file with a relative
+# path (creating it via FAT32 write), save (Ctrl-S) + exit (Ctrl-X), then cat it
+# back. Proves cd + relative paths + the editor + the FAT32 write/read round trip.
+echo "== cd + editor (FAT32 write) =="
+WRDISK="$TMP/wr.img"
+truncate -s 32M "$WRDISK"
+mformat -i "$WRDISK" -F -v OBSIDIA :: 2>/dev/null
+mmd -i "$WRDISK" ::/docs 2>/dev/null
+( sleep "$BOOT_WAIT"; printf 'cd docs\r'; sleep 0.5; \
+  printf 'edit note.txt\r'; sleep 0.8; printf 'harness editor write\r'; sleep 0.4; \
+  printf '\x13'; sleep 0.8; printf '\x18'; sleep 0.5; \
+  printf 'cat note.txt\r'; sleep 0.8 ) \
+    | timeout 20 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+      -drive file="$WRDISK",format=raw,if=ide \
+      -chardev stdio,id=c0,logfile="$TMP/wr.log",signal=off -serial chardev:c0 \
+      -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/wr.log" "obsidia:/docs>"        "cd: changed directory (prompt shows /docs)"
+assert_in "$TMP/wr.log" "harness editor write"  "editor: created + saved a file; cat reads it back (FAT32 write)"
+# Confirm the file really landed on the disk (independent host check via mtools).
+if mtype -i "$WRDISK" ::/docs/note.txt 2>/dev/null | grep -qa "harness editor write"; then
+    ok "editor: saved file is present on the disk (verified with mtools)"
+else
+    bad "editor: saved file not found on the disk"
+fi
+
 # --- Shell interaction -------------------------------------------------------
 echo "== Shell commands =="
 boot_shell "$TMP/shell.log" 512M 'help\rmem\ruptime\recho test123\rps\rbogus\r'
