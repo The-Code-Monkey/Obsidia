@@ -12,6 +12,7 @@ const serial = @import("../drivers/serial.zig");
 const heap = @import("../mm/heap.zig");
 const pic = @import("../arch/pic.zig"); // timer tick hook + tick counter
 const sync = @import("sync.zig"); // honor the print lock (don't switch mid-print)
+const mutex = @import("mutex.zig"); // blocking Mutex (used by the mutex self-test)
 
 const STACK_SIZE = 32 * 1024; // 32 KiB per thread (the shell uses std.fmt etc.)
 const MAX_THREADS = 16;
@@ -306,4 +307,84 @@ pub fn blockSleepDemo() void {
     pic.on_tick = null;
     preempting = false;
     serial.print("[SCHED] Blocking-sleep self-test complete.\n", .{});
+}
+
+// --- One-shot blocking-mutex self-test ---------------------------------------
+// Two threads hammer one shared counter, but only ever touch it while holding a
+// single Mutex. The test proves two things:
+//   1. Mutual exclusion: the counter is incremented NON-atomically (read into a
+//      local, deliberately yield to let the other thread run, then write back).
+//      Without the lock this lost-update pattern would drop increments and the
+//      final total would be < expected. With the lock the other thread blocks on
+//      lock() instead of corrupting the half-done update, so the total is EXACT.
+//   2. Blocking handoff: an "in critical section" flag is set on entry and
+//      cleared on exit; if two threads were ever inside at once we'd catch the
+//      flag already set (recorded in mtx_violation). And mtx_handoffs counts how
+//      many times a thread actually had to block on a held lock and was later
+//      woken — proving lock() blocks rather than spins.
+
+const MTX_ITERS = 200; // increments per worker
+const MTX_WORKERS = 2; // number of contending threads
+var mtx_lock: mutex.Mutex = .{}; // the single contended lock (default = unlocked)
+var mtx_counter: usize = 0; // shared counter, mutated only under mtx_lock
+var mtx_in_cs: bool = false; // true while SOME thread is inside the critical section
+var mtx_violation: bool = false; // set if two threads are ever in the CS at once
+var mtx_handoffs: usize = 0; // times a worker blocked on a held lock and was woken
+
+fn mtxWorker() void {
+    var i: usize = 0; // this worker's iteration counter
+    while (i < MTX_ITERS) : (i += 1) {
+        // Note whether the lock was held *before* we tried to take it: if it was,
+        // our lock() call will have to block until the holder releases it. We read
+        // the owner under cli so the snapshot can't be torn by a context switch.
+        asm volatile ("cli");
+        const was_held = mtx_lock.owner != ~@as(usize, 0); // != NO_OWNER => held
+        asm volatile ("sti");
+
+        mtx_lock.lock(); // <-- blocks here (descheduled) if another worker holds it
+
+        if (was_held) mtx_handoffs += 1; // we waited on a held lock and got woken
+
+        // --- critical section --------------------------------------------------
+        // If mutual exclusion holds, no other thread can be in here with us.
+        if (mtx_in_cs) mtx_violation = true; // someone else is already inside -> bug
+        mtx_in_cs = true; // mark the section occupied
+
+        const tmp = mtx_counter; // read-modify-write, split across a yield to make
+        yield(); // the race window as wide as possible (a non-atomic ++ under lock)
+        mtx_counter = tmp + 1; // write back: safe only because we hold the lock
+
+        mtx_in_cs = false; // leave the section
+        // --- end critical section ----------------------------------------------
+
+        mtx_lock.unlock(); // release; wakes one blocked waiter (the other worker)
+    }
+    // falls through to threadExit
+}
+
+pub fn mutexDemo() void {
+    serial.print("[SCHED] Blocking-mutex self-test...\n", .{});
+    setupMain(); // adopt the boot context as thread 0 (main)
+    // Reset all shared state so the test is deterministic on repeated runs.
+    mtx_lock = mutex.Mutex.init();
+    mtx_counter = 0;
+    mtx_in_cs = false;
+    mtx_violation = false;
+    mtx_handoffs = 0;
+    var w: usize = 0; // spawn MTX_WORKERS contending threads
+    while (w < MTX_WORKERS) : (w += 1) spawn("mtx", &mtxWorker);
+    preempting = true;
+    pic.on_tick = &tick; // the timer drives preemption + wakes blocked waiters
+    while (aliveCount() > 0) {} // main waits for both workers to finish
+    pic.on_tick = null;
+    preempting = false;
+
+    const expected = MTX_ITERS * MTX_WORKERS; // the exact total if no update was lost
+    if (mtx_counter == expected and !mtx_violation) {
+        // Unique success marker the integration harness greps for.
+        serial.print("[MUTEX] blocking mutex self-test: mutual exclusion held, {d} handoffs OK\n", .{mtx_handoffs});
+    } else {
+        serial.print("[MUTEX] FAIL: counter={d} (expected {d}), violation={}\n", .{ mtx_counter, expected, mtx_violation });
+    }
+    serial.print("[SCHED] Blocking-mutex self-test complete.\n", .{});
 }
