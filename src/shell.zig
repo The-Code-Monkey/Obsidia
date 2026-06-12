@@ -15,6 +15,7 @@ const power = @import("arch/power.zig"); // restart / shutdown
 const scheduler = @import("sched/scheduler.zig"); // for the `ps` command
 const apic = @import("arch/apic.zig"); // pause/resume the timer for `sleep`
 const fat32 = @import("fs/fat32.zig"); // for the `ls` / `cat` commands
+const loader = @import("loader.zig"); // for the `exec` command
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -279,8 +280,8 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          ls [path], cat <path>, sleep (full-system sleep til keypress),\n", .{});
-        serial.print("          restart, shutdown, crash\n", .{});
+        serial.print("          ls [path], cat <path>, exec <path> (run a flat binary),\n", .{});
+        serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete)\n", .{});
     } else if (std.mem.eql(u8, cmd, "restart") or std.mem.eql(u8, cmd, "reboot")) { // reboot
         serial.print("restarting...\n", .{});
@@ -301,6 +302,8 @@ fn execute(raw: []const u8) void {
         fat32.ls(if (args.len > 0) args else "/"); // default to the root directory
     } else if (std.mem.eql(u8, cmd, "cat")) { // print a file from the FAT32 disk
         if (args.len == 0) serial.print("usage: cat <path>\n", .{}) else fat32.cat(args);
+    } else if (std.mem.eql(u8, cmd, "exec")) { // load + run a flat binary from the disk
+        if (args.len == 0) serial.print("usage: exec <path>\n", .{}) else _ = loader.exec(args);
     } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
         scheduler.dump();
     } else if (std.mem.eql(u8, cmd, "clear")) { // clear the terminal
