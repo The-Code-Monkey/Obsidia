@@ -318,6 +318,30 @@ assert_in "$TMP/shell.log" "unknown command: bogus"       "shell: unknown comman
 assert_in "$TMP/shell.log" "running    shell"             "shell runs as a scheduled thread (ps)"
 assert_in "$TMP/shell.log" "ready      idle"              "ps lists the idle thread"
 
+# --- Login (scrypt) ----------------------------------------------------------
+# Seed a disk with /OBSIDIA/AUTH (root:hunter2), then drive a WRONG password
+# (rejected) followed by the correct one (accepted -> shell). Proves the shell
+# is gated and the scrypt verify accepts/rejects correctly. Generous waits: the
+# memory-hard scrypt verify takes a moment under TCG.
+echo "== Login (scrypt) =="
+LOGINDISK="$TMP/login.img"
+truncate -s 64M "$LOGINDISK"
+mformat -i "$LOGINDISK" -F -v OBSIDIA :: 2>/dev/null
+mmd -i "$LOGINDISK" ::/OBSIDIA 2>/dev/null
+zig run tools/mkpasswd.zig -- root hunter2 > "$TMP/authline" 2>/dev/null
+mcopy -i "$LOGINDISK" "$TMP/authline" ::/OBSIDIA/AUTH
+( sleep "$BOOT_WAIT"; printf 'root\r'; sleep 1; printf 'wrongpw\r'; sleep 6; \
+  printf 'root\r'; sleep 1; printf 'hunter2\r'; sleep 6; printf 'mem\r'; sleep 2 ) \
+    | timeout 45 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+      -drive file="$LOGINDISK",format=raw,if=ide \
+      -chardev stdio,id=c0,logfile="$TMP/login.log",signal=off -serial chardev:c0 \
+      -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/login.log" "Login incorrect."   "login: wrong password rejected (scrypt)"
+assert_in "$TMP/login.log" "Welcome, root."     "login: correct password accepted (scrypt)"
+assert_in "$TMP/login.log" "frames free"        "login: shell runs after a successful login"
+# Non-regression: a disk-less boot has no credential, so it must open the shell.
+assert_in "$TMP/bios.log" "no credential configured" "login: disk-less boot opens the shell (no credential)"
+
 # --- History recall (Up arrow re-runs a command) -----------------------------
 echo "== Shell history (Up arrow) =="
 boot_shell "$TMP/hist.log" 512M 'echo zqx\r\x1b[A\r'
