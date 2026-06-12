@@ -164,6 +164,7 @@ timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
 assert_in "$TMP/ata.log" "primary master present: 32768 sectors" "ATA: detects disk size via IDENTIFY (16 MiB)"
 assert_in "$TMP/ata.log" "LBA0[0..16]='OBSIDIA_ATA_OK"           "ATA: reads sector 0 contents correctly"
 assert_in "$TMP/ata.log" "self-test: read LBA 0 OK"              "ATA: PIO sector read succeeds"
+assert_in "$TMP/ata.log" "write/read-back last sector OK"        "ATA: PIO sector write succeeds (non-destructive)"
 # And confirm a disk-less boot stays graceful (the q35 BIOS marker boot has no
 # disk attached, so the driver must report "no disk" there and still reach BOOT_OK).
 assert_in "$TMP/bios.log" "no device (floating bus" "ATA: disk-less boot reports no disk and continues"
