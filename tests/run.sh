@@ -106,7 +106,9 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[HEAP] Kernel heap initialized."            "$p heap init"
     assert_in "$log" "create/destroy=true, slice=true, ArrayList=true" "$p heap self-test (std allocator)"
     assert_in "$log" "[CON] Framebuffer console initialized."     "$p framebuffer console init"
+    assert_in "$log" "lines retained"                             "$p console scrollback buffer ready"
     assert_in "$log" "[KBD] Keyboard ready (IRQ1)."               "$p PS/2 keyboard init"
+    assert_in "$log" "[MOUSE] Mouse ready (IRQ12)"                "$p PS/2 mouse init (wheel scrollback)"
     assert_in "$log" "BOOT_OK"                                    "$p BOOT_OK"
     assert_in "$log" "Reclaiming bootloader-reclaimable memory"   "$p reclaim bootloader memory"
     assert_in "$log" "APIC @ 0x"                                  "$p ACPI MADT table found"
@@ -386,6 +388,55 @@ if command -v socat >/dev/null && command -v convert >/dev/null; then
     fi
 else
     echo "  (skipping framebuffer render test: needs socat + imagemagick)"
+fi
+
+# --- Console scrollback (PageUp/PageDown) ------------------------------------
+# The long boot log fills more than one screen, so there's history to scroll
+# back into. We drive the scroll keys as the escape sequences a terminal sends
+# (Page Up = ESC[5~, Page Down = ESC[6~) over the serial line — the same path the
+# PS/2 keyboard feeds into (its 0xE0 0x49/0x51 emit those sequences; covered by a
+# host unit test). Serial input arrives via a FIFO held open on fd 3, while the
+# QEMU monitor (separate unix socket) screenshots before and after. PageUp must
+# visibly redraw the screen (far more than the ~16 px a cursor blink could
+# touch), and the serial log must show the scroll and the return to the bottom.
+if command -v socat >/dev/null && command -v convert >/dev/null && command -v compare >/dev/null; then
+    echo "== Console scrollback (PageUp/PageDown) =="
+    sock="$TMP/sb.sock"; before="$TMP/sb_before.ppm"; after="$TMP/sb_after.ppm"
+    log="$TMP/scroll.log"; fifo="$TMP/sb.in"
+    rm -f "$fifo"; mkfifo "$fifo"
+    qemu-system-x86_64 -M q35 -m 512M -vga std -cdrom "$ISO" \
+        -chardev stdio,id=c0,logfile="$log",signal=off -serial chardev:c0 \
+        -monitor "unix:$sock,server,nowait" \
+        -display none -no-reboot <"$fifo" >/dev/null 2>&1 &
+    qpid=$!
+    exec 3>"$fifo" # hold the serial input FIFO open so QEMU never sees EOF
+    sleep "$((BOOT_WAIT + 2))"
+    echo "screendump $before" | socat - "unix-connect:$sock" >/dev/null 2>&1 # live screen
+    sleep 0.6
+    printf '\x1b[5~\x1b[5~\x1b[5~' >&3 # Page Up x3 (scroll back)
+    sleep 0.6
+    echo "screendump $after" | socat - "unix-connect:$sock" >/dev/null 2>&1 # scrolled screen
+    sleep 0.6
+    printf '\x1b[6~\x1b[6~\x1b[6~\x1b[6~\x1b[6~' >&3 # Page Down x5 (back to live)
+    sleep 0.6
+    exec 3>&-; sleep 0.3; kill $qpid 2>/dev/null; wait $qpid 2>/dev/null
+    # Serial markers: at least one scroll-up happened, and a PageDown reached live.
+    assert_in "$log" "scrollback up:"          "scrollback: PageUp scrolled the view back"
+    assert_in "$log" "scrollback: live"        "scrollback: PageDown returned to the live bottom"
+    # Visual proof: PageUp redrew the screen. AE (absolute pixel-difference count)
+    # must be well above the ~16 px a cursor blink could cause.
+    if [ -f "$before" ] && [ -f "$after" ]; then
+        ae=$(compare -metric AE "$before" "$after" null: 2>&1); ae=${ae%%.*}; ae=${ae%% *}
+        if [ "${ae:-0}" -gt 1000 ]; then
+            ok "scrollback: PageUp visibly changed the screen (${ae} px differ)"
+        else
+            bad "scrollback: PageUp did not change the screen (${ae:-?} px differ)"
+        fi
+    else
+        bad "scrollback: screendumps failed"
+    fi
+else
+    echo "  (skipping console scrollback test: needs socat + imagemagick 'compare')"
 fi
 
 # --- Summary -----------------------------------------------------------------

@@ -15,6 +15,7 @@ const vmm = @import("mm/vmm.zig"); // page tables / virtual memory
 const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
 const console = @import("drivers/console.zig"); // on-screen framebuffer text console
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
+const mouse = @import("drivers/mouse.zig"); // PS/2 mouse (scroll wheel -> scrollback)
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
@@ -221,6 +222,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
     keyboard.setSink(&shell.feed); // route keystrokes into the shell
+    mouse.init(); // enable the PS/2 mouse (IRQ12); the wheel drives scrollback
 
     // Make the shell a real scheduled thread. From here the kernel multitasks:
     // the timer preempts between the idle thread (this context) and the shell.

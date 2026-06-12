@@ -101,6 +101,25 @@ pub fn print(comptime format: []const u8, args: anytype) void {
     std.fmt.format(writer, format, args) catch unreachable;
 }
 
+// A Writer that goes ONLY to the UART, never to the mirror.
+const SerialOnlyWriter = std.io.Writer(void, error{}, writeOnlyFn);
+fn writeOnlyFn(_: void, bytes: []const u8) error{}!usize {
+    for (bytes) |b| writeByte(b); // transmit each byte, but do NOT mirror
+    return bytes.len;
+}
+const note_writer: SerialOnlyWriter = .{ .context = {} };
+
+// Like print(), but writes ONLY to the serial log — it deliberately does NOT
+// mirror to the framebuffer console. Used for messages that would be on-screen
+// noise (e.g. the console's own scrollback status line) yet should still be
+// captured in the serial log. Bypassing the mirror also avoids re-entering the
+// console from inside the console's own code.
+pub fn note(comptime format: []const u8, args: anytype) void {
+    sync.preemptDisable();
+    defer sync.preemptEnable();
+    std.fmt.format(note_writer, format, args) catch unreachable;
+}
+
 // --- Input (RX), used by the serial shell ------------------------------------
 
 // Is there a received byte waiting in the UART receive register?

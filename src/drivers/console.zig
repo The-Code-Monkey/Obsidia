@@ -85,12 +85,32 @@ var fb: FramebufferInfo = undefined; // the active framebuffer
 var cols: usize = 0; // text columns (width / glyph width)
 var rows: usize = 0; // text rows (height / glyph height)
 var cur_x: usize = 0; // cursor column
-var cur_y: usize = 0; // cursor row
+var cur_y: usize = 0; // cursor row (screen row of the cursor's line)
 var fg: u32 = 0; // foreground pixel value
 var bg: u32 = 0; // background pixel value
 var ready: bool = false; // true once init() has run
 var esc_state: u8 = 0; // ANSI escape parser: 0=normal, 1=saw ESC, 2=in CSI
 var csi_param: usize = 0; // numeric parameter accumulated in a CSI sequence
+
+// --- Scrollback --------------------------------------------------------------
+// Everything written is recorded in an in-memory character grid much taller than
+// the visible screen, so the user can scroll back to re-read output that has
+// already rolled off the top. The framebuffer shows a `rows`-tall WINDOW onto
+// this grid; normally that window sits at the live bottom, but PageUp/PageDown
+// slide it up and down over the retained history.
+//
+// Lines are addressed by a monotonic ABSOLUTE index and stored circularly
+// (physical slot = abs % SB_LINES), so once we've written SB_LINES lines the
+// oldest silently roll out of the buffer. The grid is the single source of
+// truth: the live fast path draws straight to pixels AND records here, and any
+// scrolled view is re-rendered purely from the grid.
+const MAX_COLS: usize = 256; // widest line we record (>= any real text width)
+const SB_LINES: usize = 1024; // total lines retained (visible window + scrollback)
+var grid: [SB_LINES][MAX_COLS]u8 = undefined; // circular store of line contents (space-filled ASCII)
+var top_abs: usize = 0; // absolute index of the line at screen row 0 when live
+var max_abs: usize = 0; // highest absolute line index written so far (high-water mark)
+var scrolled: bool = false; // true while the view is scrolled up off the live bottom
+var view_top: usize = 0; // absolute index at screen row 0 while `scrolled`
 
 // Blinking cursor state.
 const BLINK_TICKS: u64 = 50; // toggle every 50 timer ticks (~500 ms at 100 Hz)
@@ -114,16 +134,44 @@ fn putpixel(x: usize, y: usize, color: u32) void {
     ptr.* = color; // store the color
 }
 
-// Fill the whole screen with the background color and home the cursor.
-fn clear() void {
+// Paint every pixel with the background color (no cursor/state changes).
+fn blankScreen() void {
     var y: usize = 0;
     while (y < fb.height) : (y += 1) { // every scanline
         var x: usize = 0;
         while (x < fb.width) : (x += 1) putpixel(x, y, bg); // every pixel
     }
+    cursor_drawn = false; // the old cursor underline is gone with the cleared pixels
+}
+
+// --- Scrollback grid helpers -------------------------------------------------
+fn slotOf(abs: usize) usize {
+    return abs % SB_LINES; // physical grid row backing an absolute line index
+}
+fn absLine() usize {
+    return top_abs + cur_y; // absolute index of the line the cursor sits on
+}
+fn oldestAbs() usize {
+    // Once more than SB_LINES lines exist, the earliest have been overwritten.
+    return if (max_abs + 1 > SB_LINES) max_abs + 1 - SB_LINES else 0;
+}
+fn clearGridLine(abs: usize) void {
+    const row = &grid[slotOf(abs)]; // blank one stored line to spaces
+    var i: usize = 0;
+    while (i < MAX_COLS) : (i += 1) row[i] = ' ';
+}
+
+// ESC[2J : clear the visible screen but KEEP the scrollback. The current content
+// stays in the grid as history and a fresh blank screen begins just past it, so
+// PageUp can still reveal everything that was on screen before the clear (how
+// modern terminals treat `clear`).
+fn clear() void {
+    blankScreen(); // wipe the pixels
+    top_abs = max_abs + 1; // start the live window on fresh lines after all history
     cur_x = 0;
     cur_y = 0;
-    cursor_drawn = false; // the old cursor underline is gone with the cleared screen
+    clearGridLine(absLine()); // the new current line starts blank
+    if (absLine() > max_abs) max_abs = absLine();
 }
 
 // Draw glyph `c` into text cell (col, row).
@@ -143,8 +191,10 @@ fn drawGlyph(c: u8, col: usize, row: usize) void {
     }
 }
 
-// Scroll the whole screen up by one text row and clear the new bottom row.
-fn scroll() void {
+// Slide the on-screen pixels up by one text row and clear the freed bottom row.
+// This is the fast live-scroll path (a single framebuffer memmove); the grid
+// bookkeeping is handled by the caller.
+fn scrollFb() void {
     const row_bytes = fb.pitch * font.height; // bytes in one text row
     const total = fb.pitch * fb.height; // bytes in the whole framebuffer
     const len = total - row_bytes; // bytes to move
@@ -159,31 +209,60 @@ fn scroll() void {
     }
 }
 
-// Advance to the start of the next line, scrolling if we're at the bottom.
+// Advance to the start of the next line. The live window's top advances (and the
+// screen scrolls) when we run past the bottom row; the new line is started blank
+// in the grid either way. We keep the grid + top_abs current even while the user
+// is scrolled up (we just don't repaint), so returning to the bottom is correct.
 fn newline() void {
     cur_x = 0;
     cur_y += 1;
-    if (cur_y >= rows) { // past the last row?
-        scroll();
-        cur_y = rows - 1; // stay on the last row
+    if (cur_y >= rows) { // past the last visible row?
+        if (!scrolled) scrollFb(); // repaint only when viewing the live bottom
+        top_abs += 1; // the live window's top line advances regardless
+        cur_y = rows - 1; // cursor stays on the last row
+    }
+    const abs = absLine(); // the fresh line the cursor now sits on
+    clearGridLine(abs); // start it blank in the grid
+    if (abs > max_abs) max_abs = abs; // extend the high-water mark
+}
+
+// Write character `ch` into column `col` of the cursor's current line: record it
+// in the scrollback grid (the source of truth) and, only when viewing the live
+// bottom, paint it immediately.
+fn cellPut(col: usize, ch: u8) void {
+    if (col >= cols) return; // ignore writes past the recorded line width
+    const abs = absLine();
+    const row: *[MAX_COLS]u8 = &grid[slotOf(abs)]; // pointer, never copy the grid
+    row[col] = ch; // record it
+    if (abs > max_abs) max_abs = abs;
+    if (!scrolled) drawGlyph(ch, col, cur_y); // live view: draw it now
+}
+
+// Redraw one grid line `abs` into screen row `screen_row` (blank if that line is
+// beyond the written range or has rolled out of the retained history). We take a
+// POINTER to the grid row — indexing `grid[i][col]` by value would copy the whole
+// 256 KiB grid onto the stack and blow the thread stack.
+fn drawGridRow(abs: usize, screen_row: usize) void {
+    const blank = !(abs <= max_abs and abs >= oldestAbs());
+    const row: *const [MAX_COLS]u8 = &grid[slotOf(abs)];
+    var col: usize = 0;
+    while (col < cols) : (col += 1) {
+        drawGlyph(if (blank) ' ' else row[col], col, screen_row);
     }
 }
 
-// Clear one text cell to the background color.
-fn clearCell(col: usize, row: usize) void {
-    const px = col * font.width;
-    const py = row * font.height;
-    var gy: usize = 0;
-    while (gy < font.height) : (gy += 1) {
-        var gx: usize = 0;
-        while (gx < font.width) : (gx += 1) putpixel(px + gx, py + gy, bg);
-    }
+// Repaint the whole screen from the grid, showing the window of `rows` lines that
+// starts at absolute line `win_top`.
+fn renderWindow(win_top: usize) void {
+    var r: usize = 0;
+    while (r < rows) : (r += 1) drawGridRow(win_top + r, r);
 }
 
-// Erase from the cursor to the end of the current line (ESC[K).
+// Erase from the cursor to the end of the current line (ESC[K). Goes through
+// cellPut so the scrollback grid is updated alongside the pixels.
 fn eraseToEol() void {
     var x = cur_x;
-    while (x < cols) : (x += 1) clearCell(x, cur_y);
+    while (x < cols) : (x += 1) cellPut(x, ' ');
 }
 
 // Act on a CSI escape sequence's final byte. We implement just enough of an
@@ -246,12 +325,12 @@ fn putcharRaw(c: u8) void {
         0x08 => { // backspace: move left and erase
             if (cur_x > 0) {
                 cur_x -= 1;
-                drawGlyph(' ', cur_x, cur_y);
+                cellPut(cur_x, ' '); // erase the cell (grid + pixels)
             }
         },
         else => {
             if (c >= 0x20) { // printable
-                drawGlyph(c, cur_x, cur_y); // draw it
+                cellPut(cur_x, c); // record + draw it
                 cur_x += 1; // advance the cursor
                 if (cur_x >= cols) newline(); // wrap at the right edge
             }
@@ -293,6 +372,7 @@ fn eraseCursor() void {
 // how often it's called.
 pub fn cursorBlinkTick() void {
     if (!ready) return;
+    if (scrolled) return; // no live cursor while viewing history
     const t = pic.ticks();
     if (t -% last_toggle < BLINK_TICKS) return; // not time to toggle yet
     sync.preemptDisable(); // don't let a printing thread cut in mid-draw
@@ -325,19 +405,100 @@ pub fn print(comptime fmt: []const u8, args: anytype) void {
     std.fmt.format(cwriter, fmt, args) catch unreachable;
 }
 
+// --- Scrollback control ------------------------------------------------------
+// How many lines one PageUp/PageDown moves: a screenful minus one line, so a
+// line of context carries over (the usual terminal feel).
+fn page() usize {
+    return if (rows > 1) rows - 1 else 1;
+}
+
+// Scroll the view UP toward older history by `lines`, repainting from the grid.
+// Status goes to the serial log only (serial.note), never onto the screen.
+pub fn scrollUpBy(lines: usize) void {
+    if (!ready or lines == 0) return;
+    sync.preemptDisable();
+    defer sync.preemptEnable();
+    const oldest = oldestAbs();
+    const cur_view = if (scrolled) view_top else top_abs; // where row 0 is right now
+    if (cur_view <= oldest) { // already as far back as the buffer goes
+        if (!scrolled) { // first scroll on a screen that hasn't filled history yet
+            scrolled = true;
+            view_top = oldest;
+            renderWindow(view_top);
+        }
+        serial.note("[CON] scrollback: at oldest line\n", .{});
+        return;
+    }
+    view_top = if (cur_view >= oldest + lines) cur_view - lines else oldest;
+    scrolled = true;
+    renderWindow(view_top);
+    serial.note("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
+}
+
+// Scroll the view DOWN toward the live bottom by `lines`. Reaching the bottom
+// drops back into live mode (the cursor reappears on the next blink).
+pub fn scrollDownBy(lines: usize) void {
+    if (!ready or !scrolled or lines == 0) return; // already live: nothing to do
+    sync.preemptDisable();
+    defer sync.preemptEnable();
+    if (view_top + lines >= top_abs) { // would reach (or pass) the live bottom
+        scrolled = false;
+        renderWindow(top_abs); // restore the live screen from the grid
+        serial.note("[CON] scrollback: live (bottom)\n", .{});
+    } else {
+        view_top += lines;
+        renderWindow(view_top);
+        serial.note("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
+    }
+}
+
+// Page Up / Page Down: move a full screenful (minus a line of context). The
+// mouse wheel uses scrollUpBy/scrollDownBy directly with a small line count.
+pub fn scrollUp() void {
+    scrollUpBy(page());
+}
+pub fn scrollDown() void {
+    scrollDownBy(page());
+}
+
+// Snap straight back to the live bottom (called when the user types, so they
+// always see their own input). A no-op when already live.
+pub fn scrollToBottom() void {
+    if (!ready or !scrolled) return;
+    sync.preemptDisable();
+    defer sync.preemptEnable();
+    scrolled = false;
+    renderWindow(top_abs);
+}
+
 // Set up the console over a given framebuffer.
 pub fn init(info: FramebufferInfo) void {
     serial.print("[CON] Initializing framebuffer console...\n", .{});
     fb = info; // remember the framebuffer
     cols = fb.width / font.width; // text grid size
     rows = fb.height / font.height;
+    // The scrollback grid is fixed-size, so clamp the text dimensions to it.
+    // (Real framebuffers here are far under these caps; this is a safety net.)
+    if (cols > MAX_COLS) cols = MAX_COLS;
+    if (rows > SB_LINES) rows = SB_LINES;
     fg = makeColor(0xc0, 0xc0, 0xc0); // light grey text
     bg = makeColor(0x0a, 0x0a, 0x0a); // near-black background
-    clear(); // blank the screen
+
+    // Start the scrollback grid blank and the live window at the very top.
+    var l: usize = 0;
+    while (l < SB_LINES) : (l += 1) clearGridLine(l);
+    top_abs = 0;
+    max_abs = 0;
+    cur_x = 0;
+    cur_y = 0;
+    scrolled = false;
+    view_top = 0;
+    blankScreen(); // blank the pixels (state is already homed)
     ready = true; // now usable
 
     serial.print("[CON]   fb=0x{x} {d}x{d}, pitch={d}, bpp={d}\n", .{ fb.address, fb.width, fb.height, fb.pitch, fb.bpp });
     serial.print("[CON]   font {d}x{d}, grid {d}x{d} chars\n", .{ font.width, font.height, cols, rows });
+    serial.print("[CON]   scrollback: {d} lines retained (PageUp/PageDown to scroll)\n", .{SB_LINES});
 
     // Draw a banner straight to the framebuffer so there's something to see.
     print("Obsidia framebuffer console ({d}x{d}, {d}x{d} font)\n", .{ fb.width, fb.height, font.width, font.height });

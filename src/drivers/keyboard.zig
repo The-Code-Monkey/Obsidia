@@ -82,6 +82,8 @@ fn emitExtended(code: u8) void {
         0x47 => emit("\x1b[H"), // Home
         0x4F => emit("\x1b[F"), // End
         0x53 => emit("\x1b[3~"), // Delete (forward)
+        0x49 => emit("\x1b[5~"), // Page Up (scroll the console back)
+        0x51 => emit("\x1b[6~"), // Page Down (scroll the console forward)
         else => {}, // ignore other extended keys
     }
 }
@@ -132,10 +134,26 @@ fn handle(sc: u8) void {
     }
 }
 
-// IRQ1 handler: read the scancode and decode it.
+// IRQ1 handler: drain every scancode the controller has buffered and decode it.
+//
+// We must read ALL queued bytes, not just one: under KVM (and on real hardware)
+// the 8042 can have several scancodes waiting by the time we service the IRQ —
+// in particular the two bytes of an extended key (Page Up = 0xE0 0x49, arrows,
+// Home/End/Delete) often arrive together. Reading only one byte per interrupt
+// would leave the rest in the buffer and desynchronize the stream, so extended
+// keys and fast typing silently break. (Under TCG the bytes trickle in one IRQ
+// each, which is why this went unnoticed.)
+//
+// Status port bit 0 = output buffer full; bit 5 = the byte came from the mouse.
+// We consume keyboard bytes only and stop at a mouse byte, leaving it for a
+// future mouse IRQ handler rather than swallowing it here.
 fn onIrq() void {
-    const sc = serial.inb(DATA);
-    handle(sc);
+    while (true) {
+        const status = serial.inb(STATUS);
+        if (status & 0x01 == 0) break; // output buffer empty: nothing left
+        if (status & 0x20 != 0) break; // next byte is mouse data: not ours
+        handle(serial.inb(DATA)); // a keyboard scancode — decode it
+    }
 }
 
 pub fn init() void {
@@ -206,4 +224,28 @@ test "extended arrow keys emit escape sequences" {
     handle(0xE0); // extended prefix
     handle(0x48); // Up arrow (press)
     try t.expectEqualStrings("\x1b[A", Capture.buf[0..Capture.len]);
+}
+
+test "Page Up / Page Down emit scrollback escape sequences" {
+    const t = @import("std").testing;
+    const Capture = struct {
+        var buf: [8]u8 = undefined;
+        var len: usize = 0;
+        fn reset() void {
+            len = 0;
+        }
+        fn sinkFn(c: u8) void {
+            buf[len] = c;
+            len += 1;
+        }
+    };
+    setSink(&Capture.sinkFn);
+    Capture.reset();
+    handle(0xE0); // extended prefix
+    handle(0x49); // Page Up (press) -> ESC[5~
+    try t.expectEqualStrings("\x1b[5~", Capture.buf[0..Capture.len]);
+    Capture.reset();
+    handle(0xE0);
+    handle(0x51); // Page Down (press) -> ESC[6~
+    try t.expectEqualStrings("\x1b[6~", Capture.buf[0..Capture.len]);
 }
