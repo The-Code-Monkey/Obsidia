@@ -267,6 +267,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     usermode.selfTest(); // demo ring 3: run user code at CPL3 and recover from its #GP
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
+    shell.setAuthModule(authModule()); // credential from Limine (preferred over the disk file)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
     keyboard.setSink(&shell.feed); // route keystrokes into the shell
     mouse.init(); // enable the PS/2 mouse (IRQ12); the wheel drives scrollback
