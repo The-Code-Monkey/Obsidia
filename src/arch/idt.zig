@@ -26,7 +26,7 @@ const selftest_breakpoint = true;
 // Layout matches exactly what the stubs + isrCommon + CPU leave on the stack,
 // in ascending memory order. extern struct (all u64) => no padding. The Zig
 // handler receives a pointer to this, so it can read/print every register.
-const InterruptFrame = extern struct {
+pub const InterruptFrame = extern struct {
     // Pushed by isrCommon, in reverse (r15 ends up lowest in memory).
     r15: u64,
     r14: u64,
@@ -74,6 +74,13 @@ const Idtr = packed struct {
 
 var idt: [256]IdtEntry = undefined; // the table (256 gates)
 var idtr: Idtr = undefined; // the pointer we feed to lidt
+
+// Optional CPU-exception hook. A subsystem may install this to intercept a fault
+// before the default dump-and-halt — e.g. the ring-3 self-test catches the #GP a
+// user-mode privileged instruction raises and redirects iretq back into kernel
+// code. The hook returns true if it handled the fault (the frame may be rewritten
+// to change where iretq resumes); false to fall through to the normal dump.
+pub var fault_hook: ?*const fn (*InterruptFrame) bool = null;
 
 // Vectors that push a hardware error code onto the stack. For all others we push
 // a dummy 0 so the stack frame is uniform.
@@ -246,6 +253,12 @@ fn hang() noreturn {
 // trampoline can call it by a stable symbol name.
 export fn isrHandler(frame: *InterruptFrame) callconv(.C) void {
     if (frame.vector < 32) { // vectors 0..31 are CPU exceptions
+        // Give a registered hook first crack — it can recover from a fault it was
+        // expecting (e.g. the ring-3 self-test's deliberate #GP) and redirect
+        // where iretq resumes, so we neither dump nor halt.
+        if (fault_hook) |hook| {
+            if (hook(frame)) return;
+        }
         dumpException(frame); // print the crash dump
         // #BP (breakpoint) is recoverable and used as our self-test, so return
         // to the instruction after `int3`. Every other exception is fatal here:

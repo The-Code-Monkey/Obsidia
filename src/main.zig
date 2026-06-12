@@ -21,6 +21,7 @@ const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
+const usermode = @import("arch/usermode.zig"); // ring 3 (user mode) entry
 const shell = @import("shell.zig"); // interactive serial command shell
 
 // Limine scans the kernel for "requests": structs (tagged by magic IDs) that ask
@@ -218,6 +219,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     scheduler.preemptDemo(); // demo timer-driven preemption (threads that never yield)
     scheduler.blockSleepDemo(); // demo blocking sleep (a thread sleeps, the timer wakes it)
     scheduler.mutexDemo(); // demo the blocking Mutex (two threads contend; mutual exclusion)
+    usermode.selfTest(); // demo ring 3: run user code at CPL3 and recover from its #GP
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)

@@ -28,6 +28,7 @@ const FOUR_GIB: u64 = 0x100000000; // minimum HHDM span (covers RAM + MMIO)
 // Page-table entry flags (bit positions in a 64-bit entry).
 const PRESENT: u64 = 1 << 0; // entry is valid
 const WRITE: u64 = 1 << 1; // writes allowed
+const USER: u64 = 1 << 2; // U/S: accessible from ring 3 (CPL 3) when set
 const HUGE: u64 = 1 << 7; // PS bit (2 MiB page when set at PD level)
 const NX: u64 = 1 << 63; // No-eXecute (usable only once EFER.NXE is set)
 const ADDR_MASK: u64 = 0x000FFFFFFFFFF000; // bits 12..51 hold the physical address
@@ -112,14 +113,20 @@ fn tableAt(phys: u64) [*]u64 {
     return @ptrFromInt(pmm.physToVirt(phys)); // 512 u64 entries per table
 }
 
-// Descend one level, allocating and linking a fresh table if absent.
-fn nextTable(table: [*]u64, index: usize) [*]u64 {
+// Descend one level, allocating and linking a fresh table if absent. `user` is
+// USER when the page being mapped is user-accessible, 0 otherwise: every level
+// from the PML4 down must have the U/S bit set or the CPU denies ring-3 access
+// to the leaf, so we set it on new intermediate tables and upgrade existing ones.
+// (Setting U/S on an intermediate is safe for kernel pages under it — the leaf's
+// own U/S bit still gates actual ring-3 access.)
+fn nextTable(table: [*]u64, index: usize, user: u64) [*]u64 {
     const entry = table[index]; // the entry at this level
     if (entry & PRESENT != 0) { // already points to a table?
+        if (user != 0 and entry & USER == 0) table[index] = entry | USER; // upgrade to allow user
         return tableAt(entry & ADDR_MASK); // follow it
     }
     const frame = pmm.allocZeroed() orelse fail("out of memory building page tables"); // make a new table
-    table[index] = frame | PRESENT | WRITE; // link it in (intermediate tables are RW)
+    table[index] = frame | PRESENT | WRITE | user; // link it in (intermediate tables are RW, +USER if needed)
     return tableAt(frame);
 }
 
@@ -130,16 +137,18 @@ fn idx(virt: u64, comptime shift: u6) usize {
 
 // Map a single 4 KiB page virt -> phys with the given flags.
 fn mapPage(pml4: [*]u64, virt: u64, phys: u64, flags: u64) void {
-    const pdpt = nextTable(pml4, idx(virt, 39)); // level 4 -> 3
-    const pd = nextTable(pdpt, idx(virt, 30)); // level 3 -> 2
-    const pt = nextTable(pd, idx(virt, 21)); // level 2 -> 1
+    const user = flags & USER; // propagate user-accessibility up the table hierarchy
+    const pdpt = nextTable(pml4, idx(virt, 39), user); // level 4 -> 3
+    const pd = nextTable(pdpt, idx(virt, 30), user); // level 3 -> 2
+    const pt = nextTable(pd, idx(virt, 21), user); // level 2 -> 1
     pt[idx(virt, 12)] = (phys & ADDR_MASK) | flags | PRESENT; // leaf entry
 }
 
 // Map a single 2 MiB huge page (used for the HHDM, where 4 KiB would be wasteful).
 fn map2MiB(pml4: [*]u64, virt: u64, phys: u64, flags: u64) void {
-    const pdpt = nextTable(pml4, idx(virt, 39)); // level 4 -> 3
-    const pd = nextTable(pdpt, idx(virt, 30)); // level 3 -> 2
+    const user = flags & USER; // (the HHDM is kernel-only, so this is 0 in practice)
+    const pdpt = nextTable(pml4, idx(virt, 39), user); // level 4 -> 3
+    const pd = nextTable(pdpt, idx(virt, 30), user); // level 3 -> 2
     pd[idx(virt, 21)] = (phys & ADDR_MASK) | flags | PRESENT | HUGE; // PD entry, HUGE = stop here
 }
 
@@ -165,6 +174,7 @@ pub fn unmap(virt: u64) void {
 }
 pub const FLAG_WRITE = WRITE; // re-exported so callers can request writable pages
 pub const FLAG_NX = NX; // ...and non-executable pages
+pub const FLAG_USER = USER; // ...and pages reachable from ring 3 (user mode)
 
 // Walk to the leaf entry mapping `virt` (stopping at a huge page), or null if
 // unmapped. Used to verify applied permissions without triggering a fault.
