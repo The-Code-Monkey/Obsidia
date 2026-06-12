@@ -3,7 +3,7 @@
 > ATA PIO disk driver for the primary bus / master drive using 28-bit LBA: the simplest possible block device, where the CPU moves every word through an I/O port.
 
 ## What it does
-Reads a hard disk via legacy ATA "Programmed I/O" — no DMA, the CPU itself moves each 16-bit word through the data port. It talks to the primary ATA controller through the command block at ports `0x1F0..0x1F7` and the control block at `0x3F6`, supporting the master drive with 28-bit LBA. On init it probes the primary master with IDENTIFY DEVICE to detect presence and capacity, and exposes a `read` primitive that the filesystem layer builds on. It is safe to run on disk-less boots (it simply reports no device).
+Reads and writes a hard disk via legacy ATA "Programmed I/O" — no DMA, the CPU itself moves each 16-bit word through the data port. It talks to the primary ATA controller through the command block at ports `0x1F0..0x1F7` and the control block at `0x3F6`, supporting the master drive with 28-bit LBA. On init it probes the primary master with IDENTIFY DEVICE to detect presence and capacity, and exposes `read` and `write` primitives that the filesystem and installer build on. It is safe to run on disk-less boots (it simply reports no device).
 
 ## Key components
 
@@ -26,7 +26,8 @@ Internal helpers:
 Public operations:
 - `init()` — probe the primary master: select master, check for floating bus (`0xFF`) / status 0, issue IDENTIFY, reject ATAPI/SATA signatures, read 256 words, and derive `total_sectors` from words 60/61.
 - `read(lba, count, dst)` — read `count` sectors (1..256) from `lba` into `dst`; validates presence, args, and buffer size; programs the registers, then waits for DRQ and moves 256 words per sector. Returns false on no-disk, bad args, or controller error.
-- `selfTest()` — boot self-test that reads LBA 0 and prints its first 16 bytes (printable form); no-op without a disk.
+- `write(lba, count, src)` — the mirror of `read`: issues WRITE SECTORS, pushes 256 words per sector out the data port, then FLUSH CACHE to commit. Used by the installer to lay a system image onto a disk.
+- `selfTest()` — boot self-test that reads LBA 0, then non-destructively writes/reads-back/restores the last sector (exercising the write path without touching filesystem data); no-op without a disk.
 
 ## Depends on / used by
 - **Imports:** `std` (`sliceAsBytes` for the sector copy), `serial.zig` (logging plus the `inb`/`outb` port helpers).

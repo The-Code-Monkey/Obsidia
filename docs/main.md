@@ -16,7 +16,12 @@ Limine loads the kernel in 64-bit long mode with paging already enabled, then ju
 - `start_marker` / `end_marker` — bracket the request list so Limine can locate it.
 - `base_revision` — declares boot-protocol revision 3.
 - `framebuffer_request`, `memmap_request`, `hhdm_request`, `executable_address_request`, `rsdp_request` — request the framebuffer, physical memory map, HHDM offset, kernel load base, and ACPI RSDP.
+- `module_request` — request the modules listed in `limine.conf` (the login credential, and on the installer medium the system image).
 - `paging_mode_request` — forces 4-level paging (min/max/preferred all `4lvl`).
+
+### Modules
+- `readModules()` — finds the loaded modules by path suffix and stashes their byte slices; module memory (type executable_and_modules) is never reclaimed and is reachable via the HHDM, so the slices stay valid after the CR3 switch and reclaim.
+- `authModule()` / `systemModule()` — accessors handed to the shell's login and the installer respectively.
 
 ### Constants
 - `KERNEL_STACK_SIZE` (64 KiB) and `kernel_stack` — the kernel's own stack, switched to before reclaiming Limine's boot stack.
