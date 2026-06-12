@@ -13,6 +13,14 @@ const ata = @import("drivers/ata.zig");
 const SECTOR = ata.SECTOR_SIZE; // 512
 const CHUNK = 256; // sectors per ATA write command (max for 28-bit PIO)
 
+// True if every byte of `buf` is zero (a blank chunk we can skip writing).
+fn isZero(buf: []const u8) bool {
+    for (buf) |b| {
+        if (b != 0) return false;
+    }
+    return true;
+}
+
 // The system image Limine loaded as a module, set by main before the shell runs.
 var image: ?[]const u8 = null;
 pub fn setImage(m: ?[]const u8) void {
@@ -46,19 +54,29 @@ pub fn run() void {
         return;
     }
 
-    serial.print("install: writing {d} sectors (~{d} MiB) to the disk — this erases it...\n", .{ sectors, sectors / 2048 });
+    serial.print("install: cloning {d} sectors (~{d} MiB) to the disk — this erases it...\n", .{ sectors, sectors / 2048 });
+    // The system image is mostly empty ESP space (zeros). The target starts
+    // blank (a freshly created disk is all zeros), so we skip all-zero chunks:
+    // that turns a 64 MiB clone into the few MiB actually in use, which matters
+    // a lot because PIO writes are slow (a port access per word).
     var lba: u32 = 0;
+    var done: u32 = 0; // sectors actually written (non-blank)
     while (lba < sectors) {
         const n: u16 = @intCast(@min(@as(u32, CHUNK), sectors - lba));
         const off = @as(usize, lba) * SECTOR;
-        if (!ata.write(lba, n, img[off .. off + @as(usize, n) * SECTOR])) {
-            serial.print("install: write FAILED at LBA {d}.\n", .{lba});
-            return;
+        const chunk = img[off .. off + @as(usize, n) * SECTOR];
+        if (!isZero(chunk)) { // a blank chunk is already zero on the target
+            if (!ata.write(lba, n, chunk)) {
+                serial.print("install: write FAILED at LBA {d}.\n", .{lba});
+                return;
+            }
+            done += n;
         }
         lba += n;
-        if (lba % (CHUNK * 64) == 0 or lba == sectors) { // progress every ~8 MiB
-            serial.print("install:   {d}/{d} sectors written\n", .{ lba, sectors });
+        if (lba % (CHUNK * 64) == 0 or lba == sectors) { // progress every ~8 MiB scanned
+            serial.print("install:   {d}/{d} sectors scanned ({d} written)\n", .{ lba, sectors, done });
         }
     }
-    serial.print("install: complete. Power off, remove the installer medium, and boot the disk.\n", .{});
+    serial.print("install: complete ({d} sectors written, the rest were blank).\n", .{done});
+    serial.print("install: power off, remove the installer medium, and boot the disk.\n", .{});
 }
