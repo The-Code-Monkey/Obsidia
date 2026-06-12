@@ -125,6 +125,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "Preemptive demo complete."                 "$p timer-driven preemption"
     assert_in "$log" "blocking-sleep self-test: slept, woke OK"  "$p blocking sleep (thread sleeps, timer wakes it)"
     assert_in "$log" "blocking mutex self-test: mutual exclusion held" "$p blocking mutex (two threads contend; mutual exclusion + handoff)"
+    assert_in "$log" "Ring-3 self-test OK"                       "$p ring 3: ran user code at CPL3 + recovered from its #GP"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
