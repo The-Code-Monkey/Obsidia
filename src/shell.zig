@@ -353,15 +353,27 @@ pub fn init() void {
 // up. Otherwise the shell is gated behind a username + password check.
 var cred_user: [64]u8 = undefined; // configured username
 var cred_user_len: usize = 0;
-var cred_phc: [auth.MAX_HASH]u8 = undefined; // configured Argon2id PHC hash
+var cred_phc: [auth.MAX_HASH]u8 = undefined; // configured scrypt PHC hash
 var cred_phc_len: usize = 0;
 
-// Read and parse /OBSIDIA/AUTH into cred_user/cred_phc. Returns false if there's
-// no usable credential (no disk, missing file, or malformed contents).
+// The credential bytes Limine loaded as a module, if any (set by main before the
+// shell starts). Preferred over the on-disk file because it works on a GPT disk
+// without the kernel parsing partitions.
+var auth_module: ?[]const u8 = null;
+pub fn setAuthModule(m: ?[]const u8) void {
+    auth_module = m;
+}
+
+// Read and parse the credential ("user:phc") into cred_user/cred_phc. Prefers
+// the Limine auth module, falling back to /OBSIDIA/AUTH on a plain FAT32 disk.
+// Returns false if there's no usable credential.
 fn loadCredential() bool {
     var buf: [512]u8 = undefined;
-    const n = fat32.readFile("/OBSIDIA/AUTH", &buf) orelse return false;
-    const text = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const raw: []const u8 = if (auth_module) |m| m else blk: {
+        const n = fat32.readFile("/OBSIDIA/AUTH", &buf) orelse return false;
+        break :blk buf[0..n];
+    };
+    const text = std.mem.trim(u8, raw, " \t\r\n");
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return false; // user:phc
     const user = text[0..colon];
     const phc = text[colon + 1 ..];
