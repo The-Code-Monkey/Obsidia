@@ -21,6 +21,7 @@ const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
+const install = @import("install.zig"); // in-guest installer (clones the system image)
 const shell = @import("shell.zig"); // interactive serial command shell
 
 // Limine scans the kernel for "requests": structs (tagged by magic IDs) that ask
@@ -266,6 +267,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     shell.setAuthModule(authModule()); // credential from Limine (preferred over the disk file)
+    install.setImage(systemModule()); // system image to clone if `install` is run
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
     keyboard.setSink(&shell.feed); // route keystrokes into the shell
     mouse.init(); // enable the PS/2 mouse (IRQ12); the wheel drives scrollback
