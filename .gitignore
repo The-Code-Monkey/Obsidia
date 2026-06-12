@@ -14,3 +14,10 @@ CLAUDE.md
 
 # Scratch disk image for the ATA driver / filesystem (local, not committed)
 obsidia-disk.img
+
+# Installer build artifacts (install.sh): system image + installed target disk
+obsidia-system.img
+obsidia-install.img
+
+# Personal handoff / resume note (not tracked)
+RESUME.md

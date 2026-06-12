@@ -16,6 +16,9 @@ const scheduler = @import("sched/scheduler.zig"); // for the `ps` command
 const apic = @import("arch/apic.zig"); // pause/resume the timer for `sleep`
 const fat32 = @import("fs/fat32.zig"); // for the `ls` / `cat` commands
 const loader = @import("loader.zig"); // for the `exec` command
+const auth = @import("auth.zig"); // scrypt password verification (login)
+const heap = @import("mm/heap.zig"); // allocator for the scrypt verify
+const install = @import("install.zig"); // the `install` command (in-guest installer)
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -288,6 +291,7 @@ fn execute(raw: []const u8) void {
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
         serial.print("          ls [path], cat <path>, exec <path> (run an ELF or flat binary),\n", .{});
+        if (install.available()) serial.print("          install (clone Obsidia onto the disk),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete,\n", .{});
         serial.print("   pageup/pagedown = scroll the screen back/forward)\n", .{});
@@ -312,6 +316,8 @@ fn execute(raw: []const u8) void {
         if (args.len == 0) serial.print("usage: cat <path>\n", .{}) else fat32.cat(args);
     } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary from the disk
         if (args.len == 0) serial.print("usage: exec <path>\n", .{}) else _ = loader.exec(args);
+    } else if (std.mem.eql(u8, cmd, "install")) { // clone the system image onto the disk
+        install.run();
     } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
         scheduler.dump();
     } else if (std.mem.eql(u8, cmd, "clear")) { // clear the terminal
@@ -344,8 +350,103 @@ pub fn init() void {
     serial.print("[SHELL] Type 'help' for commands.\n", .{});
 }
 
+// --- Login -------------------------------------------------------------------
+// Credentials live in /OBSIDIA/AUTH on the disk as a single line "user:phc",
+// where phc is an Argon2id PHC hash (created by the installer). If the file is
+// absent (e.g. a disk-less dev boot), login is skipped so the shell still comes
+// up. Otherwise the shell is gated behind a username + password check.
+var cred_user: [64]u8 = undefined; // configured username
+var cred_user_len: usize = 0;
+var cred_phc: [auth.MAX_HASH]u8 = undefined; // configured scrypt PHC hash
+var cred_phc_len: usize = 0;
+
+// The credential bytes Limine loaded as a module, if any (set by main before the
+// shell starts). Preferred over the on-disk file because it works on a GPT disk
+// without the kernel parsing partitions.
+var auth_module: ?[]const u8 = null;
+pub fn setAuthModule(m: ?[]const u8) void {
+    auth_module = m;
+}
+
+// Read and parse the credential ("user:phc") into cred_user/cred_phc. Prefers
+// the Limine auth module, falling back to /OBSIDIA/AUTH on a plain FAT32 disk.
+// Returns false if there's no usable credential.
+fn loadCredential() bool {
+    var buf: [512]u8 = undefined;
+    const raw: []const u8 = if (auth_module) |m| m else blk: {
+        const n = fat32.readFile("/OBSIDIA/AUTH", &buf) orelse return false;
+        break :blk buf[0..n];
+    };
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return false; // user:phc
+    const user = text[0..colon];
+    const phc = text[colon + 1 ..];
+    if (user.len == 0 or user.len > cred_user.len) return false;
+    if (phc.len == 0 or phc.len > cred_phc.len) return false;
+    @memcpy(cred_user[0..user.len], user);
+    cred_user_len = user.len;
+    @memcpy(cred_phc[0..phc.len], phc);
+    cred_phc_len = phc.len;
+    return true;
+}
+
+// Block until a full line is read from the input ring. `echo` controls whether
+// typed characters are shown (false masks them with '*', for passwords). Handles
+// backspace and Enter; ignores other control bytes.
+fn readLine(buf: []u8, echo: bool) usize {
+    var len: usize = 0;
+    while (true) {
+        const c = while (true) {
+            if (ringPop()) |b| break b;
+            asm volatile ("hlt"); // idle until the next input/timer interrupt
+        };
+        switch (c) {
+            '\r', '\n' => {
+                serial.print("\n", .{});
+                return len;
+            },
+            0x08, 0x7f => if (len > 0) { // backspace
+                len -= 1;
+                if (echo) serial.print("\x08 \x08", .{}); // rub out the echoed char
+            },
+            else => if (c >= 0x20 and c < 0x7f and len < buf.len) {
+                buf[len] = c;
+                len += 1;
+                serial.print("{c}", .{if (echo) c else '*'}); // echo, or mask passwords
+            },
+        }
+    }
+}
+
+// Gate the shell behind a login if a credential is configured. Loops until the
+// username + Argon2id-verified password match. No-op (open shell) when no
+// credential exists, so disk-less boots are unaffected.
+fn login() void {
+    if (!loadCredential()) {
+        serial.print("[LOGIN] no credential configured (/OBSIDIA/AUTH absent); open shell.\n", .{});
+        return;
+    }
+    while (true) {
+        var ubuf: [64]u8 = undefined;
+        var pbuf: [128]u8 = undefined;
+        serial.print("\nobsidia login: ", .{});
+        const ulen = readLine(&ubuf, true);
+        serial.print("password: ", .{});
+        const plen = readLine(&pbuf, false);
+        // Verify the username AND the Argon2id hash. Both must match.
+        const user_ok = std.mem.eql(u8, ubuf[0..ulen], cred_user[0..cred_user_len]);
+        const pass_ok = auth.verify(heap.allocator(), cred_phc[0..cred_phc_len], pbuf[0..plen]);
+        if (user_ok and pass_ok) {
+            serial.print("\nWelcome, {s}.\n", .{cred_user[0..cred_user_len]});
+            return;
+        }
+        serial.print("\nLogin incorrect.\n", .{});
+    }
+}
+
 // The shell loop. Never returns: it is the kernel's idle task now.
 pub fn run() noreturn {
+    login(); // gate behind a password if one is configured
     prompt(); // initial prompt
     while (true) {
         console.cursorBlinkTick(); // blink the on-screen cursor (no-op until due)

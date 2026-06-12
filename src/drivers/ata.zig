@@ -1,8 +1,8 @@
-// ATA PIO disk driver (primary bus, master drive, 28-bit LBA).
+// ATA PIO disk driver (primary bus, master drive, 28-bit LBA): read and write.
 //
-// This is the simplest possible way to read a hard disk: "Programmed I/O" means
-// the CPU itself moves every word of data through an I/O port (no DMA). It's
-// slow, but tiny and easy to reason about — the right first block device.
+// This is the simplest possible way to talk to a hard disk: "Programmed I/O"
+// means the CPU itself moves every word of data through an I/O port (no DMA).
+// It's slow, but tiny and easy to reason about — the right first block device.
 //
 // We talk to the legacy ATA controller through two register blocks of x86 I/O
 // ports: the "command block" at 0x1F0..0x1F7 and the "control block" at 0x3F6.
@@ -37,6 +37,8 @@ const SR_ERR = 0x01; // error: check the error register
 
 // --- Commands ----------------------------------------------------------------
 const CMD_READ_PIO = 0x20; // READ SECTORS (PIO, 28-bit LBA)
+const CMD_WRITE_PIO = 0x30; // WRITE SECTORS (PIO, 28-bit LBA)
+const CMD_FLUSH = 0xE7; // FLUSH CACHE (commit written sectors to the medium)
 const CMD_IDENTIFY = 0xEC; // IDENTIFY DEVICE (returns 256 words of disk info)
 
 pub const SECTOR_SIZE = 512; // bytes per sector (fixed for ATA disks)
@@ -64,6 +66,18 @@ inline fn repInsw(port: u16, buf: [*]u16, words: usize) void {
           [buf] "{rdi}" (buf), // destination pointer in RDI (auto-incremented)
           [cnt] "{rcx}" (words), // repeat count in RCX (counts down to 0)
         : "rcx", "rdi", "memory", "cc" // all clobbered by the instruction
+    );
+}
+
+// Write `words` 16-bit words from `buf` out to a port with `rep outsw` (the CPU
+// repeats the OUT, auto-incrementing the source). The mirror image of repInsw.
+inline fn repOutsw(port: u16, buf: [*]const u16, words: usize) void {
+    asm volatile ("cld; rep outsw"
+        :
+        : [port] "{dx}" (port), // destination port in DX
+          [buf] "{rsi}" (buf), // source pointer in RSI (auto-incremented)
+          [cnt] "{rcx}" (words), // repeat count in RCX (counts down to 0)
+        : "rcx", "rsi", "cc" // clobbered by the instruction
     );
 }
 
@@ -181,6 +195,36 @@ pub fn read(lba: u32, count: u16, dst: []u8) bool {
     return true;
 }
 
+// Write `count` sectors (1..256) starting at `lba` from `src` (>= count*512
+// bytes) to the disk, then flush the drive's cache. Returns false on no-disk,
+// bad args, or a controller error. The mirror of read(); the installer uses it
+// to lay a system image onto a blank disk.
+pub fn write(lba: u32, count: u16, src: []const u8) bool {
+    if (!present) return false; // no disk to write to
+    if (count == 0 or count > 256) return false; // one command moves 1..256 sectors
+    if (src.len < @as(usize, count) * SECTOR_SIZE) return false; // source too small
+    if (!waitNotBusy()) return false; // controller must be idle before we program it
+
+    outb(DRIVE_HEAD, 0xE0 | @as(u8, @intCast((lba >> 24) & 0x0F))); // master + LBA mode + LBA 24..27
+    delay400ns();
+    outb(SECCOUNT, @intCast(count & 0xFF)); // 256 wraps to 0, meaning 256
+    outb(LBA_LOW, @intCast(lba & 0xFF));
+    outb(LBA_MID, @intCast((lba >> 8) & 0xFF));
+    outb(LBA_HIGH, @intCast((lba >> 16) & 0xFF));
+    outb(COMMAND, CMD_WRITE_PIO); // start the write
+
+    var s: usize = 0;
+    while (s < count) : (s += 1) {
+        if (!waitDataRequest()) return false; // wait for the drive to want this sector
+        var tmp: [256]u16 = undefined; // one sector, word-aligned for the OUT
+        @memcpy(std.mem.sliceAsBytes(tmp[0..]), src[s * SECTOR_SIZE ..][0..SECTOR_SIZE]);
+        repOutsw(DATA, &tmp, 256); // push the sector's 256 words out the data port
+    }
+    outb(COMMAND, CMD_FLUSH); // ensure the data reaches the medium, not just a cache
+    if (!waitNotBusy()) return false; // wait for the flush to complete
+    return true;
+}
+
 // Boot self-test: read sector 0 and print its first 16 bytes (printable form),
 // proving the PIO path works against the attached disk. No-op without a disk.
 pub fn selfTest() void {
@@ -200,4 +244,19 @@ pub fn selfTest() void {
     }
     serial.print("'\n", .{});
     serial.print("[ATA] self-test: read LBA 0 OK.\n", .{});
+
+    // Non-destructive write test: save the last sector, write a known pattern,
+    // read it back, verify, then restore the original bytes — so the write path
+    // is exercised without disturbing any filesystem data.
+    if (total_sectors > 1) {
+        const last = total_sectors - 1;
+        var orig: [SECTOR_SIZE]u8 = undefined;
+        if (!read(last, 1, &orig)) return;
+        var pat: [SECTOR_SIZE]u8 = undefined;
+        for (&pat, 0..) |*b, i| b.* = @truncate(i ^ 0xA5);
+        var rb: [SECTOR_SIZE]u8 = undefined;
+        const ok = write(last, 1, &pat) and read(last, 1, &rb) and std.mem.eql(u8, &pat, &rb);
+        _ = write(last, 1, &orig); // restore the original contents either way
+        serial.print("[ATA] self-test: write/read-back last sector {s}.\n", .{if (ok) "OK (restored)" else "MISMATCH"});
+    }
 }
