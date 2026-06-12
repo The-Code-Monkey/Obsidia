@@ -41,12 +41,52 @@ export var hhdm_request: limine.HhdmRequest linksection(".limine_requests") = .{
 export var executable_address_request: limine.ExecutableAddressRequest linksection(".limine_requests") = .{};
 // Ask for the RSDP (root pointer to the ACPI tables).
 export var rsdp_request: limine.RsdpRequest linksection(".limine_requests") = .{};
+// Ask Limine to load the modules listed in limine.conf (the login credential
+// and, on the installer medium, the system image). Limine reads them off the
+// ESP/ISO for us, so the kernel needs no GPT/FAT parsing to find these files.
+export var module_request: limine.ModuleRequest linksection(".limine_requests") = .{};
 // Force 4-level paging so the VMM's table walk is correct regardless of CPU.
 export var paging_mode_request: limine.PagingModeRequest linksection(".limine_requests") = .{
     .mode = .@"4lvl", // preferred mode
     .max_mode = .@"4lvl", // never give us 5-level
     .min_mode = .@"4lvl", // never give us less than 4-level
 };
+
+// --- Limine modules ----------------------------------------------------------
+// Files Limine loaded for us, kept as slices into module memory (type
+// executable_and_modules, which the PMM never reclaims, so they stay valid).
+var auth_module: ?[]const u8 = null; // /OBSIDIA/AUTH credential (installed boot)
+var system_module: ?[]const u8 = null; // system disk image (installer medium)
+
+// True if `haystack` ends with `needle`, case-insensitively (FAT paths vary).
+fn endsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[haystack.len - needle.len ..], needle);
+}
+
+// Find the modules we care about by path suffix and stash their byte slices.
+fn readModules() void {
+    const resp = module_request.response orelse return;
+    for (resp.getModules()) |file| {
+        const path = std.mem.span(file.path);
+        const bytes = @as([*]const u8, @ptrCast(file.address))[0..file.size];
+        if (endsWithIgnoreCase(path, "AUTH")) {
+            auth_module = bytes;
+            serial.print("[OBSIDIA] module: auth credential ({d} bytes)\n", .{file.size});
+        } else if (endsWithIgnoreCase(path, "SYSTEM.IMG")) {
+            system_module = bytes;
+            serial.print("[OBSIDIA] module: system image ({d} bytes)\n", .{file.size});
+        }
+    }
+}
+
+// Accessors for other subsystems (the shell's login; the installer).
+pub fn authModule() ?[]const u8 {
+    return auth_module;
+}
+pub fn systemModule() ?[]const u8 {
+    return system_module;
+}
 
 // Custom panic handler. The Zig compiler routes all safety-check panics (index
 // out of bounds, integer overflow in Debug, reaching `unreachable`, `@panic`,
@@ -119,6 +159,11 @@ export fn _start() noreturn {
         hcf();
     };
     pmm.init(memmap_resp, hhdm_resp.offset); // parse the map, build the frame allocator
+
+    // Record the modules Limine loaded (credential / system image). Their bytes
+    // live in non-reclaimed module memory reachable via the HHDM, so the slices
+    // stay valid after we switch page tables and reclaim bootloader memory.
+    readModules();
 
     // Acquire the framebuffer BEFORE switching page tables, while Limine's
     // response pointers are still reachable under its mappings. We stash its
