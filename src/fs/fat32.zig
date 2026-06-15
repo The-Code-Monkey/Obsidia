@@ -13,6 +13,7 @@
 const std = @import("std");
 const serial = @import("../drivers/serial.zig");
 const ata = @import("../drivers/ata.zig");
+const lfnenc = @import("lfn.zig"); // long-name (LFN) entry encoding for the write path
 
 const SECTOR = 512; // bytes per sector (we only support 512-byte-sector disks)
 const EOC = 0x0FFFFFF8; // FAT entries >= this mark the end of a cluster chain
@@ -498,38 +499,139 @@ fn to83(name: []const u8, out: *[11]u8) bool {
     return true;
 }
 
-// Create a new 8.3 directory entry in `parent_cluster` for `name`, with the
-// given `attr` (0x20 = file, 0x10 = directory), pointing at `first_cluster` with
-// `size` bytes. Fails if the name isn't 8.3 or the directory has no free slot in
-// its existing clusters.
+// 32-byte directory slots per sector (16) and per cluster.
+fn slotsPerSector() usize {
+    return SECTOR / 32;
+}
+
+// Write the 32-byte directory entry `ent` into the `slot_index`-th slot of the
+// directory at `parent_cluster` (read-modify-write of its sector). The caller
+// must have ensured the slot exists (see reserveDirSlots). False on a chain that
+// ends before the slot or a disk error.
+fn placeEntry(parent_cluster: u32, slot_index: usize, ent: *const [32]u8) bool {
+    var sec_index = slot_index / slotsPerSector(); // which directory sector
+    const off = (slot_index % slotsPerSector()) * 32; // byte offset within it
+    var cluster = parent_cluster;
+    while (sec_index >= bi.sectors_per_cluster) : (sec_index -= bi.sectors_per_cluster) {
+        cluster = nextCluster(cluster); // step to the cluster holding this sector
+        if (!isDataCluster(cluster)) return false;
+    }
+    const lba = clusterToSector(cluster) + @as(u32, @intCast(sec_index));
+    var sector: [SECTOR]u8 = undefined;
+    if (!ata.read(lba, 1, &sector)) return false;
+    @memcpy(sector[off .. off + 32], ent);
+    return ata.write(lba, 1, &sector);
+}
+
+// Ensure the directory at `parent_cluster` has a run of `need` consecutive free
+// slots and return the index of the first. Reuses the free tail past the
+// directory's end marker, growing the directory by whole clusters when that tail
+// is too short. Returns null on disk-full or a read error.
+fn reserveDirSlots(parent_cluster: u32, need: usize) ?usize {
+    const per_cluster = @as(usize, bi.sectors_per_cluster) * slotsPerSector();
+    var sector: [SECTOR]u8 = undefined;
+    var idx: usize = 0; // running slot index
+    var first_free: ?usize = null; // first end-marker (0x00) slot
+    var cluster = parent_cluster;
+    var last_cluster = parent_cluster; // tail of the chain, for growth
+    while (isDataCluster(cluster)) {
+        var s: u32 = 0;
+        while (s < bi.sectors_per_cluster) : (s += 1) {
+            if (!ata.read(clusterToSector(cluster) + s, 1, &sector)) return null;
+            var e: usize = 0;
+            while (e < slotsPerSector()) : (e += 1) {
+                if (sector[e * 32] == 0x00 and first_free == null) first_free = idx;
+                idx += 1;
+            }
+        }
+        last_cluster = cluster;
+        cluster = nextCluster(cluster);
+    }
+    const total = idx;
+    const start = first_free orelse total; // a packed dir appends at its very end
+    var free_tail = total - start; // free slots from `start` to the end
+    while (free_tail < need) { // grow the directory a cluster at a time
+        const nc = allocCluster() orelse return null; // new (zeroed) dir cluster
+        if (!writeFatEntry(last_cluster, nc)) return null; // link it onto the chain
+        last_cluster = nc;
+        free_tail += per_cluster;
+    }
+    return start;
+}
+
+// Build a standard 8.3 short directory entry into `out`.
+fn buildShortEntry(out: *[32]u8, sfn: *const [11]u8, attr: u8, first_cluster: u32, size: u32) void {
+    @memset(out, 0);
+    @memcpy(out[0..11], sfn);
+    out[0x0B] = attr; // 0x20 archive (file) or 0x10 directory
+    wr16(out, 0x14, @intCast(first_cluster >> 16));
+    wr16(out, 0x1A, @intCast(first_cluster & 0xFFFF));
+    wr32(out, 0x1C, size);
+}
+
+// Create an 8.3 directory entry for `name` (attr 0x20 file / 0x10 dir) in the
+// directory at `parent_cluster`. Grows the directory if it's full. Fails only if
+// the name isn't 8.3 or the disk is full.
 fn createDirEntry(parent_cluster: u32, name: []const u8, attr: u8, first_cluster: u32, size: u32) bool {
     var sfn: [11]u8 = undefined;
     if (!to83(name, &sfn)) return false;
+    const start = reserveDirSlots(parent_cluster, 1) orelse return false;
+    var ent: [32]u8 = undefined;
+    buildShortEntry(&ent, &sfn, attr, first_cluster, size);
+    return placeEntry(parent_cluster, start, &ent);
+}
+
+// True if an 8.3 short-name field equal to `sfn` already exists in the directory
+// (used to pick a non-colliding "~n" alias for a long name).
+fn aliasExists(parent_cluster: u32, sfn: *const [11]u8) bool {
     var sector: [SECTOR]u8 = undefined;
     var cluster = parent_cluster;
     while (isDataCluster(cluster)) {
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster) : (s += 1) {
-            const lba = clusterToSector(cluster) + s;
-            if (!ata.read(lba, 1, &sector)) return false;
+            if (!ata.read(clusterToSector(cluster) + s, 1, &sector)) return false;
             var e: usize = 0;
-            while (e < SECTOR / 32) : (e += 1) {
-                const first = sector[e * 32];
-                if (first == 0x00 or first == 0xE5) { // a free slot
-                    const ent = sector[e * 32 .. e * 32 + 32];
-                    @memset(ent, 0);
-                    @memcpy(ent[0..11], &sfn);
-                    ent[0x0B] = attr; // 0x20 archive (file) or 0x10 directory
-                    wr16(ent, 0x14, @intCast(first_cluster >> 16));
-                    wr16(ent, 0x1A, @intCast(first_cluster & 0xFFFF));
-                    wr32(ent, 0x1C, size);
-                    return ata.write(lba, 1, &sector);
-                }
+            while (e < slotsPerSector()) : (e += 1) {
+                const ent = sector[e * 32 .. e * 32 + 32];
+                if (ent[0] == 0x00) return false; // end of directory
+                if (ent[0] == 0xE5 or ent[0x0B] == ATTR_LFN) continue; // deleted / LFN part
+                if (std.mem.eql(u8, ent[0..11], sfn)) return true;
             }
         }
         cluster = nextCluster(cluster);
     }
-    return false; // directory full (extending it is unsupported)
+    return false;
+}
+
+// Create a directory entry for a long `name` (one that doesn't fit 8.3): a run of
+// LFN entries holding the real name, followed by a short entry with a generated
+// "BASE~n" alias. Grows the directory if needed. Fails on disk-full or if no free
+// alias is available.
+fn createLfnEntry(parent_cluster: u32, name: []const u8, attr: u8, first_cluster: u32, size: u32) bool {
+    // Pick the first "~n" alias (n = 1..9) that doesn't collide.
+    var sfn: [11]u8 = undefined;
+    var n: u8 = 1;
+    while (true) : (n += 1) {
+        lfnenc.buildAlias(name, n, &sfn);
+        if (!aliasExists(parent_cluster, &sfn)) break;
+        if (n == 9) return false; // gave up finding a free alias
+    }
+    const cksum = lfnenc.checksum(&sfn);
+    const count = lfnenc.entryCount(name.len); // number of LFN entries
+    const start = reserveDirSlots(parent_cluster, count + 1) orelse return false;
+
+    // LFN entries come first, written highest-sequence-first (the first one
+    // carries the 0x40 end-of-name marker), then the short entry.
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        const seq: u8 = @intCast(count - k); // count, count-1, ..., 1
+        var ent: [32]u8 = undefined;
+        lfnenc.fillEntry(&ent, seq, seq == count, cksum, name);
+        if (!placeEntry(parent_cluster, start + k, &ent)) return false;
+    }
+    var short: [32]u8 = undefined;
+    buildShortEntry(&short, &sfn, attr, first_cluster, size);
+    return placeEntry(parent_cluster, start + count, &short);
 }
 
 // Write the "." and ".." entries that every FAT32 subdirectory begins with into
@@ -641,7 +743,13 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
         wr16(&sec, l.off + 0x1A, @intCast(chain_first & 0xFFFF)); // first cluster (low)
         return ata.write(l.lba, 1, &sec);
     }
-    return createDirEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
+    // A new file: an 8.3 name gets a plain short entry; anything else (e.g.
+    // "limine.conf", whose 4-char extension has no 8.3 form) gets an LFN run.
+    var sfn: [11]u8 = undefined;
+    if (to83(name, &sfn)) {
+        return createDirEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
+    }
+    return createLfnEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
 }
 
 // --- Boot self-test ----------------------------------------------------------
