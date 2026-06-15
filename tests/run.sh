@@ -126,6 +126,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "blocking-sleep self-test: slept, woke OK"  "$p blocking sleep (thread sleeps, timer wakes it)"
     assert_in "$log" "blocking mutex self-test: mutual exclusion held" "$p blocking mutex (two threads contend; mutual exclusion + handoff)"
     assert_in "$log" "Ring-3 self-test OK"                       "$p ring 3: ran user code at CPL3 + recovered from its #GP"
+    assert_in "$log" "Syscall round-trip OK"                     "$p syscall/sysret: ring 3 -> kernel -> ring 3 round trip"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

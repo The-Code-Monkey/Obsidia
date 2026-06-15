@@ -17,8 +17,10 @@ const serial = @import("../drivers/serial.zig"); // for logging
 // code selector) can use them by name.
 pub const KERNEL_CODE: u16 = 0x08; // GDT index 1 (ring 0 code)
 pub const KERNEL_DATA: u16 = 0x10; // GDT index 2 (ring 0 data)
-pub const USER_CODE: u16 = 0x18 | 3; // GDT index 3, low 2 bits = RPL 3 -> 0x1B
-pub const USER_DATA: u16 = 0x20 | 3; // GDT index 4, RPL 3 -> 0x23
+// User data precedes user code so the layout satisfies SYSRET, which derives the
+// user selectors as base+8 (SS/data) and base+16 (CS/code) from STAR[63:48].
+pub const USER_DATA: u16 = 0x18 | 3; // GDT index 3, low 2 bits = RPL 3 -> 0x1B
+pub const USER_CODE: u16 = 0x20 | 3; // GDT index 4, RPL 3 -> 0x23
 pub const TSS_SELECTOR: u16 = 0x28; // GDT index 5 (the TSS descriptor spans 5 and 6)
 
 // --- 64-bit Task State Segment ---------------------------------------------
@@ -151,8 +153,8 @@ pub fn init() void {
     gdt[0] = 0; // null descriptor (required to be entry 0)
     gdt[1] = makeEntry(0, 0xFFFFF, 0x9A, 0xA); // kernel code (ring 0, 64-bit: L bit set)
     gdt[2] = makeEntry(0, 0xFFFFF, 0x92, 0xC); // kernel data (ring 0)
-    gdt[3] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code   (ring 3, 64-bit)
-    gdt[4] = makeEntry(0, 0xFFFFF, 0xF2, 0xC); // user data   (ring 3)
+    gdt[3] = makeEntry(0, 0xFFFFF, 0xF2, 0xC); // user data   (ring 3)  -> 0x1B (SYSRET base+8)
+    gdt[4] = makeEntry(0, 0xFFFFF, 0xFA, 0xA); // user code   (ring 3, 64-bit) -> 0x23 (base+16)
 
     // Point the TSS at its stacks (tops, since the stack grows down) and
     // disable the I/O permission bitmap by pointing past the TSS limit.
