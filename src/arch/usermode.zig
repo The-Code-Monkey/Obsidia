@@ -92,6 +92,26 @@ comptime {
     );
 }
 
+// --- exit() return path ------------------------------------------------------
+// The SYS_exit handler (installed into syscall.exit_handler) for code launched via
+// usermodeEnter. There's no process to tear down yet, so it longjmps straight back
+// to usermodeEnter's caller — the same resume point the fault hook uses, but
+// reached directly from the syscall handler instead of via an interrupt frame.
+// Stage 5 replaces this with real process teardown + reschedule.
+pub var last_exit_code: u64 = 0;
+pub fn exitToKernel(code: u64) callconv(.c) noreturn {
+    last_exit_code = code;
+    asm volatile (
+        \\ movq usermode_kernel_rsp(%rip), %rsp
+        \\ sti
+        \\ jmp usermodeResume
+        ::: "memory");
+    // sti: the syscall handler runs with IF cleared (SFMASK), and unlike the
+    // fault path's iretq we don't restore RFLAGS — so re-enable interrupts here,
+    // matching the state the kernel expects on return (timer/preemption alive).
+    unreachable;
+}
+
 // --- Fault hook --------------------------------------------------------------
 var test_active: bool = false; // true only while the self-test expects a ring-3 fault
 var fault_cs: u64 = 0; // CS recorded at the fault (proves the privilege level)
@@ -124,51 +144,82 @@ pub fn selfTest() void {
     const data_frame = pmm.allocZeroed() orelse return failNoMem();
     const stack_frame = pmm.allocZeroed() orelse return failNoMem();
 
-    // Write the user stub into the code frame THROUGH ITS HHDM ALIAS (kernel RW),
-    // so we never need the user page itself to be writable — it maps in as RX,
-    // keeping W^X intact. The stub, hand-assembled:
-    //   48 B8 <magic>     mov  rax, RING3_MAGIC
-    //   48 A3 <U_DATA>    mov  [U_DATA], rax     ; a user write to a user page
-    //   B8 <TEST_NUM>     mov  eax, TEST_NUM     ; syscall number (zero-extends to rax)
-    //   0F 05             syscall                ; ring 3 -> kernel -> ring 3 (sysret)
-    //   FA                cli                     ; privileged at CPL 3 -> #GP
-    //   EB FE             jmp  $                  ; safety net (never reached)
-    const code: [*]u8 = @ptrFromInt(pmm.physToVirt(code_frame));
-    code[0] = 0x48; // REX.W
-    code[1] = 0xB8; // mov rax, imm64
-    writeU64(code + 2, RING3_MAGIC);
-    code[10] = 0x48; // REX.W
-    code[11] = 0xA3; // mov [moffs64], rax
-    writeU64(code + 12, U_DATA);
-    code[20] = 0xB8; // mov eax, imm32
-    writeU32(code + 21, @intCast(syscall.TEST_NUM));
-    code[25] = 0x0F; // syscall (0F 05)
-    code[26] = 0x05;
-    code[27] = 0xFA; // cli  (privileged -> #GP, recovered by the fault hook)
-    code[28] = 0xEB; // jmp rel8
-    code[29] = 0xFE; // -2 (to itself)
-
-    // Clear the marker (via the data frame's HHDM alias) so a stale value can't
-    // masquerade as success.
+    // The data page holds the ring-3 marker at offset 0 and a message string the
+    // write() syscall sends, at offset 64. Fill them via the HHDM alias (kernel RW).
+    const U_MSG: u64 = U_DATA + 64;
+    const MSG = "hello from ring 3 via syscall\n";
+    const data_bytes: [*]u8 = @ptrFromInt(pmm.physToVirt(data_frame));
     const marker_alias: *volatile u64 = @ptrFromInt(pmm.physToVirt(data_frame));
-    marker_alias.* = 0;
+    marker_alias.* = 0; // clear so a stale value can't masquerade as success
+    @memcpy(data_bytes[64 .. 64 + MSG.len], MSG);
+
+    // The code page carries two stubs (written via the HHDM alias, so the page maps
+    // in RX and W^X holds). Stub 1 at offset 0 exercises write + the #GP-recovery
+    // path; stub 2 at offset 0x80 exercises exit.
+    const code: [*]u8 = @ptrFromInt(pmm.physToVirt(code_frame));
+
+    // Stub 1 (entry U_CODE):
+    //   48 B8 <magic>   mov  rax, RING3_MAGIC
+    //   48 A3 <U_DATA>  mov  [U_DATA], rax       ; user writes a user page
+    //   B8 <SYS_write>  mov  eax, SYS_write
+    //   BF 1            mov  edi, 1              ; fd = stdout
+    //   48 BE <U_MSG>   mov  rsi, U_MSG          ; buffer
+    //   BA <len>        mov  edx, MSG.len        ; length
+    //   0F 05           syscall                  ; write() -> serial, sysret back
+    //   FA              cli                       ; privileged at CPL3 -> #GP (recovered)
+    //   EB FE           jmp  $
+    code[0] = 0x48;
+    code[1] = 0xB8;
+    writeU64(code + 2, RING3_MAGIC);
+    code[10] = 0x48;
+    code[11] = 0xA3;
+    writeU64(code + 12, U_DATA);
+    code[20] = 0xB8;
+    writeU32(code + 21, @intCast(syscall.SYS_write));
+    code[25] = 0xBF;
+    writeU32(code + 26, 1);
+    code[30] = 0x48;
+    code[31] = 0xBE;
+    writeU64(code + 32, U_MSG);
+    code[40] = 0xBA;
+    writeU32(code + 41, @intCast(MSG.len));
+    code[45] = 0x0F;
+    code[46] = 0x05;
+    code[47] = 0xFA;
+    code[48] = 0xEB;
+    code[49] = 0xFE;
+
+    // Stub 2 (entry U_CODE + 0x80):
+    //   B8 <SYS_exit>   mov  eax, SYS_exit
+    //   31 FF           xor  edi, edi            ; code = 0
+    //   0F 05           syscall                  ; exit() -> longjmp back to kernel
+    //   EB FE           jmp  $
+    code[0x80] = 0xB8;
+    writeU32(code + 0x81, @intCast(syscall.SYS_exit));
+    code[0x85] = 0x31;
+    code[0x86] = 0xFF;
+    code[0x87] = 0x0F;
+    code[0x88] = 0x05;
+    code[0x89] = 0xEB;
+    code[0x8A] = 0xFE;
 
     // Map the pages into user space: code RX, data + stack RW (non-exec).
     vmm.map(U_CODE, code_frame, vmm.FLAG_USER); // present + user, read-only, executable
     vmm.map(U_DATA, data_frame, vmm.FLAG_USER | vmm.FLAG_WRITE | vmm.FLAG_NX);
     vmm.map(U_STACK_TOP - PAGE_SIZE, stack_frame, vmm.FLAG_USER | vmm.FLAG_WRITE | vmm.FLAG_NX);
 
-    // Arm the recovery hook and drop to ring 3. usermodeEnter returns (via the
-    // longjmp) once the user code faults and faultHook redirects us back.
+    // --- Entry 1: write + #GP recovery ---------------------------------------
+    // Arm the fault hook and drop to ring 3. usermodeEnter returns (via the
+    // longjmp) once the stub's `cli` faults and faultHook redirects us back.
     idt.fault_hook = &faultHook;
     test_active = true;
-    syscall.test_seen = false; // cleared so the dispatcher proves it really ran
     serial.print("[USER]   entering ring 3 at 0x{x} (user stack 0x{x})...\n", .{ U_CODE, U_STACK_TOP });
     usermodeEnter(U_CODE, U_STACK_TOP);
     idt.fault_hook = null; // back in ring 0; disarm
 
-    // Verify both halves: the user code ran (marker written) AND it was genuinely
-    // at CPL 3 (the fault came from a RPL-3 code segment).
+    // The user code ran (marker written) and was genuinely at CPL 3 (the fault
+    // came from a RPL-3 code segment, which also proves the write() syscall
+    // sysret'd back to ring 3 before the cli).
     const wrote = marker_alias.* == RING3_MAGIC;
     const cpl3 = (fault_cs & 3) == 3;
     serial.print("[USER]   back in ring 0: marker=0x{x} (want 0x{x}); faulted vector {d} at CS 0x{x}.\n", .{ marker_alias.*, RING3_MAGIC, fault_vector, fault_cs });
@@ -177,14 +228,24 @@ pub fn selfTest() void {
     } else {
         serial.print("[USER] Ring-3 self-test FAILED (ran={}, cpl3={}).\n", .{ wrote, cpl3 });
     }
-
-    // The stub also issued a `syscall` before the faulting `cli`. The dispatcher
-    // set test_seen (proving entry reached the kernel), and the cli fault came
-    // from CPL 3 (proving sysret returned us to ring 3) — so the round trip held.
-    if (syscall.test_seen and cpl3) {
+    if (cpl3) { // write() returned to ring 3, then the cli faulted from CPL 3
         serial.print("[SYS] Syscall round-trip OK: ring 3 -> kernel -> ring 3 via syscall/sysret.\n", .{});
     } else {
-        serial.print("[SYS] Syscall round-trip FAILED (seen={}, cpl3={}).\n", .{ syscall.test_seen, cpl3 });
+        serial.print("[SYS] Syscall round-trip FAILED (cpl3={}).\n", .{cpl3});
+    }
+
+    // --- Entry 2: exit -------------------------------------------------------
+    // Install the exit handler (longjmps back here) and run stub 2, which calls
+    // exit(0). Control returns at the call site, as if usermodeEnter returned.
+    last_exit_code = 0xFFFF; // sentinel so we know exit really ran
+    syscall.exit_handler = &exitToKernel;
+    serial.print("[USER]   entering ring 3 at 0x{x} to test exit()...\n", .{U_CODE + 0x80});
+    usermodeEnter(U_CODE + 0x80, U_STACK_TOP);
+    syscall.exit_handler = null; // back in ring 0; disarm
+    if (last_exit_code == 0) {
+        serial.print("[SYS] exit syscall returned to the kernel (code {d}).\n", .{last_exit_code});
+    } else {
+        serial.print("[SYS] exit syscall FAILED (code={d}).\n", .{last_exit_code});
     }
 
     // Tear the mappings down and return the frames.
