@@ -176,6 +176,82 @@ pub const FLAG_WRITE = WRITE; // re-exported so callers can request writable pag
 pub const FLAG_NX = NX; // ...and non-executable pages
 pub const FLAG_USER = USER; // ...and pages reachable from ring 3 (user mode)
 
+// --- Per-process address spaces ----------------------------------------------
+// The kernel lives entirely in the higher half (PML4 entries 256..511: HHDM,
+// heap, kernel image). A process address space is a fresh PML4 that SHARES those
+// kernel entries (so the kernel — its code, stack, HHDM — stays mapped after a
+// CR3 switch) and owns the low half (0..255) for its user mappings.
+
+const KHALF_FIRST: usize = 256; // first PML4 index covering the higher (kernel) half
+
+// The kernel's own address space (the PML4 built in init), for switching back to.
+pub fn kernelSpace() u64 {
+    return pml4_phys;
+}
+
+// Create a new address space: a zeroed PML4 with the kernel's higher-half entries
+// copied in (sharing the kernel's lower-level tables). Returns its physical
+// address, or null if out of memory. The low half starts empty.
+pub fn createAddressSpace() ?u64 {
+    const frame = pmm.allocZeroed() orelse return null;
+    const new = tableAt(frame);
+    const kernel = tableAt(pml4_phys);
+    var i: usize = KHALF_FIRST;
+    while (i < 512) : (i += 1) new[i] = kernel[i]; // share the kernel half
+    return frame;
+}
+
+// Make `space` the active address space (load CR3). Caller ensures the code and
+// stack it returns to are mapped there — always true for a space from
+// createAddressSpace(), which shares the entire kernel half.
+pub fn switchTo(space: u64) void {
+    asm volatile ("mov %[p], %cr3"
+        :
+        : [p] "r" (space),
+        : "memory"
+    );
+}
+
+// Map / unmap a page in a specific address space (vs. map()/unmap(), which act on
+// the live kernel space). No TLB flush: a new space isn't active yet, and the CR3
+// load in switchTo() flushes everything anyway.
+pub fn mapInto(space: u64, virt: u64, phys: u64, flags: u64) void {
+    mapPage(tableAt(space), virt, phys, flags);
+}
+pub fn unmapInto(space: u64, virt: u64) void {
+    unmapPage(tableAt(space), virt);
+}
+
+// Free a table frame and, for PDPT/PD levels, its present non-huge children first.
+// Leaf (PT) entries point at the caller's DATA frames and are left untouched.
+fn freeSubtree(table: u64, level: u8) void {
+    if (level >= 2) { // PDPT (3) or PD (2): recurse into child tables
+        const t = tableAt(table);
+        var i: usize = 0;
+        while (i < 512) : (i += 1) {
+            const e = t[i];
+            if (e & PRESENT == 0 or e & HUGE != 0) continue; // empty, or a huge data page
+            freeSubtree(e & ADDR_MASK, level - 1);
+        }
+    }
+    pmm.free(table); // free this table frame itself
+}
+
+// Destroy an address space created by createAddressSpace(): free its low-half
+// (user) page tables and the PML4 frame. The shared kernel half is left alone;
+// data frames the user mapped are the caller's to free (e.g. via unmapInto first).
+pub fn destroyAddressSpace(space: u64) void {
+    const pml4 = tableAt(space);
+    var i: usize = 0;
+    while (i < KHALF_FIRST) : (i += 1) { // low (user) half only
+        const e = pml4[i];
+        if (e & PRESENT == 0) continue;
+        freeSubtree(e & ADDR_MASK, 3); // free the PDPT subtree under this entry
+        pml4[i] = 0;
+    }
+    pmm.free(space); // free the PML4 frame
+}
+
 // Walk to the leaf entry mapping `virt` (stopping at a huge page), or null if
 // unmapped. Used to verify applied permissions without triggering a fault.
 fn queryEntry(pml4: [*]u64, virt: u64) ?u64 {
@@ -253,6 +329,54 @@ fn selfTest(pml4: [*]u64) void {
     serial.print("[VMM]     unmapped scratch + freed frame.\n", .{});
 
     verifyWX(pml4); // finally, confirm the W^X permission bits
+}
+
+// --- Address-space self-test -------------------------------------------------
+// Create a second address space, map a user page in it, switch CR3, write+read
+// through that low-half VA, then switch back — proving a separate space works and
+// that the page is isolated (mapped in the new space, absent from the kernel's).
+pub fn selfTestAddressSpace() void {
+    serial.print("[VMM] Address-space self-test...\n", .{});
+    const as = createAddressSpace() orelse {
+        serial.print("[VMM]   FAILED: no memory for a new address space\n", .{});
+        return;
+    };
+    const frame = pmm.allocZeroed() orelse {
+        destroyAddressSpace(as);
+        return;
+    };
+    const va: u64 = 0x0000000000600000; // a low-half (user) address, only in `as`
+    mapInto(as, va, frame, FLAG_USER | FLAG_WRITE | FLAG_NX);
+
+    // The VA must resolve in the new space but not in the kernel space.
+    const in_new = queryEntry(tableAt(as), va) != null;
+    const in_kernel = queryEntry(tableAt(pml4_phys), va) != null;
+
+    // Switch to `as`, write+read through the user VA, then switch back. Interrupts
+    // off across the swap: everything the kernel touches is in the shared half, so
+    // this is just for a clean, deterministic transition.
+    const MAGIC: u64 = 0xA5A5_C0DE_1234_5678;
+    asm volatile ("cli");
+    switchTo(as);
+    const p: *volatile u64 = @ptrFromInt(va);
+    p.* = MAGIC;
+    const readback = p.*;
+    switchTo(pml4_phys); // back to the kernel address space
+    asm volatile ("sti");
+
+    // The write must have reached `frame` (confirm via its HHDM alias).
+    const alias: *volatile u64 = @ptrFromInt(pmm.physToVirt(frame));
+    const alias_ok = alias.* == MAGIC;
+
+    serial.print("[VMM]   VA 0x{x}: in new AS={}, in kernel AS={}; readback ok={}, frame alias ok={}.\n", .{ va, in_new, in_kernel, readback == MAGIC, alias_ok });
+    if (in_new and !in_kernel and readback == MAGIC and alias_ok) {
+        serial.print("[VMM] Address-space self-test OK.\n", .{});
+    } else {
+        serial.print("[VMM] Address-space self-test FAILED.\n", .{});
+    }
+
+    pmm.free(frame); // the data frame is ours to free
+    destroyAddressSpace(as); // free the space's tables + PML4
 }
 
 pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
