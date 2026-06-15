@@ -13,6 +13,11 @@ const heap = @import("../mm/heap.zig");
 const pic = @import("../arch/pic.zig"); // timer tick hook + tick counter
 const sync = @import("sync.zig"); // honor the print lock (don't switch mid-print)
 const mutex = @import("mutex.zig"); // blocking Mutex (used by the mutex self-test)
+const vmm = @import("../mm/vmm.zig"); // per-process address spaces (CR3 switch)
+const gdt = @import("../arch/gdt.zig"); // TSS.rsp0 (kernel stack for user traps)
+const syscall = @import("../arch/syscall.zig"); // per-process syscall kernel stack
+const usermode = @import("../arch/usermode.zig"); // enterRing3 (first user dispatch)
+const pmm = @import("../mm/pmm.zig"); // frames for the demo's user pages
 
 const STACK_SIZE = 32 * 1024; // 32 KiB per thread (the shell uses std.fmt etc.)
 const MAX_THREADS = 16;
@@ -55,6 +60,11 @@ const Thread = struct {
     name: []const u8,
     entry: *const fn () void = undefined, // the function the thread runs
     wake_tick: u64 = 0, // if sleeping, the tick at which to wake (0 = not sleeping)
+    // Process fields (0/unused for plain kernel threads):
+    pml4: u64 = 0, // address space to run in (0 = the shared kernel space)
+    kstack_top: u64 = 0, // ring-0 stack top for this thread's traps/syscalls
+    user_entry: u64 = 0, // ring-3 entry point (user processes only)
+    user_stack: u64 = 0, // ring-3 stack top (user processes only)
 };
 
 var threads: [MAX_THREADS]Thread = undefined;
@@ -62,6 +72,7 @@ var thread_count: usize = 0;
 var current: usize = 0; // index of the running thread
 var alive: usize = 0; // number of non-finished worker threads (atomic)
 var preempting: bool = false; // true while timer-driven preemption is enabled
+var current_as: u64 = 0; // address space currently in CR3 (0 = not yet established)
 
 // Atomic accessor for `alive` so a busy-wait reader sees worker updates.
 pub fn aliveCount() usize {
@@ -95,9 +106,26 @@ pub fn spawn(name: []const u8, func: *const fn () void) void {
     push(&sp, @intFromPtr(&threadStart)); // switchContext's `ret` enters the trampoline
     for (0..6) |_| push(&sp, 0); // saved rbp, rbx, r12, r13, r14, r15
 
-    threads[thread_count] = .{ .rsp = sp, .stack = stack, .state = .ready, .name = name, .entry = func };
+    threads[thread_count] = .{ .rsp = sp, .stack = stack, .state = .ready, .name = name, .entry = func, .kstack_top = top };
     thread_count += 1;
     _ = @atomicRmw(usize, &alive, .Add, 1, .monotonic);
+}
+
+// Prepare the CPU to run thread `idx`: point the kernel-trap and syscall stacks at
+// its kernel stack, and switch CR3 if it lives in a different address space than
+// the one currently loaded. Called just before switchContext. Kernel threads use
+// the shared kernel space; only switches involving a process touch CR3.
+fn applyContext(idx: usize) void {
+    const t = &threads[idx];
+    if (t.kstack_top != 0) { // where a trap/syscall from this thread should land
+        gdt.setKernelStack(t.kstack_top);
+        syscall.setKernelStack(t.kstack_top);
+    }
+    const target = if (t.pml4 != 0) t.pml4 else vmm.kernelSpace();
+    if (target != current_as) {
+        vmm.switchTo(target);
+        current_as = target;
+    }
 }
 
 // First thing a new thread runs: enable interrupts (so it's preemptible — a
@@ -136,6 +164,7 @@ pub fn yield() void {
             if (threads[prev].state == .running) threads[prev].state = .ready;
             threads[cand].state = .running;
             current = cand;
+            applyContext(cand); // set the kernel/syscall stacks + CR3 for the incoming thread
             switchContext(&threads[prev].rsp, threads[cand].rsp);
             break; // resumes here when we're switched back to
         }
@@ -200,6 +229,56 @@ fn threadExit() noreturn {
     _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic);
     yield();
     unreachable;
+}
+
+// --- User processes ----------------------------------------------------------
+// Create a user process: a thread that begins in ring 3 at `user_entry` (stack
+// `user_stack`) inside address space `pml4`. Like spawn(), the kernel stack is
+// hand-built so the first switchContext "returns" into a trampoline — userStart,
+// which drops to ring 3. The kernel stack also catches the process's syscalls and
+// traps (applyContext points TSS.rsp0 / the syscall stack at it while it runs).
+pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) void {
+    if (thread_count >= MAX_THREADS) return;
+    const stack = heap.allocator().alloc(u8, STACK_SIZE) catch {
+        serial.print("[SCHED]   failed to allocate a user kernel stack\n", .{});
+        return;
+    };
+    const top = (@intFromPtr(stack.ptr) + stack.len) & ~@as(usize, 0xF);
+    var sp: usize = top;
+    push(&sp, @intFromPtr(&threadExit)); // fallback (userStart never returns here)
+    push(&sp, @intFromPtr(&userStart)); // switchContext's `ret` enters this trampoline
+    for (0..6) |_| push(&sp, 0); // saved rbp, rbx, r12-r15
+
+    threads[thread_count] = .{
+        .rsp = sp,
+        .stack = stack,
+        .state = .ready,
+        .name = name,
+        .kstack_top = top,
+        .pml4 = pml4,
+        .user_entry = user_entry,
+        .user_stack = user_stack,
+    };
+    thread_count += 1;
+    _ = @atomicRmw(usize, &alive, .Add, 1, .monotonic);
+}
+
+// First thing a user thread runs (ring 0, in its own address space): drop to
+// ring 3. It returns to ring 0 only via a syscall or interrupt, never to here.
+fn userStart() void {
+    const t = &threads[current];
+    usermode.enterRing3(t.user_entry, t.user_stack);
+}
+
+// SYS_exit handler for user processes (installed into syscall.exit_handler while a
+// process is scheduled): mark the caller finished and switch away for good.
+fn exitProcessHandler(code: u64) callconv(.c) noreturn {
+    _ = code;
+    asm volatile ("cli"); // the thread we switch to restores its own interrupt flag
+    threads[current].state = .finished;
+    _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic);
+    yield();
+    unreachable; // a finished thread is never scheduled again
 }
 
 // --- Self-test: two cooperative worker threads -------------------------------
@@ -387,4 +466,103 @@ pub fn mutexDemo() void {
         serial.print("[MUTEX] FAIL: counter={d} (expected {d}), violation={}\n", .{ mtx_counter, expected, mtx_violation });
     }
     serial.print("[SCHED] Blocking-mutex self-test complete.\n", .{});
+}
+
+// --- User-process self-test --------------------------------------------------
+// Spawn a real ring-3 process (its own address space) alongside a kernel thread
+// and run them under preemption. The process loops in ring 3 doing SYS_yield and
+// incrementing a counter in ITS user memory, then SYS_exit; the kernel thread
+// increments a kernel counter. Both advancing proves user/kernel co-scheduling
+// across address spaces (CR3 switch + per-process kernel stack on every switch).
+const DEMO_ITERS = 5;
+var demo_kcounter: usize = 0;
+
+fn demoKWorker() void {
+    var k: usize = 0;
+    while (k < DEMO_ITERS) : (k += 1) {
+        demo_kcounter += 1;
+        yield(); // interleave with the user process
+    }
+    // falls through to threadExit
+}
+
+// Little-endian stores into the hand-assembled user stub.
+fn wr64(p: [*]u8, v: u64) void {
+    var i: usize = 0;
+    while (i < 8) : (i += 1) p[i] = @truncate(v >> @intCast(i * 8));
+}
+fn wr32(p: [*]u8, v: u32) void {
+    var i: usize = 0;
+    while (i < 4) : (i += 1) p[i] = @truncate(v >> @intCast(i * 8));
+}
+
+pub fn userProcessDemo() void {
+    serial.print("[SCHED] User-process self-test (ring 3 + own address space)...\n", .{});
+    setupMain();
+    demo_kcounter = 0;
+
+    const as = vmm.createAddressSpace() orelse {
+        serial.print("[SCHED]   FAILED: no memory for a user address space\n", .{});
+        return;
+    };
+    const code_frame = pmm.allocZeroed() orelse return;
+    const data_frame = pmm.allocZeroed() orelse return;
+    const stack_frame = pmm.allocZeroed() orelse return;
+
+    const U_CODE: u64 = 0x400000; // ring-3 code
+    const U_DATA: u64 = 0x401000; // a counter the process bumps each iteration
+    const U_STACK_TOP: u64 = 0x403000; // top of a one-page user stack at 0x402000
+
+    // Hand-assemble the ring-3 stub into the code frame via its HHDM alias:
+    //   xor ebx,ebx; loop: mov eax,SYS_yield; syscall; inc rbx; mov rax,rbx;
+    //   mov [U_DATA],rax; cmp rbx,N; jl loop; mov eax,SYS_exit; xor edi,edi; syscall
+    const code: [*]u8 = @ptrFromInt(pmm.physToVirt(code_frame));
+    code[0] = 0x31; code[1] = 0xDB; // xor ebx, ebx
+    code[2] = 0xB8; wr32(code + 3, @intCast(syscall.SYS_yield)); // mov eax, SYS_yield
+    code[7] = 0x0F; code[8] = 0x05; // syscall
+    code[9] = 0x48; code[10] = 0xFF; code[11] = 0xC3; // inc rbx
+    code[12] = 0x48; code[13] = 0x89; code[14] = 0xD8; // mov rax, rbx
+    code[15] = 0x48; code[16] = 0xA3; wr64(code + 17, U_DATA); // mov [U_DATA], rax
+    code[25] = 0x48; code[26] = 0x83; code[27] = 0xFB; code[28] = DEMO_ITERS; // cmp rbx, N
+    code[29] = 0x7C; code[30] = 0xE3; // jl loop (-29 -> back to offset 2)
+    code[31] = 0xB8; wr32(code + 32, @intCast(syscall.SYS_exit)); // mov eax, SYS_exit
+    code[36] = 0x31; code[37] = 0xFF; // xor edi, edi
+    code[38] = 0x0F; code[39] = 0x05; // syscall (exit)
+    code[40] = 0xEB; code[41] = 0xFE; // jmp $ (safety)
+
+    const counter: *volatile u64 = @ptrFromInt(pmm.physToVirt(data_frame));
+    counter.* = 0;
+
+    vmm.mapInto(as, U_CODE, code_frame, vmm.FLAG_USER); // RX, user
+    vmm.mapInto(as, U_DATA, data_frame, vmm.FLAG_USER | vmm.FLAG_WRITE | vmm.FLAG_NX);
+    vmm.mapInto(as, U_STACK_TOP - 0x1000, stack_frame, vmm.FLAG_USER | vmm.FLAG_WRITE | vmm.FLAG_NX);
+
+    // Run the process + a kernel thread under preemption until both finish.
+    syscall.exit_handler = &exitProcessHandler;
+    spawnUser("uproc", U_CODE, U_STACK_TOP, as);
+    spawn("kproc", &demoKWorker);
+    preempting = true;
+    pic.on_tick = &tick;
+    while (aliveCount() > 0) {} // main waits; the timer co-schedules both
+    pic.on_tick = null;
+    preempting = false;
+    syscall.exit_handler = null;
+
+    const user_iters = counter.*;
+    serial.print("[SCHED]   user process ran {d} ring-3 iterations; kernel thread ran {d}.\n", .{ user_iters, demo_kcounter });
+    if (user_iters == DEMO_ITERS and demo_kcounter == DEMO_ITERS) {
+        serial.print("[SCHED] User-process self-test OK: ring-3 process + kernel thread co-scheduled across address spaces.\n", .{});
+    } else {
+        serial.print("[SCHED] User-process self-test FAILED (user={d}, kernel={d}).\n", .{ user_iters, demo_kcounter });
+    }
+
+    // Tear down the process's address space + frames (its kernel stack, like the
+    // other self-tests' thread stacks, is left allocated — these run once at boot).
+    vmm.unmapInto(as, U_CODE);
+    vmm.unmapInto(as, U_DATA);
+    vmm.unmapInto(as, U_STACK_TOP - 0x1000);
+    pmm.free(code_frame);
+    pmm.free(data_frame);
+    pmm.free(stack_frame);
+    vmm.destroyAddressSpace(as);
 }

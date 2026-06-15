@@ -137,6 +137,13 @@ fn load(ptr: *const Gdtr) void {
     );
 }
 
+// Update the ring-0 stack the CPU switches to on a ring 3 -> ring 0 transition
+// (interrupt/exception from user mode). The scheduler calls this on every switch
+// so a trap from the running user process lands on ITS kernel stack.
+pub fn setKernelStack(rsp0: u64) void {
+    tss.rsp0 = rsp0;
+}
+
 // Load the task register (TR) with the TSS selector, activating the TSS.
 fn loadTss(selector: u16) void {
     asm volatile ("ltr %[sel]" // ltr = load task register
