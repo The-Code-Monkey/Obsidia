@@ -35,6 +35,11 @@ pub const SYS_exit: u64 = 3; // exit(code) -> does not return
 
 const ENOSYS: u64 = @bitCast(@as(i64, -38)); // unknown syscall
 const EBADF: u64 = @bitCast(@as(i64, -9)); // bad file descriptor
+const EFAULT: u64 = @bitCast(@as(i64, -14)); // bad (out-of-bounds) user address
+
+// First address above the canonical low half: every user buffer must lie below
+// it, so a syscall can never be tricked into reading higher-half kernel memory.
+const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 // exit() has no real meaning until processes exist (Stage 4/5). For now a caller
 // (the self-test, later the loader) installs a handler that returns control to
@@ -57,13 +62,15 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
 }
 
 // write(fd, ptr, len): copy `len` bytes from the user buffer to serial (the only
-// sink for now). fd 1 (stdout) / 2 (stderr) only. The length is clamped as a
-// crude guard; real user-pointer validation (copy_from_user with fault handling)
-// comes with the process model.
+// sink for now). fd 1 (stdout) / 2 (stderr) only. The buffer must lie wholly in
+// user space so a caller can't make the kernel read its own memory. (This is a
+// range check only; full per-page validation with fault handling — copy_from_user
+// — comes with the process model.)
 fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
     if (fd != 1 and fd != 2) return EBADF;
     if (len == 0) return 0;
     const n = @min(len, 4096);
+    if (ptr >= USER_LIMIT or n > USER_LIMIT - ptr) return EFAULT; // buffer escapes user space
     const buf = @as([*]const u8, @ptrFromInt(ptr))[0..n];
     serial.print("{s}", .{buf});
     return n;
@@ -80,7 +87,10 @@ fn sysYield() u64 {
 fn sysExit(code: u64) u64 {
     serial.print("[SYS]   exit({d}).\n", .{code});
     if (exit_handler) |h| h(code); // noreturn
-    return 0; // no handler installed (shouldn't happen while user code runs)
+    // No handler installed: this is a kernel bug (one is always set before user
+    // code runs), so say so loudly rather than silently letting the user resume.
+    serial.print("[SYS]   WARNING: exit() with no handler installed — cannot terminate caller.\n", .{});
+    return ENOSYS;
 }
 
 // The `syscall` entry point (the LSTAR target). Global naked asm: switch to the

@@ -103,8 +103,12 @@ pub fn exitToKernel(code: u64) callconv(.c) noreturn {
     last_exit_code = code;
     asm volatile (
         \\ movq usermode_kernel_rsp(%rip), %rsp
+        \\ sti
         \\ jmp usermodeResume
         ::: "memory");
+    // sti: the syscall handler runs with IF cleared (SFMASK), and unlike the
+    // fault path's iretq we don't restore RFLAGS — so re-enable interrupts here,
+    // matching the state the kernel expects on return (timer/preemption alive).
     unreachable;
 }
 
