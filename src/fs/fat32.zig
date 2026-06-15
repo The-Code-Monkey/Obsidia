@@ -71,21 +71,52 @@ pub fn isMounted() bool {
     return mounted;
 }
 
-// --- One-sector FAT cache ----------------------------------------------------
-// Following a cluster chain re-reads the FAT a lot; caching the last FAT sector
-// makes walking a chain that stays within one FAT sector free after the first.
-var fat_cache_sector: u32 = 0xFFFFFFFF; // which FAT sector is cached (invalid = none)
+// --- Write-back one-sector FAT cache -----------------------------------------
+// Walking and *building* cluster chains touches the FAT constantly. We cache one
+// FAT sector (identified by its index WITHIN a FAT, so the same buffer maps to
+// every FAT copy) and write back lazily: reads see our own pending edits, and a
+// dirty sector is flushed to all FAT copies only when we move to another sector
+// or finish an operation. That collapses the thousands of single-entry updates a
+// big-file write makes into a handful of sector writes — essential over slow PIO.
+var fat_cache_sector: u32 = 0xFFFFFFFF; // cached FAT-relative sector index (invalid = none)
 var fat_cache: [SECTOR]u8 = undefined; // the cached FAT sector bytes
+var fat_cache_dirty: bool = false; // does the cache hold unflushed edits?
+
+// Flush the dirty cached FAT sector to every FAT copy. A no-op if clean.
+fn fatFlush() bool {
+    if (!fat_cache_dirty or fat_cache_sector == 0xFFFFFFFF) {
+        fat_cache_dirty = false;
+        return true;
+    }
+    var fi: u8 = 0;
+    while (fi < bi.num_fats) : (fi += 1) { // mirror into each FAT copy
+        const lba = bi.volume_start + bi.reserved_sectors + @as(u32, fi) * bi.fat_size + fat_cache_sector;
+        if (!ata.write(lba, 1, &fat_cache)) return false;
+    }
+    fat_cache_dirty = false;
+    return true;
+}
+
+// Ensure FAT-relative sector `rel` is the one in the cache (flushing any other
+// dirty sector first). Returns false on a disk error.
+fn fatLoad(rel: u32) bool {
+    if (fat_cache_sector == rel) return true;
+    if (!fatFlush()) return false; // commit the previous sector before evicting it
+    const lba = bi.volume_start + bi.reserved_sectors + rel; // read from FAT copy 0
+    if (!ata.read(lba, 1, &fat_cache)) {
+        fat_cache_sector = 0xFFFFFFFF;
+        return false;
+    }
+    fat_cache_sector = rel;
+    return true;
+}
 
 // Look up the next cluster after `cluster` in the chain (or >= EOC at the end).
 fn nextCluster(cluster: u32) u32 {
     const fat_offset = cluster * 4; // each FAT32 entry is 4 bytes
-    const fat_sector = bi.volume_start + bi.reserved_sectors + (fat_offset / @as(u32, bi.bytes_per_sector));
+    const rel = fat_offset / @as(u32, bi.bytes_per_sector); // FAT-relative sector
     const entry_offset = fat_offset % @as(u32, bi.bytes_per_sector);
-    if (fat_sector != fat_cache_sector) { // not cached -> fetch it
-        if (!ata.read(fat_sector, 1, &fat_cache)) return EOC; // read error: stop the chain
-        fat_cache_sector = fat_sector;
-    }
+    if (!fatLoad(rel)) return EOC; // read error: stop the chain
     return rd32(&fat_cache, entry_offset) & 0x0FFFFFFF; // top 4 bits are reserved
 }
 
@@ -144,6 +175,8 @@ pub fn mountAt(start: u32) bool {
     bi.first_data_sector = bi.reserved_sectors + @as(u32, bi.num_fats) * bi.fat_size;
     bi.volume_start = start; // remember where the volume lives on the disk
     fat_cache_sector = 0xFFFFFFFF; // invalidate the FAT cache for the new volume
+    fat_cache_dirty = false; // nothing pending on a fresh mount
+    next_free_cluster = 2; // restart the allocation hint for the new volume
     mounted = true;
     serial.print("[FAT32] mounted: {d}-byte sectors, {d} sec/cluster, {d} FAT(s), root cluster {d}, data @ sector {d}.\n", .{ bi.bytes_per_sector, bi.sectors_per_cluster, bi.num_fats, bi.root_cluster, bi.first_data_sector });
     return true;
@@ -386,22 +419,16 @@ fn clusterCount() u32 {
     return (bi.total_sectors - bi.first_data_sector) / bi.sectors_per_cluster;
 }
 
-// Set the FAT entry for `cluster` to `value` in every FAT copy. Invalidates the
-// read cache so subsequent reads see the change.
+// Set the FAT entry for `cluster` to `value`. Edits the write-back cache (which
+// reads see immediately); fatFlush() commits it to every FAT copy later.
 fn writeFatEntry(cluster: u32, value: u32) bool {
     const fat_offset = cluster * 4;
     const ent_off = fat_offset % @as(u32, bi.bytes_per_sector);
-    const within = fat_offset / @as(u32, bi.bytes_per_sector);
-    var sec: [SECTOR]u8 = undefined;
-    var fi: u8 = 0;
-    while (fi < bi.num_fats) : (fi += 1) {
-        const fat_sector = bi.volume_start + bi.reserved_sectors + @as(u32, fi) * bi.fat_size + within;
-        if (!ata.read(fat_sector, 1, &sec)) return false;
-        const top = rd32(&sec, ent_off) & 0xF0000000; // keep the 4 reserved high bits
-        wr32(&sec, ent_off, top | (value & 0x0FFFFFFF));
-        if (!ata.write(fat_sector, 1, &sec)) return false;
-    }
-    fat_cache_sector = 0xFFFFFFFF; // the cached FAT sector may now be stale
+    const rel = fat_offset / @as(u32, bi.bytes_per_sector);
+    if (!fatLoad(rel)) return false; // bring the entry's sector into the cache
+    const top = rd32(&fat_cache, ent_off) & 0xF0000000; // keep the 4 reserved high bits
+    wr32(&fat_cache, ent_off, top | (value & 0x0FFFFFFF));
+    fat_cache_dirty = true;
     return true;
 }
 
@@ -415,16 +442,29 @@ fn zeroCluster(c: u32) bool {
     return true;
 }
 
-// Find a free cluster, mark it end-of-chain, zero it, and return it.
-fn allocCluster() ?u32 {
+// Allocation hint: the cluster to begin the next free search from. Resuming here
+// instead of restarting at cluster 2 turns sequential allocation (e.g. writing a
+// multi-megabyte file) from O(n^2) into O(n) — critical for the installer copying
+// a 2.5 MiB kernel over slow PIO. Reset on mount.
+var next_free_cluster: u32 = 2;
+
+// Find a free cluster, mark it end-of-chain, optionally zero it, and return it.
+// `zero` is true for directory clusters (which must start empty) and false for
+// file-data clusters (writeFile overwrites every sector it uses), saving a write
+// per cluster.
+fn allocCluster(zero: bool) ?u32 {
     const count = clusterCount();
-    var c: u32 = 2;
-    while (c < count + 2) : (c += 1) {
+    var c: u32 = if (next_free_cluster >= 2 and next_free_cluster < count + 2) next_free_cluster else 2;
+    var scanned: u32 = 0;
+    while (scanned < count) : (scanned += 1) {
+        if (c >= count + 2) c = 2; // wrap past the end of the cluster space
         if (nextCluster(c) == 0) { // a 0 FAT entry means free
             if (!writeFatEntry(c, EOC)) return null;
-            if (!zeroCluster(c)) return null;
+            if (zero and !zeroCluster(c)) return null;
+            next_free_cluster = c + 1; // resume the next search just past here
             return c;
         }
+        c += 1;
     }
     return null; // disk full
 }
@@ -551,7 +591,7 @@ fn reserveDirSlots(parent_cluster: u32, need: usize) ?usize {
     const start = first_free orelse total; // a packed dir appends at its very end
     var free_tail = total - start; // free slots from `start` to the end
     while (free_tail < need) { // grow the directory a cluster at a time
-        const nc = allocCluster() orelse return null; // new (zeroed) dir cluster
+        const nc = allocCluster(true) orelse return null; // new (zeroed) dir cluster
         if (!writeFatEntry(last_cluster, nc)) return null; // link it onto the chain
         last_cluster = nc;
         free_tail += per_cluster;
@@ -673,10 +713,11 @@ pub fn mkdir(path: []const u8) bool {
     const parent = resolve(parent_path) orelse return false;
     if (!parent.is_dir) return false;
 
-    const dir_cluster = allocCluster() orelse return false; // the new dir's data
+    const dir_cluster = allocCluster(true) orelse return false; // the new dir's data
     if (!writeDotEntries(dir_cluster, parent.cluster)) return false; // "." and ".."
     // A directory's entry records cluster but size 0 (size is unused for dirs).
-    return createDirEntry(parent.cluster, name, ATTR_DIRECTORY, dir_cluster, 0);
+    const made = createDirEntry(parent.cluster, name, ATTR_DIRECTORY, dir_cluster, 0);
+    return made and fatFlush(); // commit the FAT edits (new cluster + any dir growth)
 }
 
 // Write `data` to `path`, creating or overwriting the file. Grows/shrinks the
@@ -703,13 +744,13 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
         if (isDataCluster(old_first)) freeChain(old_first);
         chain_first = 0;
     } else {
-        if (!isDataCluster(chain_first)) chain_first = allocCluster() orelse return false;
+        if (!isDataCluster(chain_first)) chain_first = allocCluster(false) orelse return false;
         var prev = chain_first;
         var have: usize = 1;
         while (have < needed) : (have += 1) {
             var nxt = nextCluster(prev);
             if (!isDataCluster(nxt)) {
-                nxt = allocCluster() orelse return false;
+                nxt = allocCluster(false) orelse return false;
                 if (!writeFatEntry(prev, nxt)) return false;
             }
             prev = nxt;
@@ -719,22 +760,50 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
         if (isDataCluster(extra)) freeChain(extra);
     }
 
-    // Write the data into the chain, zero-padding the final sector.
-    var cluster = chain_first;
-    var written: usize = 0;
-    while (written < data.len and isDataCluster(cluster)) {
-        var s: u32 = 0;
-        while (s < bi.sectors_per_cluster and written < data.len) : (s += 1) {
-            var buf = [_]u8{0} ** SECTOR;
-            const n = @min(data.len - written, @as(usize, SECTOR));
-            @memcpy(buf[0..n], data[written .. written + n]);
-            if (!ata.write(clusterToSector(cluster) + s, 1, &buf)) return false;
-            written += n;
+    // Write the data across the chain, batching physically-contiguous clusters
+    // into single multi-sector PIO writes straight from `data` (no per-sector
+    // copy); only a trailing partial sector needs a zero-padded temp buffer.
+    {
+        const spc: u32 = bi.sectors_per_cluster;
+        var cluster = chain_first;
+        var off: usize = 0;
+        var tmp: [SECTOR]u8 = undefined;
+        while (off < data.len and isDataCluster(cluster)) {
+            // Grow a run of contiguous clusters (one PIO command moves <=256 secs).
+            const start_lba = clusterToSector(cluster);
+            var run: u32 = spc;
+            var last = cluster;
+            while (run < 256) {
+                const nxt = nextCluster(last);
+                if (!isDataCluster(nxt) or clusterToSector(nxt) != start_lba + run) break;
+                run += spc;
+                last = nxt;
+            }
+            const remaining_secs = (data.len - off + SECTOR - 1) / SECTOR;
+            const run_secs = @min(@as(usize, run), remaining_secs);
+            // Full sectors come straight from `data`; a short tail sector is padded.
+            const full = if (data.len - off >= run_secs * SECTOR) run_secs else run_secs - 1;
+            if (full > 0) {
+                if (!ata.write(start_lba, @intCast(full), data[off .. off + full * SECTOR])) return false;
+                off += full * SECTOR;
+            }
+            if (full < run_secs) { // the final, partially filled sector
+                const n = data.len - off;
+                @memset(&tmp, 0);
+                @memcpy(tmp[0..n], data[off .. off + n]);
+                if (!ata.write(start_lba + @as(u32, @intCast(full)), 1, &tmp)) return false;
+                off += n;
+            }
+            cluster = nextCluster(last);
         }
-        cluster = nextCluster(cluster);
     }
 
-    // Update the existing directory entry, or create a new one.
+    // Commit the chain's FAT edits to disk before any directory entry points at
+    // them (so a crash can't leave a dir entry referencing an uncommitted chain).
+    if (!fatFlush()) return false;
+
+    // Update the existing directory entry, or create a new one (which may itself
+    // grow the directory, so flush the FAT once more before returning).
     if (loc) |l| {
         var sec: [SECTOR]u8 = undefined;
         if (!ata.read(l.lba, 1, &sec)) return false;
@@ -746,10 +815,11 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
     // A new file: an 8.3 name gets a plain short entry; anything else (e.g.
     // "limine.conf", whose 4-char extension has no 8.3 form) gets an LFN run.
     var sfn: [11]u8 = undefined;
-    if (to83(name, &sfn)) {
-        return createDirEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
-    }
-    return createLfnEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
+    const made = if (to83(name, &sfn))
+        createDirEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len))
+    else
+        createLfnEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
+    return made and fatFlush();
 }
 
 // --- Boot self-test ----------------------------------------------------------
