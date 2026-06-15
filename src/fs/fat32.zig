@@ -29,7 +29,11 @@ const BootInfo = struct {
     fat_size: u32, // sectors per FAT
     root_cluster: u32,
     total_sectors: u32,
-    first_data_sector: u32, // where the data region (cluster 2) begins
+    first_data_sector: u32, // where the data region (cluster 2) begins (relative)
+    volume_start: u32, // disk LBA where the volume begins (0 = whole-disk mount;
+    // nonzero when the volume lives in a partition, e.g. an ESP at LBA 2048).
+    // Every absolute LBA we compute is offset by this, so the same read/write
+    // code serves both a raw FAT32 disk and a partition.
 };
 
 var bi: BootInfo = undefined;
@@ -75,7 +79,7 @@ var fat_cache: [SECTOR]u8 = undefined; // the cached FAT sector bytes
 // Look up the next cluster after `cluster` in the chain (or >= EOC at the end).
 fn nextCluster(cluster: u32) u32 {
     const fat_offset = cluster * 4; // each FAT32 entry is 4 bytes
-    const fat_sector = bi.reserved_sectors + (fat_offset / @as(u32, bi.bytes_per_sector));
+    const fat_sector = bi.volume_start + bi.reserved_sectors + (fat_offset / @as(u32, bi.bytes_per_sector));
     const entry_offset = fat_offset % @as(u32, bi.bytes_per_sector);
     if (fat_sector != fat_cache_sector) { // not cached -> fetch it
         if (!ata.read(fat_sector, 1, &fat_cache)) return EOC; // read error: stop the chain
@@ -84,9 +88,9 @@ fn nextCluster(cluster: u32) u32 {
     return rd32(&fat_cache, entry_offset) & 0x0FFFFFFF; // top 4 bits are reserved
 }
 
-// The first LBA sector of a given cluster's data.
+// The first (absolute) LBA sector of a given cluster's data.
 fn clusterToSector(c: u32) u32 {
-    return bi.first_data_sector + (c - 2) * bi.sectors_per_cluster;
+    return bi.volume_start + bi.first_data_sector + (c - 2) * bi.sectors_per_cluster;
 }
 
 // Is `c` a valid in-use data cluster (not free, not end-of-chain, not bad)?
@@ -95,15 +99,22 @@ fn isDataCluster(c: u32) bool {
 }
 
 // --- Mount -------------------------------------------------------------------
-// Read and validate the boot sector, then compute the geometry we need. Safe to
-// call with no disk or an unformatted disk: it reports why and returns false.
+// Mount the whole disk as one FAT32 volume (the volume begins at LBA 0). This is
+// the common case (run.sh's dev disk); the installer uses mountAt() for an ESP.
 pub fn mount() bool {
+    return mountAt(0);
+}
+
+// Read and validate the boot sector at disk LBA `start`, then compute the
+// geometry we need, recording `start` so every later LBA is offset by it. Safe to
+// call with no disk or an unformatted volume: it reports why and returns false.
+pub fn mountAt(start: u32) bool {
     if (!ata.isPresent()) {
         serial.print("[FAT32] no disk present — nothing to mount.\n", .{});
         return false;
     }
     var bs: [SECTOR]u8 = undefined;
-    if (!ata.read(0, 1, &bs)) {
+    if (!ata.read(start, 1, &bs)) {
         serial.print("[FAT32] failed to read the boot sector.\n", .{});
         return false;
     }
@@ -127,8 +138,10 @@ pub fn mount() bool {
         serial.print("[FAT32] not a FAT32 volume (cluster/FAT size zero).\n", .{});
         return false;
     }
-    // Data region begins after the reserved sectors and all FAT copies.
+    // Data region begins after the reserved sectors and all FAT copies (relative
+    // to the volume start; clusterToSector adds volume_start for absolute LBAs).
     bi.first_data_sector = bi.reserved_sectors + @as(u32, bi.num_fats) * bi.fat_size;
+    bi.volume_start = start; // remember where the volume lives on the disk
     fat_cache_sector = 0xFFFFFFFF; // invalidate the FAT cache for the new volume
     mounted = true;
     serial.print("[FAT32] mounted: {d}-byte sectors, {d} sec/cluster, {d} FAT(s), root cluster {d}, data @ sector {d}.\n", .{ bi.bytes_per_sector, bi.sectors_per_cluster, bi.num_fats, bi.root_cluster, bi.first_data_sector });
@@ -381,7 +394,7 @@ fn writeFatEntry(cluster: u32, value: u32) bool {
     var sec: [SECTOR]u8 = undefined;
     var fi: u8 = 0;
     while (fi < bi.num_fats) : (fi += 1) {
-        const fat_sector = bi.reserved_sectors + @as(u32, fi) * bi.fat_size + within;
+        const fat_sector = bi.volume_start + bi.reserved_sectors + @as(u32, fi) * bi.fat_size + within;
         if (!ata.read(fat_sector, 1, &sec)) return false;
         const top = rd32(&sec, ent_off) & 0xF0000000; // keep the 4 reserved high bits
         wr32(&sec, ent_off, top | (value & 0x0FFFFFFF));
@@ -485,10 +498,11 @@ fn to83(name: []const u8, out: *[11]u8) bool {
     return true;
 }
 
-// Create a new 8.3 directory entry in `parent_cluster` for `name`, pointing at
-// `first_cluster` with `size` bytes. Fails if the name isn't 8.3 or the
-// directory has no free slot in its existing clusters.
-fn createDirEntry(parent_cluster: u32, name: []const u8, first_cluster: u32, size: u32) bool {
+// Create a new 8.3 directory entry in `parent_cluster` for `name`, with the
+// given `attr` (0x20 = file, 0x10 = directory), pointing at `first_cluster` with
+// `size` bytes. Fails if the name isn't 8.3 or the directory has no free slot in
+// its existing clusters.
+fn createDirEntry(parent_cluster: u32, name: []const u8, attr: u8, first_cluster: u32, size: u32) bool {
     var sfn: [11]u8 = undefined;
     if (!to83(name, &sfn)) return false;
     var sector: [SECTOR]u8 = undefined;
@@ -505,7 +519,7 @@ fn createDirEntry(parent_cluster: u32, name: []const u8, first_cluster: u32, siz
                     const ent = sector[e * 32 .. e * 32 + 32];
                     @memset(ent, 0);
                     @memcpy(ent[0..11], &sfn);
-                    ent[0x0B] = 0x20; // attribute: archive (a normal file)
+                    ent[0x0B] = attr; // 0x20 archive (file) or 0x10 directory
                     wr16(ent, 0x14, @intCast(first_cluster >> 16));
                     wr16(ent, 0x1A, @intCast(first_cluster & 0xFFFF));
                     wr32(ent, 0x1C, size);
@@ -516,6 +530,51 @@ fn createDirEntry(parent_cluster: u32, name: []const u8, first_cluster: u32, siz
         cluster = nextCluster(cluster);
     }
     return false; // directory full (extending it is unsupported)
+}
+
+// Write the "." and ".." entries that every FAT32 subdirectory begins with into
+// the freshly allocated cluster `dir_cluster`. "." points at the directory
+// itself; ".." points at its parent (or 0 when the parent is the root, per the
+// FAT convention). The cluster is already zeroed, so we only write its first
+// sector; the remaining slots stay empty.
+fn writeDotEntries(dir_cluster: u32, parent_cluster: u32) bool {
+    var sector = [_]u8{0} ** SECTOR;
+    const dot = sector[0..32]; // "."  entry -> this directory
+    @memset(dot[0..11], ' ');
+    dot[0] = '.';
+    dot[0x0B] = ATTR_DIRECTORY;
+    wr16(dot, 0x14, @intCast(dir_cluster >> 16));
+    wr16(dot, 0x1A, @intCast(dir_cluster & 0xFFFF));
+    const dd = sector[32..64]; // ".." entry -> the parent directory
+    @memset(dd[0..11], ' ');
+    dd[0] = '.';
+    dd[1] = '.';
+    dd[0x0B] = ATTR_DIRECTORY;
+    // The root has no cluster number, so ".." in a top-level dir points at 0.
+    const pc: u32 = if (parent_cluster == bi.root_cluster) 0 else parent_cluster;
+    wr16(dd, 0x14, @intCast(pc >> 16));
+    wr16(dd, 0x1A, @intCast(pc & 0xFFFF));
+    return ata.write(clusterToSector(dir_cluster), 1, &sector);
+}
+
+// Create the directory `path` (e.g. "/EFI/BOOT"). The parent must already exist.
+// Idempotent: succeeds if `path` already exists as a directory. Returns false on
+// no FS, a missing/non-directory parent, an existing non-directory at `path`, a
+// non-8.3 name, a full disk, or a full parent directory.
+pub fn mkdir(path: []const u8) bool {
+    if (!mounted) return false;
+    if (resolve(path)) |node| return node.is_dir; // already there -> ok iff a dir
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return false;
+    const parent_path = if (slash == 0) "/" else path[0..slash];
+    const name = path[slash + 1 ..];
+    if (name.len == 0) return false;
+    const parent = resolve(parent_path) orelse return false;
+    if (!parent.is_dir) return false;
+
+    const dir_cluster = allocCluster() orelse return false; // the new dir's data
+    if (!writeDotEntries(dir_cluster, parent.cluster)) return false; // "." and ".."
+    // A directory's entry records cluster but size 0 (size is unused for dirs).
+    return createDirEntry(parent.cluster, name, ATTR_DIRECTORY, dir_cluster, 0);
 }
 
 // Write `data` to `path`, creating or overwriting the file. Grows/shrinks the
@@ -582,7 +641,7 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
         wr16(&sec, l.off + 0x1A, @intCast(chain_first & 0xFFFF)); // first cluster (low)
         return ata.write(l.lba, 1, &sec);
     }
-    return createDirEntry(parent.cluster, name, chain_first, @intCast(data.len));
+    return createDirEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
 }
 
 // --- Boot self-test ----------------------------------------------------------
