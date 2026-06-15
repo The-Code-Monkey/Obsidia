@@ -26,7 +26,34 @@ DISK=obsidia-install.img      # the blank target disk the installer writes
 SIZE=64M                      # size of both the system image and the target disk
 ESP_OFFSET=$((2048 * 512))    # ESP partition starts at LBA 2048 (1 MiB)
 
+# Option B (construct) artifacts — the installer that BUILDS the disk in-kernel.
+CISO=obsidia-construct.iso    # installer ISO carrying the payload as modules
+CDISK=obsidia-construct.img   # the blank target disk the construct installer fills
+
 kvm_args=(); [ -e /dev/kvm ] && kvm_args=(-enable-kvm -cpu host)
+
+# Locate OVMF UEFI firmware (the constructed disk boots via UEFI). Sets uefi_args
+# to the right QEMU flags, or leaves it empty (with a warning) if none is found.
+uefi_args=()
+find_ovmf() {
+    local p c v
+    for p in "${OVMF:-}" /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd \
+             /usr/share/qemu/OVMF.fd /usr/share/edk2-ovmf/x64/OVMF.fd; do
+        [ -n "$p" ] && [ -f "$p" ] && { uefi_args=(-bios "$p"); return 0; }
+    done
+    for c in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
+        [ -f "$c" ] || continue
+        for v in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do
+            [ -f "$v" ] || continue
+            cp "$v" obsidia-ovmf-vars.fd
+            uefi_args=(-drive "if=pflash,format=raw,readonly=on,file=$c"
+                       -drive "if=pflash,format=raw,file=obsidia-ovmf-vars.fd")
+            return 0
+        done
+    done
+    echo "WARNING: no OVMF firmware found — the constructed disk needs UEFI to boot." >&2
+    return 1
+}
 
 build() {
     echo "== Building kernel =="
@@ -108,10 +135,78 @@ run_disk() {
         -drive file="$DISK",format=raw,if=ide -serial stdio
 }
 
+# === Option B: the construct installer (builds the disk in-kernel) ============
+# Instead of a prebuilt image, carry the individual pieces as Limine modules. The
+# in-kernel installer writes a GPT, formats an ESP, lays the tree, copies the
+# pieces and writes a credential it hashes in-guest. The result boots under UEFI.
+build_construct() {
+    echo "== Building kernel =="
+    zig build
+
+    echo "== Building construct installer ISO ($CISO) =="
+    rm -rf iso_root "$CISO"
+    mkdir -p iso_root/boot/limine iso_root/EFI/BOOT
+    cp zig-out/bin/kernel.elf iso_root/boot/kernel.elf      # also a module (copied to disk)
+    cp limine/BOOTX64.EFI iso_root/EFI/BOOT/BOOTX64.EFI     # the bootloader we deploy
+    cp limine/BOOTIA32.EFI iso_root/EFI/BOOT/ 2>/dev/null || true
+    cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin iso_root/boot/limine/
+    # The config the INSTALLED system boots from (written to /boot/limine/limine.conf).
+    cat > iso_root/installed.conf <<EOF
+timeout: 0
+serial: yes
+/Obsidia
+    protocol: limine
+    kernel_path: boot():/boot/kernel.elf
+    module_path: boot():/OBSIDIA/AUTH
+EOF
+    # The installer's OWN boot config (BIOS), exposing the payload as modules.
+    cat > iso_root/boot/limine/limine.conf <<EOF
+timeout: 0
+serial: yes
+/Obsidia Installer (construct)
+    protocol: limine
+    kernel_path: boot():/boot/kernel.elf
+    module_path: boot():/boot/kernel.elf
+    module_path: boot():/EFI/BOOT/BOOTX64.EFI
+    module_path: boot():/installed.conf
+EOF
+    xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+        -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus -apm-block-size 2048 \
+        --efi-boot boot/limine/limine-uefi-cd.bin \
+        -efi-boot-part --efi-boot-image --protective-msdos-label \
+        iso_root -o "$CISO" >/dev/null 2>&1
+    ./limine/limine bios-install "$CISO" >/dev/null 2>&1
+    rm -rf iso_root
+
+    echo "== Creating blank target disk ($CDISK, $SIZE) =="
+    rm -f "$CDISK"; truncate -s "$SIZE" "$CDISK"
+    echo "Build complete."
+}
+
+# Boot the construct installer (BIOS, -M pc for the legacy IDE the ATA driver
+# needs) with the blank disk. Inside the guest, run `install` and pick a login.
+run_construct() {
+    echo "Booting the construct installer. At the obsidia> shell, type:  install"
+    echo "Then power off (shutdown) and run:  ./install.sh construct-boot"
+    qemu-system-x86_64 -M pc "${kvm_args[@]}" -m 2G -boot d -cdrom "$CISO" \
+        -drive file="$CDISK",format=raw,if=ide -serial stdio
+}
+
+# Boot the constructed disk standalone under UEFI (OVMF), to the login.
+run_construct_boot() {
+    find_ovmf || exit 1
+    echo "Booting the constructed disk ($CDISK) under UEFI..."
+    qemu-system-x86_64 -M pc "${kvm_args[@]}" "${uefi_args[@]}" -m 2G -boot c \
+        -drive file="$CDISK",format=raw,if=ide -serial stdio
+}
+
 case "${1:-all}" in
     build) build ;;
     install) run_installer ;;
     boot) run_disk ;;
     all) build; echo; run_installer ;;
-    *) echo "usage: $0 [build|install|boot]"; exit 2 ;;
+    construct-build) build_construct ;;
+    construct) build_construct; echo; run_construct ;;
+    construct-boot) run_construct_boot ;;
+    *) echo "usage: $0 [build|install|boot|construct|construct-build|construct-boot]"; exit 2 ;;
 esac

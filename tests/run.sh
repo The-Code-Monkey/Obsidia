@@ -491,6 +491,85 @@ else
     echo "  (skipping console scrollback test: needs socat + imagemagick 'compare')"
 fi
 
+# --- In-kernel installer: construct a disk (Option B) ------------------------
+# The installer carries the kernel, Limine's BOOTX64.EFI and an installed-system
+# config as Limine modules, then BUILDS the target disk in-kernel: a GPT with one
+# ESP, the ESP formatted as FAT32, the /EFI/BOOT//boot/limine//OBSIDIA tree, the
+# files copied in, and a scrypt credential hashed in-guest. We drive `install`
+# over a held-open FIFO (polling prompts, so we never race the slow TCG boot or
+# the in-guest hash), verify the disk with host tools (independent of our FS
+# code), then boot it under UEFI and log in to prove it is genuinely bootable.
+echo "== In-kernel installer (construct a disk, -M pc) =="
+CROOT="$TMP/croot"; CISO="$TMP/construct.iso"; CDISK="$TMP/construct.img"
+rm -rf "$CROOT"; mkdir -p "$CROOT/boot/limine" "$CROOT/EFI/BOOT"
+cp zig-out/bin/kernel.elf "$CROOT/boot/kernel.elf"          # also a module -> copied to disk
+cp limine/BOOTX64.EFI "$CROOT/EFI/BOOT/BOOTX64.EFI"         # the bootloader we deploy
+cp limine/BOOTIA32.EFI "$CROOT/EFI/BOOT/" 2>/dev/null || true
+cp limine/limine-bios.sys limine/limine-bios-cd.bin limine/limine-uefi-cd.bin "$CROOT/boot/limine/"
+printf 'timeout: 0\nserial: yes\n/Obsidia\n    protocol: limine\n    kernel_path: boot():/boot/kernel.elf\n    module_path: boot():/OBSIDIA/AUTH\n' > "$CROOT/installed.conf"
+printf 'timeout: 0\nserial: yes\n/Obsidia Installer\n    protocol: limine\n    kernel_path: boot():/boot/kernel.elf\n    module_path: boot():/boot/kernel.elf\n    module_path: boot():/EFI/BOOT/BOOTX64.EFI\n    module_path: boot():/installed.conf\n' > "$CROOT/boot/limine/limine.conf"
+if xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+    -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus -apm-block-size 2048 \
+    --efi-boot boot/limine/limine-uefi-cd.bin \
+    -efi-boot-part --efi-boot-image --protective-msdos-label \
+    "$CROOT" -o "$CISO" >/dev/null 2>&1; then
+    ./limine/limine bios-install "$CISO" >/dev/null 2>&1
+    truncate -s 64M "$CDISK"
+
+    # waitfor <pattern> <log> <pid> : poll a log until the pattern appears (or the
+    # guest exits / a ~120s cap), so input never races the (slow, TCG) boot.
+    waitfor() { local p="$1" f="$2" pid="$3" n=0; until grep -qaE "$p" "$f" 2>/dev/null || ! kill -0 "$pid" 2>/dev/null; do sleep 0.5; n=$((n + 1)); [ "$n" -gt 300 ] && break; done; }
+
+    cfifo="$TMP/c.in"; rm -f "$cfifo"; mkfifo "$cfifo"
+    timeout 240 qemu-system-x86_64 -M pc -m 2G -boot d -cdrom "$CISO" \
+        -drive file="$CDISK",format=raw,if=ide \
+        -chardev stdio,id=c0,logfile="$TMP/construct.log",signal=off -serial chardev:c0 \
+        -display none -no-reboot < "$cfifo" >/dev/null 2>&1 &
+    cpid=$!
+    exec 4>"$cfifo" # hold the installer's serial input open
+    waitfor "Type 'help'" "$TMP/construct.log" "$cpid"; sleep 0.5; printf 'install\r' >&4
+    waitfor "Choose a username" "$TMP/construct.log" "$cpid"; sleep 0.3; printf 'cuser\r' >&4
+    waitfor "Choose a password" "$TMP/construct.log" "$cpid"; sleep 0.3; printf 'cpass\r' >&4
+    waitfor "install: complete|FAILED" "$TMP/construct.log" "$cpid"
+    sleep 0.5; printf 'shutdown\r' >&4; sleep 2
+    exec 4>&-; kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+
+    assert_in "$TMP/construct.log" "install: complete" "construct: in-kernel installer built the disk"
+
+    # Independent host verification of the freshly constructed disk.
+    ESP=$((2048 * 512))
+    if command -v sgdisk >/dev/null; then
+        if sgdisk -p "$CDISK" 2>/dev/null | grep -qi "EF00"; then ok "construct: GPT carries an EFI System Partition (sgdisk)"; else bad "construct: no ESP in the GPT"; fi
+    fi
+    if mtype -i "$CDISK@@$ESP" ::/boot/limine/limine.conf 2>/dev/null | grep -qa "kernel_path"; then
+        ok "construct: long-named limine.conf written + readable (LFN, via mtools)"
+    else bad "construct: limine.conf missing or unreadable"; fi
+    # Copy the kernel back out and byte-compare it (robust: no mdir column parsing).
+    mcopy -i "$CDISK@@$ESP" ::/boot/kernel.elf "$TMP/kdump.elf" 2>/dev/null
+    if cmp -s "$TMP/kdump.elf" zig-out/bin/kernel.elf; then ok "construct: kernel.elf copied byte-for-byte"; else bad "construct: kernel.elf differs from source"; fi
+    if mtype -i "$CDISK@@$ESP" ::/OBSIDIA/AUTH 2>/dev/null | grep -qa "^cuser:"; then ok "construct: in-guest scrypt credential written (cuser:...)"; else bad "construct: AUTH credential missing"; fi
+
+    # Boot the constructed disk under UEFI and log in (the real proof it boots).
+    if [ "${#uefi_args[@]}" -gt 0 ]; then
+        bfifo="$TMP/b.in"; rm -f "$bfifo"; mkfifo "$bfifo"
+        timeout 150 qemu-system-x86_64 -M pc "${uefi_args[@]}" -m 2G -boot c \
+            -drive file="$CDISK",format=raw,if=ide \
+            -chardev stdio,id=c0,logfile="$TMP/construct_boot.log",signal=off -serial chardev:c0 \
+            -display none -no-reboot < "$bfifo" >/dev/null 2>&1 &
+        bpid=$!
+        exec 5>"$bfifo"
+        waitfor "obsidia login:" "$TMP/construct_boot.log" "$bpid"; sleep 0.5; printf 'cuser\r' >&5; sleep 1; printf 'cpass\r' >&5
+        waitfor "Welcome|Login incorrect" "$TMP/construct_boot.log" "$bpid"; sleep 0.5; printf 'mem\r' >&5; sleep 2
+        exec 5>&-; kill "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+        assert_in "$TMP/construct_boot.log" "BOOT_OK"         "construct: the built disk boots under UEFI"
+        assert_in "$TMP/construct_boot.log" "Welcome, cuser." "construct: login works with the in-guest credential"
+    else
+        echo "  (skipping construct UEFI boot: no OVMF firmware)"
+    fi
+else
+    bad "construct: could not assemble the installer ISO (need xorriso + limine/)"
+fi
+
 # --- Summary -----------------------------------------------------------------
 echo ""
 echo "================ RESULTS: $PASS passed, $FAIL failed ================"

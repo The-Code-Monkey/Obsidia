@@ -7,4 +7,7 @@ test {
     _ = @import("drivers/keyboard.zig"); // scancode translation, escape sequences
     _ = @import("drivers/console.zig"); // PSF font parsing
     _ = @import("auth.zig"); // Argon2id hash + verify round-trip
+    _ = @import("fs/gpt.zig"); // GPT layout: protective MBR, headers, CRCs
+    _ = @import("fs/fatformat.zig"); // FAT32 mkfs: BPB, FSInfo, FATs, root
+    _ = @import("fs/lfn.zig"); // FAT32 long-name encoding: alias, checksum, entries
 }
