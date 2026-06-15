@@ -544,9 +544,9 @@ if xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
     if mtype -i "$CDISK@@$ESP" ::/boot/limine/limine.conf 2>/dev/null | grep -qa "kernel_path"; then
         ok "construct: long-named limine.conf written + readable (LFN, via mtools)"
     else bad "construct: limine.conf missing or unreadable"; fi
-    csz=$(mdir -i "$CDISK@@$ESP" ::/boot 2>/dev/null | awk '$1=="KERNEL"{print $3}')
-    ssz=$(stat -c%s zig-out/bin/kernel.elf)
-    if [ "$csz" = "$ssz" ]; then ok "construct: kernel.elf copied intact ($csz bytes)"; else bad "construct: kernel.elf size mismatch (disk=$csz src=$ssz)"; fi
+    # Copy the kernel back out and byte-compare it (robust: no mdir column parsing).
+    mcopy -i "$CDISK@@$ESP" ::/boot/kernel.elf "$TMP/kdump.elf" 2>/dev/null
+    if cmp -s "$TMP/kdump.elf" zig-out/bin/kernel.elf; then ok "construct: kernel.elf copied byte-for-byte"; else bad "construct: kernel.elf differs from source"; fi
     if mtype -i "$CDISK@@$ESP" ::/OBSIDIA/AUTH 2>/dev/null | grep -qa "^cuser:"; then ok "construct: in-guest scrypt credential written (cuser:...)"; else bad "construct: AUTH credential missing"; fi
 
     # Boot the constructed disk under UEFI and log in (the real proof it boots).

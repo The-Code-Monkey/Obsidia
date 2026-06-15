@@ -34,6 +34,7 @@ const BK_BOOT = 6; // backup boot sector lives at sector 6 (the convention)
 const ROOT_CLUSTER = 2; // first data cluster; FAT32 puts the root directory here
 const VOL_ID = 0x0B51D1A0; // volume serial number (arbitrary but fixed)
 const EOC = 0x0FFFFFF8; // end-of-cluster-chain marker value
+const FAT32_MIN_CLUSTERS = 65525; // a volume with fewer clusters isn't FAT32 (spec)
 
 // --- Little-endian field writers --------------------------------------------
 fn wr16(b: []u8, o: usize, v: u16) void {
@@ -108,11 +109,13 @@ fn fillFsInfo(out: *[SECTOR]u8, free_count: u32) void {
 // `dev` must expose writeSector(lba,buf) and zeroSectors(lba,n). Returns false on
 // a too-small region or the first failed write.
 pub fn run(dev: anytype, volume_lba: u64, total_sectors: u32) bool {
+    if (volume_lba > 0xFFFFFFFF) return false; // BPB_HiddSec is a 32-bit field
     if (total_sectors < RESERVED + NUM_FATS + 1) return false; // can't even hold metadata
     const fat_size = fatSize(total_sectors);
     const first_data = RESERVED + @as(u32, NUM_FATS) * fat_size; // relative to volume
     if (first_data + SEC_PER_CLUS > total_sectors) return false; // no room for a root cluster
     const cluster_count = (total_sectors - first_data) / SEC_PER_CLUS;
+    if (cluster_count < FAT32_MIN_CLUSTERS) return false; // too few clusters to be valid FAT32
 
     // Zero the whole reserved region first, then drop the real sectors on top, so
     // sectors 2..5 / 8..31 are cleanly zero regardless of the disk's prior state.

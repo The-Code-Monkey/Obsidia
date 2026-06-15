@@ -20,6 +20,8 @@ const EOC = 0x0FFFFFF8; // FAT entries >= this mark the end of a cluster chain
 const ATTR_DIRECTORY = 0x10; // directory-entry attribute bit
 const ATTR_VOLUME_ID = 0x08; // volume-label entry (skip these)
 const ATTR_LFN = 0x0F; // a "long file name" component entry (RO|HID|SYS|VOL)
+const MAX_LFN_SEQ = 19; // highest LFN sequence the read path accepts (~247 chars);
+// creation must reject longer names, whose higher sequences would be unreachable.
 
 // Geometry read from the boot sector, plus the derived first-data-sector.
 const BootInfo = struct {
@@ -191,7 +193,7 @@ const LFN_OFFSETS = [_]u8{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
 // Fold one LFN entry's 13 chars into the assembly buffer at its sequenced slot.
 fn accumulateLfn(ent: []const u8, lfn: *[256]u8, lfn_len: *usize) void {
     const seq = ent[0] & 0x1F; // 1-based position of this chunk in the name
-    if (seq == 0 or seq > 19) return; // ignore odd sequences (cap ~247 chars)
+    if (seq == 0 or seq > MAX_LFN_SEQ) return; // ignore odd sequences (cap ~247 chars)
     const base = (@as(usize, seq) - 1) * 13; // where this chunk's chars start
     var i: usize = 0;
     while (i < 13) : (i += 1) {
@@ -658,6 +660,7 @@ fn createLfnEntry(parent_cluster: u32, name: []const u8, attr: u8, first_cluster
     }
     const cksum = lfnenc.checksum(&sfn);
     const count = lfnenc.entryCount(name.len); // number of LFN entries
+    if (count > MAX_LFN_SEQ) return false; // too long: higher sequences would be unreadable
     const start = reserveDirSlots(parent_cluster, count + 1) orelse return false;
 
     // LFN entries come first, written highest-sequence-first (the first one
@@ -717,7 +720,12 @@ pub fn mkdir(path: []const u8) bool {
     if (!writeDotEntries(dir_cluster, parent.cluster)) return false; // "." and ".."
     // A directory's entry records cluster but size 0 (size is unused for dirs).
     const made = createDirEntry(parent.cluster, name, ATTR_DIRECTORY, dir_cluster, 0);
-    return made and fatFlush(); // commit the FAT edits (new cluster + any dir growth)
+    if (!made) { // linking the entry failed: free the just-allocated cluster
+        freeChain(dir_cluster);
+        _ = fatFlush();
+        return false;
+    }
+    return fatFlush(); // commit the FAT edits (new cluster + any dir growth)
 }
 
 // Write `data` to `path`, creating or overwriting the file. Grows/shrinks the
@@ -819,7 +827,12 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
         createDirEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len))
     else
         createLfnEntry(parent.cluster, name, 0x20, chain_first, @intCast(data.len));
-    return made and fatFlush();
+    if (!made) { // no dir entry: free the freshly allocated chain so it isn't orphaned
+        if (isDataCluster(chain_first)) freeChain(chain_first);
+        _ = fatFlush();
+        return false;
+    }
+    return fatFlush();
 }
 
 // --- Boot self-test ----------------------------------------------------------

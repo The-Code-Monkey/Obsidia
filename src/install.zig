@@ -15,6 +15,7 @@
 //
 // `install` picks Option B when the construct payload is present, else Option A.
 
+const std = @import("std"); // std.crypto.secureZero for wiping the password
 const serial = @import("drivers/serial.zig");
 const ata = @import("drivers/ata.zig");
 const gpt = @import("fs/gpt.zig");
@@ -142,6 +143,8 @@ fn construct(getKey: *const fn () u8) void {
     const ulen = readLine(getKey, &ubuf, true);
     serial.print("Choose a password: ", .{});
     const plen = readLine(getKey, &pbuf, false);
+    // Wipe the plaintext password on every exit path (secureZero isn't optimized out).
+    defer std.crypto.secureZero(u8, &pbuf);
     if (ulen == 0 or plen == 0) {
         serial.print("install: username and password must not be empty.\n", .{});
         return;
