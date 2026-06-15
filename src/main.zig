@@ -22,6 +22,7 @@ const loader = @import("loader.zig"); // ELF64/flat program loader (runs the ini
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
 const usermode = @import("arch/usermode.zig"); // ring 3 (user mode) entry
+const syscall = @import("arch/syscall.zig"); // syscall/sysret ABI (STAR/LSTAR/SFMASK)
 const install = @import("install.zig"); // in-guest installer (clones the system image)
 const shell = @import("shell.zig"); // interactive serial command shell
 
@@ -204,6 +205,10 @@ export fn _start() noreturn {
 
     // Install the IDT so CPU exceptions become readable crash dumps.
     idt.init();
+
+    // Program the syscall/sysret MSRs (needs the GDT's selectors; harmless this
+    // early — the path isn't used until user code runs).
+    syscall.init();
 
     // Remap the PIC, start the PIT, and enable hardware interrupts.
     pic.init();

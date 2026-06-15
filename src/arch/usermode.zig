@@ -24,12 +24,13 @@ const gdt = @import("gdt.zig"); // segment selectors (kernel/user)
 const idt = @import("idt.zig"); // InterruptFrame + the fault hook we install
 const pmm = @import("../mm/pmm.zig"); // frames for the user code/data/stack pages
 const vmm = @import("../mm/vmm.zig"); // map those frames user-accessible (FLAG_USER)
+const syscall = @import("syscall.zig"); // the syscall the ring-3 stub exercises
 
 // Selector sanity: the iretq frame in usermodeEnter hardcodes these (global asm
 // can't reference Zig constants), so assert they still match the GDT.
 comptime {
-    if (gdt.USER_CODE != 0x1b) @compileError("usermode: USER_CODE selector changed; update usermodeEnter asm");
-    if (gdt.USER_DATA != 0x23) @compileError("usermode: USER_DATA selector changed; update usermodeEnter asm");
+    if (gdt.USER_CODE != 0x23) @compileError("usermode: USER_CODE selector changed; update usermodeEnter asm");
+    if (gdt.USER_DATA != 0x1b) @compileError("usermode: USER_DATA selector changed; update usermodeEnter asm");
     if (gdt.KERNEL_DATA != 0x10) @compileError("usermode: KERNEL_DATA selector changed; update usermodeResume asm");
 }
 
@@ -66,13 +67,13 @@ comptime {
         \\  push %r14
         \\  push %r15
         \\  mov %rsp, usermode_kernel_rsp(%rip)   // save resume point (points at saved r15)
-        \\  movw $0x23, %ax                        // USER_DATA selector (RPL 3)
+        \\  movw $0x1b, %ax                        // USER_DATA selector (RPL 3)
         \\  movw %ax, %ds                          // give user code user data segments
         \\  movw %ax, %es
-        \\  pushq $0x23                            // iretq frame: SS  = USER_DATA
+        \\  pushq $0x1b                            // iretq frame: SS  = USER_DATA
         \\  pushq %rsi                             //             RSP = user stack top
         \\  pushq $0x202                           //             RFLAGS = IF=1 + reserved bit 1
-        \\  pushq $0x1b                            //             CS  = USER_CODE (RPL 3)
+        \\  pushq $0x23                            //             CS  = USER_CODE (RPL 3)
         \\  pushq %rdi                             //             RIP = entry
         \\  iretq                                  // drop to ring 3
         \\.global usermodeResume
@@ -128,6 +129,8 @@ pub fn selfTest() void {
     // keeping W^X intact. The stub, hand-assembled:
     //   48 B8 <magic>     mov  rax, RING3_MAGIC
     //   48 A3 <U_DATA>    mov  [U_DATA], rax     ; a user write to a user page
+    //   B8 <TEST_NUM>     mov  eax, TEST_NUM     ; syscall number (zero-extends to rax)
+    //   0F 05             syscall                ; ring 3 -> kernel -> ring 3 (sysret)
     //   FA                cli                     ; privileged at CPL 3 -> #GP
     //   EB FE             jmp  $                  ; safety net (never reached)
     const code: [*]u8 = @ptrFromInt(pmm.physToVirt(code_frame));
@@ -137,9 +140,13 @@ pub fn selfTest() void {
     code[10] = 0x48; // REX.W
     code[11] = 0xA3; // mov [moffs64], rax
     writeU64(code + 12, U_DATA);
-    code[20] = 0xFA; // cli
-    code[21] = 0xEB; // jmp rel8
-    code[22] = 0xFE; // -2 (to itself)
+    code[20] = 0xB8; // mov eax, imm32
+    writeU32(code + 21, @intCast(syscall.TEST_NUM));
+    code[25] = 0x0F; // syscall (0F 05)
+    code[26] = 0x05;
+    code[27] = 0xFA; // cli  (privileged -> #GP, recovered by the fault hook)
+    code[28] = 0xEB; // jmp rel8
+    code[29] = 0xFE; // -2 (to itself)
 
     // Clear the marker (via the data frame's HHDM alias) so a stale value can't
     // masquerade as success.
@@ -155,6 +162,7 @@ pub fn selfTest() void {
     // longjmp) once the user code faults and faultHook redirects us back.
     idt.fault_hook = &faultHook;
     test_active = true;
+    syscall.test_seen = false; // cleared so the dispatcher proves it really ran
     serial.print("[USER]   entering ring 3 at 0x{x} (user stack 0x{x})...\n", .{ U_CODE, U_STACK_TOP });
     usermodeEnter(U_CODE, U_STACK_TOP);
     idt.fault_hook = null; // back in ring 0; disarm
@@ -170,6 +178,15 @@ pub fn selfTest() void {
         serial.print("[USER] Ring-3 self-test FAILED (ran={}, cpl3={}).\n", .{ wrote, cpl3 });
     }
 
+    // The stub also issued a `syscall` before the faulting `cli`. The dispatcher
+    // set test_seen (proving entry reached the kernel), and the cli fault came
+    // from CPL 3 (proving sysret returned us to ring 3) — so the round trip held.
+    if (syscall.test_seen and cpl3) {
+        serial.print("[SYS] Syscall round-trip OK: ring 3 -> kernel -> ring 3 via syscall/sysret.\n", .{});
+    } else {
+        serial.print("[SYS] Syscall round-trip FAILED (seen={}, cpl3={}).\n", .{ syscall.test_seen, cpl3 });
+    }
+
     // Tear the mappings down and return the frames.
     vmm.unmap(U_CODE);
     vmm.unmap(U_DATA);
@@ -183,6 +200,12 @@ pub fn selfTest() void {
 fn writeU64(p: [*]u8, v: u64) void {
     var i: usize = 0;
     while (i < 8) : (i += 1) p[i] = @truncate(v >> @intCast(i * 8));
+}
+
+// Store a little-endian u32 at p[0..4].
+fn writeU32(p: [*]u8, v: u32) void {
+    var i: usize = 0;
+    while (i < 4) : (i += 1) p[i] = @truncate(v >> @intCast(i * 8));
 }
 
 fn failNoMem() void {
