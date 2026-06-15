@@ -15,6 +15,7 @@
 const serial = @import("../drivers/serial.zig");
 const gdt = @import("gdt.zig");
 const cpu = @import("cpu.zig");
+const scheduler = @import("../sched/scheduler.zig"); // SYS_yield hands off the CPU
 
 // A dedicated ring-0 stack the entry stub switches to (`syscall` doesn't load one
 // for us). A single static stack is safe for now because the handler runs with
@@ -25,22 +26,61 @@ var syscall_stack: [SYSCALL_STACK_SIZE]u8 align(16) = undefined;
 export var syscall_kernel_rsp: u64 = 0; // top of syscall_stack (set in init)
 export var syscall_user_rsp: u64 = 0; // scratch: the user RSP saved on entry
 
-// The Stage-1 test syscall number ("TST\0"), and a flag the dispatcher sets when
-// it runs — so the ring-3 self-test can prove the call reached the kernel. Fits in
-// 32 bits so the user stub can load it with a plain `mov eax, imm32`.
-pub const TEST_NUM: u64 = 0x5453_5400;
-pub var test_seen: bool = false;
+// --- The syscall table -------------------------------------------------------
+// Numbers the user passes in RAX. Small values so a user stub can load them with
+// a plain `mov eax, imm32`.
+pub const SYS_write: u64 = 1; // write(fd, ptr, len) -> bytes written
+pub const SYS_yield: u64 = 2; // yield() -> 0 (hand the CPU to another thread)
+pub const SYS_exit: u64 = 3; // exit(code) -> does not return
 
-// The C-ABI dispatcher the entry stub calls with the syscall number in RDI.
-// Stage 1 only recognises the test number; Stage 2 turns this into a real table.
-export fn syscallDispatch(num: u64) callconv(.c) u64 {
-    if (num == TEST_NUM) {
-        test_seen = true;
-        serial.print("[SYS]   test syscall received (num=0x{x}).\n", .{num});
-        return num +% 1; // an arbitrary, checkable result
-    }
-    serial.print("[SYS]   unknown syscall num=0x{x}.\n", .{num});
-    return @bitCast(@as(i64, -1)); // ENOSYS-ish
+const ENOSYS: u64 = @bitCast(@as(i64, -38)); // unknown syscall
+const EBADF: u64 = @bitCast(@as(i64, -9)); // bad file descriptor
+
+// exit() has no real meaning until processes exist (Stage 4/5). For now a caller
+// (the self-test, later the loader) installs a handler that returns control to
+// the kernel; this mirrors idt.fault_hook. noreturn — it never comes back here.
+pub var exit_handler: ?*const fn (code: u64) callconv(.c) noreturn = null;
+
+// The C-ABI dispatcher the entry stub calls: syscall number in RDI, then up to
+// three args (a1..a3) marshalled from the user's RDI/RSI/RDX. Returns the result
+// (or a negative errno) in RAX.
+export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 {
+    return switch (num) {
+        SYS_write => sysWrite(a1, a2, a3),
+        SYS_yield => sysYield(),
+        SYS_exit => sysExit(a1),
+        else => blk: {
+            serial.print("[SYS]   unknown syscall num={d}.\n", .{num});
+            break :blk ENOSYS;
+        },
+    };
+}
+
+// write(fd, ptr, len): copy `len` bytes from the user buffer to serial (the only
+// sink for now). fd 1 (stdout) / 2 (stderr) only. The length is clamped as a
+// crude guard; real user-pointer validation (copy_from_user with fault handling)
+// comes with the process model.
+fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
+    if (fd != 1 and fd != 2) return EBADF;
+    if (len == 0) return 0;
+    const n = @min(len, 4096);
+    const buf = @as([*]const u8, @ptrFromInt(ptr))[0..n];
+    serial.print("{s}", .{buf});
+    return n;
+}
+
+// yield(): cooperatively hand the CPU to the next ready thread.
+fn sysYield() u64 {
+    scheduler.yield();
+    return 0;
+}
+
+// exit(code): terminate the caller. Routes to the installed handler (which longjmps
+// back to whoever launched the user code); becomes real process teardown later.
+fn sysExit(code: u64) u64 {
+    serial.print("[SYS]   exit({d}).\n", .{code});
+    if (exit_handler) |h| h(code); // noreturn
+    return 0; // no handler installed (shouldn't happen while user code runs)
 }
 
 // The `syscall` entry point (the LSTAR target). Global naked asm: switch to the
@@ -56,7 +96,13 @@ comptime {
         \\  movq syscall_kernel_rsp(%rip), %rsp    // switch to the kernel stack
         \\  pushq %rcx                             // save user RIP (sysret restores it)
         \\  pushq %r11                             // save user RFLAGS (ditto)
-        \\  movq %rax, %rdi                        // arg1 = syscall number (passed in RAX)
+        \\  // Marshal the user's syscall regs (num=RAX, args a1/a2/a3 = RDI/RSI/RDX)
+        \\  // into the C ABI (RDI/RSI/RDX/RCX). Done back-to-front so no source is
+        \\  // clobbered before it's read. RCX is free here (user RIP already saved).
+        \\  movq %rdx, %rcx                        // C arg4 = a3
+        \\  movq %rsi, %rdx                        // C arg3 = a2
+        \\  movq %rdi, %rsi                        // C arg2 = a1
+        \\  movq %rax, %rdi                        // C arg1 = syscall number
         \\  call syscallDispatch                   // result -> RAX
         \\  popq %r11                              // restore user RFLAGS
         \\  popq %rcx                              // restore user RIP

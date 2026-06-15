@@ -127,6 +127,8 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "blocking mutex self-test: mutual exclusion held" "$p blocking mutex (two threads contend; mutual exclusion + handoff)"
     assert_in "$log" "Ring-3 self-test OK"                       "$p ring 3: ran user code at CPL3 + recovered from its #GP"
     assert_in "$log" "Syscall round-trip OK"                     "$p syscall/sysret: ring 3 -> kernel -> ring 3 round trip"
+    assert_in "$log" "hello from ring 3 via syscall"             "$p write() syscall: ring 3 buffer reached serial"
+    assert_in "$log" "exit syscall returned to the kernel"       "$p exit() syscall: returned control to the kernel"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
