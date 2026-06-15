@@ -60,6 +60,17 @@ comptime {
         \\  call syscallDispatch                   // result -> RAX
         \\  popq %r11                              // restore user RFLAGS
         \\  popq %rcx                              // restore user RIP
+        \\  // Guard the return: a non-canonical RIP makes SYSRET #GP in RING 0
+        \\  // (the classic CVE-2012-0217 footgun). If RCX isn't canonical, clamp it
+        \\  // to 0 so the fault instead happens harmlessly in ring 3. RDX is dead
+        \\  // here (caller-saved, clobbered by the syscall ABI), so use it as scratch.
+        \\  movq %rcx, %rdx
+        \\  sarq $47, %rdx                         // canonical -> 0 (low half) or -1 (high half)
+        \\  incq %rdx                              //           -> 1 or 0
+        \\  cmpq $1, %rdx
+        \\  jbe 1f                                 // unsigned <= 1: canonical, proceed
+        \\  xorq %rcx, %rcx                        // non-canonical: return to RIP 0 (a ring-3 fault)
+        \\1:
         \\  movq syscall_user_rsp(%rip), %rsp      // restore the user RSP
         \\  sysretq                                // back to ring 3 (RIP=RCX, RFLAGS=R11)
     );
