@@ -58,7 +58,11 @@ export var paging_mode_request: limine.PagingModeRequest linksection(".limine_re
 // Files Limine loaded for us, kept as slices into module memory (type
 // executable_and_modules, which the PMM never reclaims, so they stay valid).
 var auth_module: ?[]const u8 = null; // /OBSIDIA/AUTH credential (installed boot)
-var system_module: ?[]const u8 = null; // system disk image (installer medium)
+var system_module: ?[]const u8 = null; // system disk image (Option A installer medium)
+// Option B installer payload: the pieces the in-kernel installer lays onto a disk.
+var kernel_module: ?[]const u8 = null; // kernel.elf to copy to /boot/kernel.elf
+var bootx64_module: ?[]const u8 = null; // Limine BOOTX64.EFI to copy to /EFI/BOOT
+var installed_conf_module: ?[]const u8 = null; // installed-system limine.conf
 
 // True if `haystack` ends with `needle`, case-insensitively (FAT paths vary).
 fn endsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -78,6 +82,15 @@ fn readModules() void {
         } else if (endsWithIgnoreCase(path, "SYSTEM.IMG")) {
             system_module = bytes;
             serial.print("[OBSIDIA] module: system image ({d} bytes)\n", .{file.size});
+        } else if (endsWithIgnoreCase(path, "BOOTX64.EFI")) {
+            bootx64_module = bytes;
+            serial.print("[OBSIDIA] module: bootloader BOOTX64.EFI ({d} bytes)\n", .{file.size});
+        } else if (endsWithIgnoreCase(path, "INSTALLED.CONF")) {
+            installed_conf_module = bytes;
+            serial.print("[OBSIDIA] module: installed limine.conf ({d} bytes)\n", .{file.size});
+        } else if (endsWithIgnoreCase(path, "KERNEL.ELF")) {
+            kernel_module = bytes;
+            serial.print("[OBSIDIA] module: kernel image ({d} bytes)\n", .{file.size});
         }
     }
 }
@@ -88,6 +101,52 @@ pub fn authModule() ?[]const u8 {
 }
 pub fn systemModule() ?[]const u8 {
     return system_module;
+}
+pub fn kernelModule() ?[]const u8 {
+    return kernel_module;
+}
+pub fn bootx64Module() ?[]const u8 {
+    return bootx64_module;
+}
+pub fn installedConfModule() ?[]const u8 {
+    return installed_conf_module;
+}
+
+// --- Entropy for std.crypto.random ------------------------------------------
+// std's CSPRNG seeds itself from the OS (getrandom), which doesn't exist
+// freestanding. std exposes `cryptoRandomSeed` precisely so a freestanding kernel
+// can supply its own entropy; with `crypto_always_getrandom` every draw routes
+// straight here. We seed an xorshift from the CPU timestamp counter — weak by
+// crypto standards, but enough to give the installer's scrypt credential a unique
+// salt (scrypt's strength is in the KDF, not the salt's unpredictability).
+pub const std_options: std.Options = .{
+    .cryptoRandomSeed = cryptoRandomSeed,
+    .crypto_always_getrandom = true,
+};
+
+// Read the 64-bit CPU timestamp counter (cycles since reset) — our entropy tap.
+fn rdtsc() u64 {
+    var hi: u32 = undefined;
+    var lo: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+var rng_state: u64 = 0x9E3779B97F4A7C15; // golden-ratio seed, stirred per call
+
+// Fill `buffer` with pseudo-random bytes: an xorshift64 generator re-stirred from
+// the TSC each byte so successive calls (and boots) diverge.
+fn cryptoRandomSeed(buffer: []u8) void {
+    for (buffer) |*b| {
+        rng_state ^= rdtsc() *% 0x2545F4914F6CDD1D; // mix in fresh cycle counts
+        rng_state ^= rng_state << 13; // xorshift64 scramble
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        b.* = @truncate(rng_state >> 24);
+    }
 }
 
 // Custom panic handler. The Zig compiler routes all safety-check panics (index
@@ -269,7 +328,8 @@ fn runAfterReclaim() callconv(.C) noreturn {
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     shell.setAuthModule(authModule()); // credential from Limine (preferred over the disk file)
-    install.setImage(systemModule()); // system image to clone if `install` is run
+    install.setImage(systemModule()); // Option A: system image to clone if `install` is run
+    install.setPayload(kernelModule(), bootx64Module(), installedConfModule()); // Option B: build a disk
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
     keyboard.setSink(&shell.feed); // route keystrokes into the shell
     mouse.init(); // enable the PS/2 mouse (IRQ12); the wheel drives scrollback

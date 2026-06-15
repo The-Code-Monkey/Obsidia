@@ -415,8 +415,8 @@ fn execute(raw: []const u8) void {
             var pbuf: [256]u8 = undefined;
             editor.run(resolvePath(args, &pbuf), &getKeyBlocking);
         }
-    } else if (std.mem.eql(u8, cmd, "install")) { // clone the system image onto the disk
-        install.run();
+    } else if (std.mem.eql(u8, cmd, "install")) { // install Obsidia onto the disk
+        install.run(&getKeyBlocking); // construct a fresh disk, or clone the image
     } else if (std.mem.eql(u8, cmd, "ps")) { // list kernel threads
         scheduler.dump();
     } else if (std.mem.eql(u8, cmd, "clear")) { // clear the terminal
