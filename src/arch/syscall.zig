@@ -16,6 +16,7 @@ const serial = @import("../drivers/serial.zig");
 const gdt = @import("gdt.zig");
 const cpu = @import("cpu.zig");
 const scheduler = @import("../sched/scheduler.zig"); // SYS_yield hands off the CPU
+const vmm = @import("../mm/vmm.zig"); // validate user pointers against the page tables
 
 // A dedicated ring-0 stack the entry stub switches to (`syscall` doesn't load one
 // for us). A single static stack is safe for now because the handler runs with
@@ -70,15 +71,19 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
 }
 
 // write(fd, ptr, len): copy `len` bytes from the user buffer to serial (the only
-// sink for now). fd 1 (stdout) / 2 (stderr) only. The buffer must lie wholly in
-// user space so a caller can't make the kernel read its own memory. (This is a
-// range check only; full per-page validation with fault handling — copy_from_user
-// — comes with the process model.)
+// sink for now). fd 1 (stdout) / 2 (stderr) only. The buffer is validated in two
+// steps so a hostile or buggy caller can never make the kernel touch memory it
+// shouldn't: first a RANGE check (the whole buffer lies in the user half, below
+// USER_LIMIT — not the kernel's higher half), then a PAGE check (every page is
+// actually mapped and user-accessible in the caller's address space). Without the
+// second step an in-range but unmapped pointer would fault the kernel mid-deref;
+// with it we return EFAULT instead — a minimal copy_from_user-style probe.
 fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
     if (fd != 1 and fd != 2) return EBADF;
     if (len == 0) return 0;
     const n = @min(len, 4096);
     if (ptr >= USER_LIMIT or n > USER_LIMIT - ptr) return EFAULT; // buffer escapes user space
+    if (!vmm.userRangeAccessible(vmm.activeSpace(), ptr, n)) return EFAULT; // unmapped / kernel-only page
     const buf = @as([*]const u8, @ptrFromInt(ptr))[0..n];
     serial.print("{s}", .{buf});
     return n;
