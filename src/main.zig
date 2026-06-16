@@ -299,11 +299,6 @@ export fn _start() noreturn {
     // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
     fat32.selfTest();
 
-    // Load and execute the init binary off the disk (if present) — an ELF64 at
-    // /INIT.ELF, else a flat /INIT. The first code this kernel runs that came
-    // from a filesystem.
-    loader.selfTest();
-
     serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
     serial.print("BOOT_OK\n", .{}); // the marker our test harness greps for
     serial.print("========================================\n", .{});
@@ -337,6 +332,13 @@ fn runAfterReclaim() callconv(.C) noreturn {
     usermode.selfTest(); // demo ring 3: run user code at CPL3 and recover from its #GP
     vmm.selfTestAddressSpace(); // demo a per-process address space (create/switch/destroy)
     scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
+
+    // Load and run the init binary off the disk (if present) as a RING-3 PROCESS
+    // — an ELF64 at /INIT.ELF, else a flat /INIT. The first code this kernel runs
+    // that came from a filesystem, and the first userland it runs at boot. Runs
+    // here (after the reclaim + the scheduler demos) so it's in the same proven
+    // environment the other ring-3 runs use.
+    loader.selfTest();
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     shell.setAuthModule(authModule()); // credential from Limine (preferred over the disk file)
