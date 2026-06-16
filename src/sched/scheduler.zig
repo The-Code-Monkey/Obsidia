@@ -281,6 +281,60 @@ fn exitProcessHandler(code: u64) callconv(.c) noreturn {
     unreachable; // a finished thread is never scheduled again
 }
 
+// --- Launch a user process and wait for it (used by the program loader) -------
+// runUser spawns one user process and blocks the *calling* thread until that
+// process calls exit(), then returns the exit code it passed. This is how the
+// loader runs a binary "synchronously": the launcher (the boot init-run, or the
+// shell's `exec`) parks here, cooperatively yielding the CPU so the new process
+// (and anything else ready) gets to run, and wakes once the child is done.
+//
+// Single-process-at-a-time by design: one global exit handler + result slot,
+// matching the loader's one-image-at-a-time model. A real multi-process kernel
+// would key these by pid; that's a later task.
+var user_done: bool = false; // set by the exit handler when the launched process exits
+var user_exit_code: u64 = 0; // the code it passed to exit()
+
+// SYS_exit handler installed while runUser waits: record the code, flag done, and
+// finish the process (same teardown as exitProcessHandler — finished threads are
+// never rescheduled, so the launcher's yield loop is what observes `user_done`).
+fn captureUserExit(code: u64) callconv(.c) noreturn {
+    user_exit_code = code;
+    @atomicStore(bool, &user_done, true, .release); // publish before we switch away
+    asm volatile ("cli"); // the thread we switch to restores its own interrupt flag
+    threads[current].state = .finished;
+    _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic);
+    yield();
+    unreachable; // a finished thread is never scheduled again
+}
+
+// Spawn `entry`/`user_stack` as a ring-3 process in address space `pml4`, then
+// yield until it exits; returns its exit code. MUST be called from within an
+// existing scheduler thread (so yield() has a context to return to) — the shell,
+// which runs as a real thread, satisfies this. The boot path, which runs before
+// the scheduler is live, uses runUserStandalone() below instead.
+pub fn runUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) u64 {
+    @atomicStore(bool, &user_done, false, .release);
+    user_exit_code = 0;
+    const prev = syscall.exit_handler; // restore afterwards so nested/other users are unaffected
+    syscall.exit_handler = &captureUserExit;
+
+    spawnUser(name, user_entry, user_stack, pml4);
+    while (!@atomicLoad(bool, &user_done, .acquire)) yield();
+
+    syscall.exit_handler = prev;
+    return user_exit_code;
+}
+
+// Like runUser, but for callers that are NOT yet part of the scheduler (the boot
+// init-run, which happens before scheduler.init()). It adopts the current context
+// as a throwaway "main" thread first, so yield() has somewhere to return to. The
+// real scheduler.init() later calls setupMain() again, discarding this state — the
+// same disposable pattern the boot self-tests/demos use.
+pub fn runUserStandalone(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) u64 {
+    setupMain();
+    return runUser(name, user_entry, user_stack, pml4);
+}
+
 // --- Self-test: two cooperative worker threads -------------------------------
 fn worker() void {
     const name = threads[current].name; // "A" or "B"
