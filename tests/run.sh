@@ -130,6 +130,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "hello from ring 3 via syscall"             "$p write() syscall: ring 3 buffer reached serial"
     assert_in "$log" "exit syscall returned to the kernel"       "$p exit() syscall: returned control to the kernel"
     assert_in "$log" "Address-space self-test OK"                "$p VMM: per-process address space (create/switch/isolate/destroy)"
+    assert_in "$log" "User-process self-test OK"                 "$p process model: ring-3 process + kernel thread co-scheduled across address spaces"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------

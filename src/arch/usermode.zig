@@ -92,6 +92,30 @@ comptime {
     );
 }
 
+// --- One-way ring-3 entry (for real processes) -------------------------------
+// Drop to ring 3 at `entry` with stack `user_stack`, never returning here: a real
+// process leaves ring 3 only via a syscall or an interrupt, not the self-test's
+// longjmp. The scheduler's user-thread trampoline calls this the first time a
+// process is scheduled. Selectors match the GDT (asserted above).
+pub fn enterRing3(entry: u64, user_stack: u64) noreturn {
+    asm volatile (
+        \\ movw $0x1b, %ax           // USER_DATA (RPL 3)
+        \\ movw %ax, %ds
+        \\ movw %ax, %es
+        \\ pushq $0x1b               // iretq frame: SS  = USER_DATA
+        \\ pushq %[sp]               //             RSP = user stack top
+        \\ pushq $0x202              //             RFLAGS = IF=1 + reserved bit 1
+        \\ pushq $0x23               //             CS  = USER_CODE (RPL 3)
+        \\ pushq %[ip]               //             RIP = entry
+        \\ iretq                     // enter ring 3 (interrupts on -> preemptible)
+        :
+        : [sp] "r" (user_stack),
+          [ip] "r" (entry),
+        : "rax", "memory"
+    );
+    unreachable;
+}
+
 // --- exit() return path ------------------------------------------------------
 // The SYS_exit handler (installed into syscall.exit_handler) for code launched via
 // usermodeEnter. There's no process to tear down yet, so it longjmps straight back

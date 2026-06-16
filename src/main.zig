@@ -331,6 +331,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
     scheduler.mutexDemo(); // demo the blocking Mutex (two threads contend; mutual exclusion)
     usermode.selfTest(); // demo ring 3: run user code at CPL3 and recover from its #GP
     vmm.selfTestAddressSpace(); // demo a per-process address space (create/switch/destroy)
+    scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
 
     shell.init(); // enable serial-RX interrupts (IRQ4)
     shell.setAuthModule(authModule()); // credential from Limine (preferred over the disk file)

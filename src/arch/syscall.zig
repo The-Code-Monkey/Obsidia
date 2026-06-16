@@ -23,8 +23,16 @@ const scheduler = @import("../sched/scheduler.zig"); // SYS_yield hands off the 
 // stack via TSS.rsp0.
 const SYSCALL_STACK_SIZE = 0x4000; // 16 KiB
 var syscall_stack: [SYSCALL_STACK_SIZE]u8 align(16) = undefined;
-export var syscall_kernel_rsp: u64 = 0; // top of syscall_stack (set in init)
+export var syscall_kernel_rsp: u64 = 0; // kernel stack the entry stub switches to
 export var syscall_user_rsp: u64 = 0; // scratch: the user RSP saved on entry
+
+// Point the syscall entry at a specific kernel stack. The scheduler calls this on
+// every switch so a `syscall` from the running user process lands on ITS kernel
+// stack (mirrors gdt.setKernelStack for the interrupt path). The default static
+// stack set in init() serves the boot self-test, before processes exist.
+pub fn setKernelStack(top: u64) void {
+    syscall_kernel_rsp = top;
+}
 
 // --- The syscall table -------------------------------------------------------
 // Numbers the user passes in RAX. Small values so a user stub can load them with
