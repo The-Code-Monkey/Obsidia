@@ -16,6 +16,7 @@ const serial = @import("../drivers/serial.zig");
 const gdt = @import("gdt.zig");
 const cpu = @import("cpu.zig");
 const scheduler = @import("../sched/scheduler.zig"); // SYS_yield hands off the CPU
+const vmm = @import("../mm/vmm.zig"); // validate user pointers against the page tables
 
 // A dedicated ring-0 stack the entry stub switches to (`syscall` doesn't load one
 // for us). A single static stack is safe for now because the handler runs with
@@ -70,15 +71,19 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
 }
 
 // write(fd, ptr, len): copy `len` bytes from the user buffer to serial (the only
-// sink for now). fd 1 (stdout) / 2 (stderr) only. The buffer must lie wholly in
-// user space so a caller can't make the kernel read its own memory. (This is a
-// range check only; full per-page validation with fault handling — copy_from_user
-// — comes with the process model.)
+// sink for now). fd 1 (stdout) / 2 (stderr) only. The buffer is validated in two
+// steps so a hostile or buggy caller can never make the kernel touch memory it
+// shouldn't: first a RANGE check (the whole buffer lies in the user half, below
+// USER_LIMIT — not the kernel's higher half), then a PAGE check (every page is
+// actually mapped and user-accessible in the caller's address space). Without the
+// second step an in-range but unmapped pointer would fault the kernel mid-deref;
+// with it we return EFAULT instead — a minimal copy_from_user-style probe.
 fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
     if (fd != 1 and fd != 2) return EBADF;
     if (len == 0) return 0;
     const n = @min(len, 4096);
     if (ptr >= USER_LIMIT or n > USER_LIMIT - ptr) return EFAULT; // buffer escapes user space
+    if (!vmm.userRangeAccessible(vmm.activeSpace(), ptr, n)) return EFAULT; // unmapped / kernel-only page
     const buf = @as([*]const u8, @ptrFromInt(ptr))[0..n];
     serial.print("{s}", .{buf});
     return n;
@@ -150,8 +155,15 @@ pub fn init() void {
     cpu.wrmsr(cpu.IA32_EFER, cpu.rdmsr(cpu.IA32_EFER) | cpu.EFER_SCE);
 
     // STAR: bits 47:32 = kernel CS base (syscall sets CS=base, SS=base+8);
-    //       bits 63:48 = sysret base   (sysret sets CS=base+16, SS=base+8, RPL 3).
-    const star: u64 = (@as(u64, 0x10) << 48) | (@as(u64, gdt.KERNEL_CODE) << 32);
+    //       bits 63:48 = sysret base   (sysret sets CS=base+16, SS=base+8).
+    // SYSRET forces CS.RPL=3 but does NOT force SS.RPL — SS's RPL comes straight
+    // from the base. So the base MUST already carry RPL 3, or SYSRET returns to
+    // ring 3 with SS at RPL 0 (e.g. 0x18 instead of 0x1b). That bad SS is harmless
+    // until an interrupt is taken from ring 3 and its iretq reloads SS at CPL 3 —
+    // RPL 0 vs CPL 3 then #GPs. We use USER_DATA-8 as the base: +8 = USER_DATA
+    // (0x1b, the ring-3 SS) and +16 = USER_CODE (0x23, the ring-3 CS), both RPL 3.
+    const sysret_base: u64 = gdt.USER_DATA - 8; // 0x13: +8=0x1b (SS), +16=0x23 (CS)
+    const star: u64 = (sysret_base << 48) | (@as(u64, gdt.KERNEL_CODE) << 32);
     cpu.wrmsr(cpu.IA32_STAR, star);
 
     // LSTAR: where `syscall` jumps. SFMASK: clear IF/DF/TF on entry (handler runs

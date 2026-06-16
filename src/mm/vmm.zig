@@ -267,6 +267,32 @@ fn queryEntry(pml4: [*]u64, virt: u64) ?u64 {
     return pt[idx(virt, 12)]; // 4 KiB leaf
 }
 
+// Physical address of the currently-loaded address space (CR3), low flag bits
+// masked off. A syscall runs on the calling process's CR3, so this names the
+// tables a user pointer must be validated against.
+pub fn activeSpace() u64 {
+    return asm volatile ("mov %%cr3, %[ret]"
+        : [ret] "=r" (-> u64),
+    ) & ADDR_MASK;
+}
+
+// Verify that every page of [virt, virt+len) is mapped and reachable from ring 3
+// (PRESENT + USER) in address space `space`. Syscalls call this before touching a
+// user buffer so a bad pointer returns an error instead of faulting the kernel on
+// the user's behalf — a minimal copy_from_user-style probe. The caller is
+// responsible for the bounds (that the range stays within the user half).
+pub fn userRangeAccessible(space: u64, virt: u64, len: u64) bool {
+    if (len == 0) return true;
+    const pml4 = tableAt(space);
+    var addr = virt & ~(PAGE_SIZE - 1); // page containing the first byte
+    const end = virt + len; // exclusive; no overflow — caller bounds it below USER_LIMIT
+    while (addr < end) : (addr += PAGE_SIZE) {
+        const entry = queryEntry(pml4, addr) orelse return false; // unmapped page
+        if (entry & USER == 0) return false; // present but kernel-only — not user-reachable
+    }
+    return true;
+}
+
 // Map every page in [vstart, vend) to its kernel-slide physical address.
 fn mapKernelRange(pml4: [*]u64, vstart: u64, vend: u64, flags: u64, virt_base: u64, phys_base: u64) usize {
     var v = vstart; // current virtual page
