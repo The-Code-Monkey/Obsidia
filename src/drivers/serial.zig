@@ -39,6 +39,26 @@ pub inline fn inb(port: u16) u8 {
     return data; // hand the byte back to the caller
 }
 
+// Write one 32-bit dword to an I/O port. Used for PCI configuration access, which
+// reads/writes 32-bit-aligned config registers through the 0xCF8/0xCFC port pair.
+pub inline fn outl(port: u16, data: u32) void {
+    asm volatile ("outl %eax, %dx"
+        : // no outputs
+        : [data] "{eax}" (data), // put `data` in EAX
+          [port] "{dx}" (port), // put `port` in DX
+    );
+}
+
+// Read one 32-bit dword from an I/O port and return it (the PCI config data port).
+pub inline fn inl(port: u16) u32 {
+    var data: u32 = undefined; // destination for the dword we read
+    asm volatile ("inl %dx, %eax"
+        : [data] "={eax}" (data), // capture EAX into `data`
+        : [port] "{dx}" (port), // port number goes in DX
+    );
+    return data; // hand the dword back to the caller
+}
+
 // Program the UART into a usable state: 38400 baud, 8N1, FIFOs on.
 pub fn init() void {
     outb(PORT + 1, 0x00); // IER: disable all UART interrupts (we poll instead)
