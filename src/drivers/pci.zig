@@ -56,6 +56,7 @@ pub fn readByte(bus: u8, slot: u5, func: u3, offset: u8) u8 {
 const OFF_VENDOR: u8 = 0x00; // u16 vendor id (0xFFFF = no device) + u16 device id
 const OFF_CLASS: u8 = 0x08; // u8 revision, u8 prog-if, u8 subclass, u8 class (high byte)
 const OFF_HEADER_TYPE: u8 = 0x0E; // bit 7 = multifunction; bits 0-6 = header layout
+const OFF_BAR0: u8 = 0x10; // first of six Base Address Registers (type-0 header)
 
 // A device we discovered, with the identity fields a driver needs to recognize it
 // and reach its config space again (bus/slot/func address it uniquely).
@@ -108,6 +109,70 @@ fn className(class: u8) []const u8 {
     };
 }
 
+// --- Base Address Registers (BARs) -------------------------------------------
+// A BAR names a region the device decodes — either I/O ports or a block of MMIO.
+// The low bits flag the kind; the rest is the base address. To learn a region's
+// SIZE, write all-ones to the BAR and read back: the device returns 0 in the
+// address bits it doesn't decode, so size = ~(readback & mask) + 1. We restore
+// the original value immediately after. (A production driver would clear the
+// command register's I/O/memory-decode bits around this so the device can't be
+// accessed mid-resize; harmless here on a quiescent boot-time scan.)
+
+// Size a 32-bit BAR at byte offset `off`. `mask` clears the low flag bits
+// (0xFFFFFFFC for I/O, 0xFFFFFFF0 for memory) before the size math.
+fn barSize(d: *const Device, off: u8, mask: u32) u32 {
+    const orig = readDword(d.bus, d.slot, d.func, off);
+    writeDword(d.bus, d.slot, d.func, off, 0xFFFF_FFFF); // probe: write all-ones
+    const readback = readDword(d.bus, d.slot, d.func, off) & mask;
+    writeDword(d.bus, d.slot, d.func, off, orig); // restore the real base
+    if (readback == 0) return 0; // no implemented address bits
+    return ~readback +% 1; // span = one past the highest decoded address bit
+}
+
+// Size a 64-bit memory BAR, whose value spans the dword at `off` and the next.
+fn barSize64(d: *const Device, off: u8) u64 {
+    const orig_lo = readDword(d.bus, d.slot, d.func, off);
+    const orig_hi = readDword(d.bus, d.slot, d.func, off + 4);
+    writeDword(d.bus, d.slot, d.func, off, 0xFFFF_FFFF);
+    writeDword(d.bus, d.slot, d.func, off + 4, 0xFFFF_FFFF);
+    const rb: u64 = (@as(u64, readDword(d.bus, d.slot, d.func, off + 4)) << 32) |
+        (readDword(d.bus, d.slot, d.func, off) & 0xFFFF_FFF0);
+    writeDword(d.bus, d.slot, d.func, off, orig_lo); // restore both halves
+    writeDword(d.bus, d.slot, d.func, off + 4, orig_hi);
+    if (rb == 0) return 0;
+    return ~rb +% 1;
+}
+
+// Decode + log the BARs of a normal (type-0) device. Bridges use a different
+// header layout (only two BARs, plus bus-number registers) so we skip them.
+fn decodeBars(d: *const Device) void {
+    if (d.header_type & 0x7F != 0x00) return; // not a type-0 (normal device) header
+    var i: u8 = 0;
+    while (i < 6) {
+        const off = OFF_BAR0 + i * 4;
+        const bar = readDword(d.bus, d.slot, d.func, off);
+        if (bar == 0) { // an unimplemented BAR reads back as zero
+            i += 1;
+            continue;
+        }
+        if (bar & 1 != 0) { // bit 0 set => I/O space BAR
+            serial.print("[PCI]     BAR{d}: I/O    port 0x{x:0>4} size 0x{x}\n", .{ i, bar & 0xFFFF_FFFC, barSize(d, off, 0xFFFF_FFFC) });
+            i += 1;
+        } else { // memory BAR: bits 2:1 = width, bit 3 = prefetchable
+            const is64 = (bar >> 1) & 3 == 0x2;
+            const pf: []const u8 = if ((bar >> 3) & 1 != 0) " prefetchable" else "";
+            if (is64) { // 64-bit BAR: high half is in the next slot
+                const base = (@as(u64, readDword(d.bus, d.slot, d.func, off + 4)) << 32) | (bar & 0xFFFF_FFF0);
+                serial.print("[PCI]     BAR{d}: MMIO64 0x{x:0>8} size 0x{x}{s}\n", .{ i, base, barSize64(d, off), pf });
+                i += 2; // a 64-bit BAR occupies two slots
+            } else {
+                serial.print("[PCI]     BAR{d}: MMIO32 0x{x:0>8} size 0x{x}{s}\n", .{ i, bar & 0xFFFF_FFF0, barSize(d, off, 0xFFFF_FFF0), pf });
+                i += 1;
+            }
+        }
+    }
+}
+
 // Probe one (bus, slot, func). If a device lives there, record it (until the
 // registry is full) and log a one-line summary.
 fn checkFunction(bus: u8, slot: u5, func: u3) void {
@@ -135,6 +200,7 @@ fn checkFunction(bus: u8, slot: u5, func: u3) void {
     }
 
     serial.print("[PCI]   {x:0>2}:{x:0>2}.{d}  {x:0>4}:{x:0>4}  class {x:0>2}.{x:0>2} prog-if {x:0>2}  {s}\n", .{ dev.bus, dev.slot, dev.func, dev.vendor, dev.device, dev.class, dev.subclass, dev.prog_if, className(dev.class) });
+    decodeBars(&dev); // log this device's I/O / MMIO regions
 }
 
 // Probe one slot. Function 0 must exist for the slot to be populated; only a
