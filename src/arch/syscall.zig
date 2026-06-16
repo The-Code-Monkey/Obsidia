@@ -150,8 +150,15 @@ pub fn init() void {
     cpu.wrmsr(cpu.IA32_EFER, cpu.rdmsr(cpu.IA32_EFER) | cpu.EFER_SCE);
 
     // STAR: bits 47:32 = kernel CS base (syscall sets CS=base, SS=base+8);
-    //       bits 63:48 = sysret base   (sysret sets CS=base+16, SS=base+8, RPL 3).
-    const star: u64 = (@as(u64, 0x10) << 48) | (@as(u64, gdt.KERNEL_CODE) << 32);
+    //       bits 63:48 = sysret base   (sysret sets CS=base+16, SS=base+8).
+    // SYSRET forces CS.RPL=3 but does NOT force SS.RPL — SS's RPL comes straight
+    // from the base. So the base MUST already carry RPL 3, or SYSRET returns to
+    // ring 3 with SS at RPL 0 (e.g. 0x18 instead of 0x1b). That bad SS is harmless
+    // until an interrupt is taken from ring 3 and its iretq reloads SS at CPL 3 —
+    // RPL 0 vs CPL 3 then #GPs. We use USER_DATA-8 as the base: +8 = USER_DATA
+    // (0x1b, the ring-3 SS) and +16 = USER_CODE (0x23, the ring-3 CS), both RPL 3.
+    const sysret_base: u64 = gdt.USER_DATA - 8; // 0x13: +8=0x1b (SS), +16=0x23 (CS)
+    const star: u64 = (sysret_base << 48) | (@as(u64, gdt.KERNEL_CODE) << 32);
     cpu.wrmsr(cpu.IA32_STAR, star);
 
     // LSTAR: where `syscall` jumps. SFMASK: clear IF/DF/TF on entry (handler runs
