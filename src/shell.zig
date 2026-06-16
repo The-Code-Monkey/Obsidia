@@ -401,9 +401,16 @@ fn execute(raw: []const u8) void {
             var pbuf: [256]u8 = undefined;
             fat32.cat(resolvePath(args, &pbuf));
         }
-    } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary from the disk
+    } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary as a ring-3 process
         if (args.len == 0) {
             serial.print("usage: exec <path>\n", .{});
+        } else {
+            var pbuf: [256]u8 = undefined;
+            _ = loader.execUser(resolvePath(args, &pbuf));
+        }
+    } else if (std.mem.eql(u8, cmd, "exec0")) { // legacy: load + run in ring 0 (the old binary contract)
+        if (args.len == 0) {
+            serial.print("usage: exec0 <path>\n", .{});
         } else {
             var pbuf: [256]u8 = undefined;
             _ = loader.exec(resolvePath(args, &pbuf));
