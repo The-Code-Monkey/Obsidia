@@ -131,6 +131,9 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "exit syscall returned to the kernel"       "$p exit() syscall: returned control to the kernel"
     assert_in "$log" "Address-space self-test OK"                "$p VMM: per-process address space (create/switch/isolate/destroy)"
     assert_in "$log" "User-process self-test OK"                 "$p process model: ring-3 process + kernel thread co-scheduled across address spaces"
+    assert_in "$log" "[PCI] Enumeration complete:"               "$p PCI: bus enumeration completed (config mechanism #1)"
+    assert_in "$log" "class 01.06 prog-if 01"                    "$p PCI: decoded the AHCI controller (class/subclass/prog-if)"
+    assert_in "$log" "BAR5: MMIO32"                              "$p PCI: decoded + sized a device BAR (MMIO)"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
