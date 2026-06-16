@@ -46,46 +46,55 @@ if [ ! -f "$DISK" ]; then
 fi
 
 # /INIT: a flat x86-64 binary the kernel loads and runs at boot (and via the
-# shell's `exec /INIT`). It prints a marker to COM1 and returns the magic
-# 0xB017B007. Its bytes come from the shared canonical producer (the single
-# source of truth, also used by the test harness; see tests/make-init.sh for the
-# annotated instruction listing). Refreshed on every run so an existing disk
-# image picks up contract changes.
+# shell's `exec /INIT`) as a RING-3 user process. It write()s a marker, then
+# exit()s (the user ABI; not a privileged `out` + return-magic). Its bytes come
+# from the shared canonical producer (the single source of truth, also used by
+# the test harness; see tests/make-init.sh for the annotated instruction
+# listing). Refreshed on every run so an existing disk image picks up changes.
 tmpf=$(mktemp)
 tests/make-init.sh "$tmpf"
 mcopy -o -i "$DISK" "$tmpf" ::/INIT
+rm -f "$tmpf"
+
+# /INIT0: a flat RING-0-ABI binary for the shell's legacy `exec0` command (the old
+# loader contract — entered as a C function, prints via privileged `out`, returns
+# a magic). Kept so the ring-0 load path stays exercisable now that /INIT is a
+# ring-3 user program. Bytes from the shared producer; see tests/make-init0.sh.
+tmpf=$(mktemp)
+tests/make-init0.sh "$tmpf"
+mcopy -o -i "$DISK" "$tmpf" ::/INIT0
 rm -f "$tmpf"
 
 # /INIT.ELF: a real, statically linked ELF64 ET_EXEC built with the Zig
 # toolchain. The kernel's loader auto-detects the ELF magic and uses the ELF
 # path (parse header -> walk program headers -> map each PT_LOAD segment at its
 # linked address with per-segment W^X), and prefers this file over the flat
-# /INIT at boot. It prints a marker to COM1 and returns the same magic. Built in
-# a scratch dir; refreshed on every run.
+# /INIT at boot. Like the flat init it runs in ring 3: write() a marker, then
+# exit(). Linked into the low (user) half. Built in a scratch dir; refreshed on
+# every run.
 elfd=$(mktemp -d)
 cat > "$elfd/init.s" <<'ASM'
 .section .text
 .global _start
 _start:
-    lea     msg(%rip), %rsi      # rsi = &msg (RIP-relative: position-independent)
-    mov     $0x3f8, %dx          # COM1 data port
-.loop:
-    lodsb
-    testb   %al, %al
-    je      .done
-    outb    %al, %dx
-    jmp     .loop
-.done:
-    movl    $0xb017b007, %eax    # success magic in rax
-    ret
+    movl    $1, %eax                # SYS_write
+    movl    $1, %edi                # fd = 1 (stdout)
+    lea     msg(%rip), %rsi         # rsi = &msg (RIP-relative: position-independent)
+    movl    $(msg_end - msg), %edx  # len = number of bytes in msg
+    syscall                         # write(1, msg, len)
+    movl    $3, %eax                # SYS_exit
+    xorl    %edi, %edi              # code = 0
+    syscall                         # exit(0) — does not return
+1:  jmp     1b                      # safety: spin if exit ever returns
 .section .rodata
 msg:
-    .asciz "INIT.ELF: hello from a real ELF!\n"
+    .ascii  "INIT.ELF: hello from a real ELF!\n"
+msg_end:
 ASM
 cat > "$elfd/init.ld" <<'LDS'
 ENTRY(_start)
 SECTIONS {
-    . = 0xffffd00000001000;
+    . = 0x400000;
     .text   : { *(.text*) }
     . = ALIGN(0x1000);
     .rodata : { *(.rodata*) }

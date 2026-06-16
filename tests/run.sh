@@ -189,42 +189,42 @@ mformat -i "$FATDISK" -F -v OBSIDIA :: 2>/dev/null
 # linked ELF64 ET_EXEC produced by the Zig toolchain (zig cc + zig ld.lld), so
 # the ELF loader path is exercised end-to-end against a genuine linked binary
 # rather than a hand-rolled header. The program is freestanding x86-64 asm that
-# prints a marker to COM1 and returns the magic 0xB017B007 in rax via `ret`,
-# matching the loader's binary contract. It is linked into LOAD_BASE's PML4 slot
-# (0xffffd0...) with two PAGE-DISJOINT load segments — .text (R+X) and .rodata
-# (R only, non-exec) — so the loader's PER-SEGMENT W^X mapping is tested: one
-# segment must come out executable, the other non-executable. Returns non-zero
-# (and leaves "$1" absent) if the toolchain can't build it, so the caller can
-# skip the ELF checks rather than fail spuriously.
+# runs as a RING-3 user process: it write()s a marker via the syscall ABI, then
+# exit()s (not the old privileged `out` + return-magic — `out` faults at CPL3).
+# It is linked into the LOW (user) half with two PAGE-DISJOINT load segments —
+# .text (R+X) and .rodata (R only, non-exec) — so the loader's PER-SEGMENT W^X
+# mapping is tested: one segment must come out executable, the other not.
+# Returns non-zero (and leaves "$1" absent) if the toolchain can't build it, so
+# the caller can skip the ELF checks rather than fail spuriously.
 make_init_elf() {
     local out="$1" d
     d=$(mktemp -d) || return 1
     cat > "$d/init.s" <<'ASM'
-# Freestanding ELF init: print a marker to COM1, then return the success magic.
+# Freestanding ELF init (ring 3): write() a marker, then exit(). Syscall ABI:
+# number in RAX, args in RDI/RSI/RDX; SYS_write=1, SYS_exit=3.
 .section .text
 .global _start
 _start:
-    lea     msg(%rip), %rsi      # rsi = &msg (RIP-relative: position-independent)
-    mov     $0x3f8, %dx          # COM1 data port
-.loop:
-    lodsb                        # al = *rsi++
-    testb   %al, %al             # NUL terminator?
-    je      .done
-    outb    %al, %dx             # emit the byte to the serial port
-    jmp     .loop
-.done:
-    movl    $0xb017b007, %eax    # the success magic, returned in rax
-    ret                          # back into the kernel loader
+    movl    $1, %eax                # SYS_write
+    movl    $1, %edi                # fd = 1 (stdout)
+    lea     msg(%rip), %rsi         # rsi = &msg (RIP-relative: position-independent)
+    movl    $(msg_end - msg), %edx  # len = number of bytes in msg
+    syscall                         # write(1, msg, len)
+    movl    $3, %eax                # SYS_exit
+    xorl    %edi, %edi              # code = 0
+    syscall                         # exit(0) — does not return
+1:  jmp     1b                      # safety: spin if exit ever returns
 .section .rodata
 msg:
-    .asciz "INIT.ELF: hello from a real ELF!\n"
+    .ascii  "INIT.ELF: hello from a real ELF!\n"
+msg_end:
 ASM
-    # Linker script: load into LOAD_BASE's slot, .text and .rodata on separate
+    # Linker script: load into the low (user) half, .text and .rodata on separate
     # pages so they become two distinct PT_LOAD segments with different perms.
     cat > "$d/init.ld" <<'LDS'
 ENTRY(_start)
 SECTIONS {
-    . = 0xffffd00000001000;
+    . = 0x400000;
     .text   : { *(.text*) }
     . = ALIGN(0x1000);
     .rodata : { *(.rodata*) }
@@ -243,13 +243,17 @@ printf 'Hello from FAT32 on Obsidia!\n' > "$fattmp"; mcopy -i "$FATDISK" "$fattm
 mmd -i "$FATDISK" ::/docs 2>/dev/null
 printf 'nested file contents ok\n'      > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/docs/NOTES.TXT
 printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" "::/a-long-filename.txt"
-# /INIT (flat) is produced by the shared canonical helper (one source of truth
-# for the binary's bytes, see tests/make-init.sh) so it can't drift from run.sh.
+# /INIT (flat, ring-3 user ABI) is produced by the shared canonical helper (one
+# source of truth for the binary's bytes, see tests/make-init.sh) so it can't
+# drift from run.sh. /INIT0 is its ring-0-ABI counterpart for the legacy exec0
+# path (see tests/make-init0.sh).
 tests/make-init.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/INIT
+tests/make-init0.sh "$fattmp";                       mcopy -i "$FATDISK" "$fattmp" ::/INIT0
 # Seed the real ELF init too (if the toolchain can build it). The boot self-test
 # prefers /INIT.ELF when present, so it exercises the ELF path automatically; we
-# also drive `exec /INIT.ELF` (ELF) and `exec /INIT` (flat) from the shell to
-# prove both loader paths are reachable and re-runnable.
+# also drive `exec /INIT.ELF` (ELF) and `exec /INIT` (flat) in ring 3 from the
+# shell, plus `exec0 /INIT0` for the ring-0 path, to prove all are reachable and
+# re-runnable.
 HAVE_ELF=0
 if make_init_elf "$fattmp"; then mcopy -i "$FATDISK" "$fattmp" ::/INIT.ELF; HAVE_ELF=1; else
     echo "  (note: could not build /INIT.ELF with the zig toolchain; ELF-path checks will be skipped)"
@@ -259,7 +263,7 @@ elf_cmd=""; [ "$HAVE_ELF" -eq 1 ] && elf_cmd="exec /INIT.ELF\r"
 ( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
   printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 0.4; \
   [ -n "$elf_cmd" ] && { printf '%b' "$elf_cmd"; sleep 1; }; \
-  printf 'exec /INIT\r'; sleep 1 ) \
+  printf 'exec /INIT\r'; sleep 1; printf 'exec0 /INIT0\r'; sleep 1 ) \
     | timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$FATDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/fat.log",signal=off -serial chardev:c0 \
@@ -272,32 +276,42 @@ assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a ne
 assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
 
 # --- Init loader (ELF64 + flat binary off the FAT32 disk) ---------------------
-# Boot self-test execs /INIT.ELF (preferred when present); the shell then runs
-# `exec /INIT.ELF` (ELF path again) and `exec /INIT` (flat path). A marker can
-# only appear if the loaded code itself executed (the string lives inside the
-# binary and is printed by its own loop), and the magic return value proves it
-# came back to the kernel cleanly. We assert BOTH formats independently so the
-# auto-detect and both code paths are covered.
-echo "== Init loader (ELF64 + flat binary off the FAT32 disk) =="
+# Stage 5: the loader runs an init binary as a real RING-3 PROCESS — its own
+# address space, USER pages, a user stack — that signals completion with the
+# exit() syscall (not the old ring-0 return-magic). The boot self-test execs
+# /INIT.ELF (preferred when present) in ring 3; the shell then runs `exec
+# /INIT.ELF` (ELF) and `exec /INIT` (flat) in ring 3, plus `exec0 /INIT0` for the
+# legacy RING-0 path that still exists alongside it. A marker can only appear if
+# the loaded code itself executed (the string lives inside the binary and is
+# printed by its own write() syscall / out loop). We assert every path
+# independently so the auto-detect, ring-3, and ring-0 routes are all covered.
+echo "== Init loader (ring-3 user process + legacy ring-0 path) =="
 
-# Flat path (shell `exec /INIT`): hand-assembled raw binary, auto-detected as
-# non-ELF and loaded at LOAD_BASE.
-assert_in "$TMP/fat.log" "INIT: hello from FAT32!"                 "init(flat): the binary's own code ran (marker on serial)"
+# Ring-3 flat path (shell `exec /INIT`): hand-assembled raw binary, auto-detected
+# as non-ELF, loaded into a user address space at USER_LOAD_BASE, run at CPL3.
+assert_in "$TMP/fat.log" "INIT: hello from FAT32!"                 "init(flat,ring3): the binary's own write() ran (marker on serial)"
 assert_in "$TMP/fat.log" "flat binary -> "                        "init(flat): auto-detected as a flat binary"
-assert_in "$TMP/fat.log" "init returned 0xb017b007 (magic OK)"     "init: returned the magic value to the kernel"
-assert_in "$TMP/fat.log" "[LOADER] init ran and exited cleanly."   "init: full pipeline (map RW+NX -> copy -> remap -> run -> unmap)"
-assert_in "$TMP/fat.log" "image unmapped,"                         "init: image unmapped + frames freed after run"
-# Count clean RETURNS (magic-OK log lines), not greetings: this proves the
-# binary both ran and returned to the kernel cleanly on each run (boot self-test
-# plus the shell exec(s) — >=2 across flat and/or ELF).
-inits=$(grep -ac "init returned 0xb017b007 (magic OK)" "$TMP/fat.log")
-if [ "$inits" -ge 2 ]; then ok "init: re-runnable (boot self-test + shell exec = ${inits} runs)"; else bad "init: expected >=2 runs (boot + shell exec), saw ${inits}"; fi
+assert_in "$TMP/fat.log" "user image ready:"                       "init(ring3): built a user address space (image + stack)"
+assert_in "$TMP/fat.log" "user process exited with code 0"         "init(ring3): process exited cleanly via the exit() syscall"
+assert_in "$TMP/fat.log" "[LOADER] init ran and exited cleanly."   "init: boot self-test ran /INIT.ELF in ring 3 end-to-end"
+# Count clean ring-3 EXITS, not greetings: proves a process both ran and exited
+# cleanly each time (boot self-test + the shell exec(s) of flat and/or ELF).
+inits=$(grep -ac "user process exited with code 0" "$TMP/fat.log")
+if [ "$inits" -ge 2 ]; then ok "init(ring3): re-runnable (boot self-test + shell exec = ${inits} runs)"; else bad "init(ring3): expected >=2 runs (boot + shell exec), saw ${inits}"; fi
+
+# Legacy ring-0 path (shell `exec0 /INIT0`): the old binary contract — a flat
+# binary entered as a C function in ring 0, printing via privileged `out`, and
+# returning the magic 0xB017B007 to the kernel, which then unmaps the image.
+assert_in "$TMP/fat.log" "INIT0: ring-0 binary contract OK!"       "init(ring0): the ring-0 binary's own code ran (marker on serial)"
+assert_in "$TMP/fat.log" "calling entry point 0x"                  "init(ring0): entered the binary as a C function"
+assert_in "$TMP/fat.log" "init returned 0xb017b007 (magic OK)"     "init(ring0): returned the success magic to the kernel"
+assert_in "$TMP/fat.log" "image unmapped,"                         "init(ring0): image unmapped + frames freed after run"
 
 if [ "$HAVE_ELF" -eq 1 ]; then
-    # ELF path: a real linked ELF64 ET_EXEC. Assert it was parsed as ELF, its two
-    # segments were mapped with PER-SEGMENT W^X (one R-X, one R--), the .text ran
-    # (its marker reached serial), and it returned the magic.
-    assert_in "$TMP/fat.log" "INIT.ELF: hello from a real ELF!"    "init(elf): the ELF's own code ran (marker on serial)"
+    # Ring-3 ELF path: a real linked ELF64 ET_EXEC. Assert it was parsed as ELF,
+    # its two segments were mapped with PER-SEGMENT W^X (one R-X, one R--), the
+    # .text ran at CPL3 (its marker reached serial), and the process exited.
+    assert_in "$TMP/fat.log" "INIT.ELF: hello from a real ELF!"    "init(elf,ring3): the ELF's own write() ran (marker on serial)"
     assert_in "$TMP/fat.log" "ELF64 ET_EXEC, entry 0x"             "init(elf): parsed ELF64 header + entry point"
     assert_in "$TMP/fat.log" "R-X"                                 "init(elf): a segment mapped executable read-only (W^X)"
     assert_in "$TMP/fat.log" "R--"                                 "init(elf): a segment mapped non-executable read-only (W^X)"
