@@ -15,6 +15,11 @@ const serial = @import("../drivers/serial.zig"); // logging
 
 pub const PAGE_SIZE: usize = 4096; // one physical frame = 4 KiB
 
+// 32-bit DMA ceiling: legacy bus-master devices (AC'97, e1000, many AHCI) carry
+// only 32-bit physical addresses in their descriptors, so any buffer they touch
+// must live below 4 GiB. DMA buffers are allocated with this as the max address.
+pub const DMA_MAX_ADDR: u64 = 0x100000000; // 4 GiB
+
 var hhdm: u64 = 0; // HHDM offset (virtual = hhdm + physical)
 var bitmap: [*]u8 = undefined; // the allocation bitmap (1 bit per frame)
 var bitmap_size: usize = 0; // bitmap length in bytes
@@ -119,6 +124,51 @@ pub fn free(phys: u64) void {
         used_frames -= 1;
     }
     if (frame < next_hint) next_hint = frame; // bias the next scan toward freed space
+}
+
+// --- Contiguous allocation (for DMA) ----------------------------------------
+// A device's bus-master DMA engine reads/writes memory by *physical* address
+// without going through the MMU, so a multi-page buffer it touches must occupy
+// physically-contiguous frames. The single-frame alloc() above gives no such
+// guarantee, so DMA drivers come through here instead.
+//
+// Allocate `count` consecutive free frames, all strictly below `max_phys`
+// (pass DMA_MAX_ADDR for the 32-bit ceiling). Returns the base physical address
+// of the run, or null if no run that long fits under the ceiling. The frames are
+// NOT zeroed — the DMA wrapper does that through the HHDM.
+pub fn allocContiguous(count: usize, max_phys: u64) ?u64 {
+    if (!ready or count == 0) return null; // PMM down or nonsense request
+    // Highest frame index we may hand out: the lower of "what RAM exists" and
+    // "what the device can address". A run must end at or before this.
+    const ceiling = @min(total_frames, max_phys / PAGE_SIZE);
+    var base: usize = 1; // never start a run at frame 0 (permanently reserved)
+    while (base + count <= ceiling) { // room for a full run below the ceiling?
+        var i: usize = 0; // probe the candidate run frame by frame
+        while (i < count) : (i += 1) {
+            if (bitTest(base + i)) break; // hit a used frame: this run is dead
+        }
+        if (i == count) { // all `count` frames were free — claim the whole run
+            for (0..count) |k| bitSet(base + k); // mark each frame used
+            used_frames += count; // keep the count consistent
+            return @as(u64, base) * PAGE_SIZE; // base frame index -> physical addr
+        }
+        base += i + 1; // restart just past the used frame we tripped on
+    }
+    return null; // no contiguous run of that size fits under the ceiling
+}
+
+// Return a contiguous run (as handed out by allocContiguous) to the pool.
+pub fn freeContiguous(phys: u64, count: usize) void {
+    const start = phys / PAGE_SIZE; // address -> first frame index
+    for (0..count) |i| { // free each frame in the run
+        const frame = start + i;
+        if (frame >= total_frames) break; // out of range, stop
+        if (bitTest(frame)) { // only if it was actually used
+            bitClear(frame);
+            used_frames -= 1;
+        }
+    }
+    if (start < next_hint) next_hint = start; // bias the next scan toward freed space
 }
 
 // Stats accessors used for logging / the VMM.
