@@ -376,13 +376,26 @@ mkwav() {
       printf 'fmt '; le 16 4; le 1 2; le "$ch" 2; le "$rate" 4; le $((rate * ch * 2)) 4; le $((ch * 2)) 2; le 16 2
       printf 'data'; le "$data" 4; head -c "$data" /dev/urandom; } > "$out"
 }
+# mkbadwav <out>: a MALFORMED WAV — valid RIFF/WAVE + fmt, but the "data" chunk's
+# size field claims 0x7FFFFFFF (~2 GiB) while the file is only a few bytes long.
+# A parser that trusts the size would skip/read absurd byte counts (hang or read
+# past EOF); a hardened one must reject it gracefully. We write a tiny 4-byte body
+# so the file is unambiguously smaller than the claimed length.
+mkbadwav() {
+    local out=$1
+    { printf 'RIFF'; le $((36 + 4)) 4; printf 'WAVE'
+      printf 'fmt '; le 16 4; le 1 2; le 2 2; le 48000 4; le $((48000 * 2 * 2)) 4; le 4 2; le 16 2
+      printf 'data'; le 2147483647 4; head -c 4 /dev/urandom; } > "$out"  # 0x7FFFFFFF size, 4-byte body
+}
 echo "== AC'97 play (raw PCM + WAV, -M pc) =="
 head -c 131072 /dev/urandom > "$TMP/sound.pcm" # 128 KiB raw = 32768 stereo frames
 mkwav "$TMP/st48.wav" 2 48000 65536           # stereo 48 kHz, 65536 data bytes
 mkwav "$TMP/mono44.wav" 1 44100 32768          # mono 44.1 kHz, 32768 data bytes -> 65536 stereo
+mkbadwav "$TMP/bad.wav"                         # bogus 2 GiB data size on a tiny file
 mcopy -i "$FATDISK" "$TMP/sound.pcm" ::/sound.pcm
 mcopy -i "$FATDISK" "$TMP/st48.wav" ::/st48.wav
 mcopy -i "$FATDISK" "$TMP/mono44.wav" ::/mono44.wav
+mcopy -i "$FATDISK" "$TMP/bad.wav" ::/bad.wav
 pfifo="$TMP/play.in"; rm -f "$pfifo"; mkfifo "$pfifo"
 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
     -drive file="$FATDISK",format=raw,if=ide \
@@ -394,7 +407,11 @@ exec 6>"$pfifo" # hold the input FIFO open so QEMU never sees EOF
 waitfor "Type 'help'" "$TMP/play.log" "$ppid"; sleep 0.3; printf 'play /sound.pcm\r' >&6
 waitfor "streamed 131072 bytes of /sound.pcm" "$TMP/play.log" "$ppid"; sleep 0.2; printf 'play /st48.wav\r' >&6
 waitfor "streamed .* of /st48.wav" "$TMP/play.log" "$ppid"; sleep 0.2; printf 'play /mono44.wav\r' >&6
-waitfor "streamed .* of /mono44.wav" "$TMP/play.log" "$ppid"
+waitfor "streamed .* of /mono44.wav" "$TMP/play.log" "$ppid"; sleep 0.2; printf 'play /bad.wav\r' >&6
+# Malformed WAV: the parser must reject it (not hang). Once it does, prove the
+# shell is still alive by echoing a marker — a crash/hang would never print it.
+waitfor "not a playable WAV" "$TMP/play.log" "$ppid"; sleep 0.2; printf 'echo WAVOK\r' >&6
+waitfor "WAVOK" "$TMP/play.log" "$ppid"
 exec 6>&-; sleep 0.3; kill $ppid 2>/dev/null; wait $ppid 2>/dev/null
 # Raw PCM path.
 assert_in "$TMP/play.log" "play: streamed 131072 bytes of /sound.pcm"          "AC97: play streamed a raw .pcm file from FAT32"
@@ -406,6 +423,12 @@ assert_in "$TMP/play.log" "play: streamed 65536 bytes of /st48.wav"            "
 # Mono 44.1 kHz WAV: variable-rate + mono expanded to stereo (32768 -> 65536).
 assert_in "$TMP/play.log" "WAV 44100 Hz, 1 ch, 16-bit, 32768 data bytes"       "AC97: parsed a mono 44.1 kHz WAV header"
 assert_in "$TMP/play.log" "play: streamed 65536 bytes of /mono44.wav"          "AC97: mono WAV expanded to stereo (32768 -> 65536) at 44.1 kHz"
+# Malformed WAV: bogus 2 GiB data size on a tiny file must be rejected (the parser
+# logs a [WAV] reason and play falls back to "not a playable WAV"), and the shell
+# must stay responsive afterwards — the echoed marker proves no hang/crash.
+assert_in "$TMP/play.log" "[WAV] chunk size exceeds file"                      "WAV: rejected a chunk size larger than the file (no over-read)"
+assert_in "$TMP/play.log" "play: not a playable WAV: /bad.wav"                 "WAV: play declined the malformed file gracefully"
+assert_in "$TMP/play.log" "WAVOK"                                             "WAV: shell stayed responsive after rejecting the malformed WAV"
 # Playback must be interrupt-driven: the completion IRQ fires once per buffer, so
 # a multi-buffer file yields several. Assert the count is non-zero (not polled).
 pirqs=$(grep -aoE "[0-9]+ completion IRQ" "$TMP/play.log" | grep -oE "^[0-9]+" | head -1)

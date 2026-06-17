@@ -438,6 +438,15 @@ pub const FileReader = struct {
         return out;
     }
 
+    // How many file bytes are still readable from the current cursor position.
+    // This is the un-refilled tail (`remaining`) PLUS whatever is still sitting in
+    // the sector cache but not yet returned (`buf_len - buf_pos`). Parsers (e.g.
+    // the WAV loader) use this as a hard upper bound so a malformed length field
+    // can't drive read()/skip() past EOF.
+    pub fn bytesLeft(self: *const FileReader) u32 {
+        return self.remaining + @as(u32, @intCast(self.buf_len - self.buf_pos));
+    }
+
     // Advance the cursor by `n` bytes without copying them out (used to skip over
     // chunks a parser doesn't care about, e.g. WAV metadata). Stops early at EOF.
     pub fn skip(self: *FileReader, n: usize) void {
