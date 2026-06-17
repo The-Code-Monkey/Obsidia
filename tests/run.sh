@@ -243,6 +243,15 @@ assert_in "$TMP/ahci.log" "self-test OK: IDENTIFY model present" "AHCI: IDENTIFY
 # above has no AHCI HBA, so the driver must report "no controller" and continue.
 assert_in "$TMP/ata.log" "no AHCI controller found"             "AHCI: controller-less boot (-M pc) skips cleanly and continues"
 
+# --- AHCI/SATA write path (WRITE DMA EXT) ------------------------------------
+# Reuses the AHCI disk boot above ($TMP/ahci.log). The write self-test runs a
+# NON-DESTRUCTIVE round-trip on scratch LBA 1: save original bytes, write a known
+# pattern, read it back + verify, then restore the original. We assert the per-
+# step status line and the success marker. (Self-contained: depends only on the
+# already-captured ahci.log.)
+assert_in "$TMP/ahci.log" "self-test: write save-ok=true, write-ok=true, verify-ok=true, restore-ok=true" "AHCI: write round-trip steps all succeeded (save/write/verify/restore)"
+assert_in "$TMP/ahci.log" "write self-test OK: WRITE DMA EXT round-trip verified" "AHCI: WRITE DMA EXT round-trip verified + original sector restored"
+
 # --- FAT32 filesystem (read-only) --------------------------------------------
 # Format a FAT32 disk (mtools only — no root needed), seed known files including
 # a subdirectory and a long-name file, then boot and drive `ls`/`cat` to confirm
