@@ -554,7 +554,7 @@ fi
 
 # --- Shell interaction -------------------------------------------------------
 echo "== Shell commands =="
-boot_shell "$TMP/shell.log" 512M 'help\rmem\ruptime\recho test123\rps\rbogus\r'
+boot_shell "$TMP/shell.log" 512M 'help\rmem\ruptime\recho test123\rps\rdate\rbogus\r'
 assert_in "$TMP/shell.log" "commands: help, clear"        "shell: help"
 assert_in "$TMP/shell.log" "frames free"                  "shell: mem"
 assert_in "$TMP/shell.log" "ticks @ 100 Hz"               "shell: uptime"
@@ -562,6 +562,21 @@ assert_in "$TMP/shell.log" "test123"                      "shell: echo"
 assert_in "$TMP/shell.log" "unknown command: bogus"       "shell: unknown command"
 assert_in "$TMP/shell.log" "running    shell"             "shell runs as a scheduled thread (ps)"
 assert_in "$TMP/shell.log" "ready      idle"              "ps lists the idle thread"
+
+# --- RTC / CMOS wall-clock (`date`) ------------------------------------------
+# The RTC driver reads the battery-backed CMOS clock; QEMU's emulated RTC defaults
+# to the host's time, so a plausible "YYYY-MM-DD HH:MM:SS UTC" line must appear.
+# We assert the FORMAT (not a specific value) on both the boot marker and the
+# `date` command, since the exact time is whatever the host clock reads.
+assert_in "$TMP/bios.log" "[RTC] RTC initialized:"        "RTC: boot marker logged the wall-clock time"
+# Boot marker has a well-formed date: a 4-digit year in this century + valid HH:MM:SS.
+if grep -qaE '\[RTC\] RTC initialized: 20[0-9][0-9]-[0-1][0-9]-[0-3][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9] UTC' "$TMP/bios.log"; then
+    ok "RTC: boot marker time is a well-formed YYYY-MM-DD HH:MM:SS UTC"
+else bad "RTC: boot marker time is malformed"; fi
+# The `date` shell command prints the same well-formed timestamp on demand.
+if grep -qaE '20[0-9][0-9]-[0-1][0-9]-[0-3][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9] UTC' "$TMP/shell.log"; then
+    ok "shell: date printed a plausible YYYY-MM-DD HH:MM:SS UTC line"
+else bad "shell: date did not print a well-formed timestamp"; fi
 
 # --- Login (scrypt) ----------------------------------------------------------
 # Seed a disk with /OBSIDIA/AUTH (root:hunter2), then drive a WRONG password
