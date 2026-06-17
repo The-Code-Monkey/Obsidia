@@ -6,6 +6,7 @@ const builtin = @import("builtin"); // compile-time target info (CPU arch, etc.)
 const std = @import("std"); // for the panic-handler wiring
 const limine = @import("limine"); // Limine boot-protocol bindings (48cf/limine-zig)
 const serial = @import("drivers/serial.zig"); // COM1 logging
+const cpu = @import("arch/cpu.zig"); // CPUID, CR4 (SMEP/SMAP), RDRAND
 const gdt = @import("arch/gdt.zig"); // segment descriptors + TSS
 const idt = @import("arch/idt.zig"); // interrupt/exception handlers
 const pic = @import("arch/pic.zig"); // legacy interrupt controller + timer
@@ -141,9 +142,16 @@ fn rdtsc() u64 {
 
 var rng_state: u64 = 0x9E3779B97F4A7C15; // golden-ratio seed, stirred per call
 
-// Fill `buffer` with pseudo-random bytes: an xorshift64 generator re-stirred from
-// the TSC each byte so successive calls (and boots) diverge.
+// Fill `buffer` with random bytes. Prefer the CPU's hardware RNG (RDRAND, an
+// on-die entropy source) when present and willing; if RDRAND is absent or its
+// entropy pool is momentarily drained (CF=0 past the retry budget), fall back to
+// the existing TSC-stirred xorshift64. Freestanding-safe (no std.Thread/OS).
 fn cryptoRandomSeed(buffer: []u8) void {
+    if (cpu.rdrandFill(buffer)) {
+        serial.print("[OBSIDIA] RNG: rdrand\n", .{});
+        return;
+    }
+    serial.print("[OBSIDIA] RNG: rdtsc\n", .{});
     for (buffer) |*b| {
         rng_state ^= rdtsc() *% 0x2545F4914F6CDD1D; // mix in fresh cycle counts
         rng_state ^= rng_state << 13; // xorshift64 scramble
@@ -264,6 +272,12 @@ export fn _start() noreturn {
     // Pass the kernel's physical + virtual load base (so we can re-map it) and
     // the HHDM offset (so we can re-map all of physical RAM).
     vmm.init(exec_resp.physical_base, exec_resp.virtual_base, hhdm_resp.offset);
+
+    // Now that we run on OUR page tables (kernel pages S=0, user pages U=1),
+    // turn on SMEP/SMAP: ring 0 can no longer execute (SMEP) or read/write
+    // (SMAP) user pages, closing a whole class of privilege-escalation tricks.
+    // Must follow vmm.init() — on Limine's tables a U/S mismatch could fault us.
+    cpu.enableSmepSmap();
 
     // Kernel heap: a std.mem.Allocator backed by the VMM.
     heap.init();

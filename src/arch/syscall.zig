@@ -84,6 +84,13 @@ fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
     const n = @min(len, 4096);
     if (ptr >= USER_LIMIT or n > USER_LIMIT - ptr) return EFAULT; // buffer escapes user space
     if (!vmm.userRangeAccessible(vmm.activeSpace(), ptr, n)) return EFAULT; // unmapped / kernel-only page
+    // This is the ONE place the kernel dereferences a raw user pointer. With
+    // SMAP on, a ring-0 access to a U=1 page faults unless we lift the guard:
+    // STAC sets RFLAGS.AC (access allowed), CLAC clears it again. We re-arm via
+    // defer so the window is exactly the buffer copy below and nothing more —
+    // leaving AC set would silently disable SMAP for the rest of this syscall.
+    asm volatile ("stac");
+    defer asm volatile ("clac");
     const buf = @as([*]const u8, @ptrFromInt(ptr))[0..n];
     serial.print("{s}", .{buf});
     return n;

@@ -105,6 +105,8 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[PMM] Physical memory manager initialized." "$p PMM init"
     assert_in "$log" "free-count restored: true"                  "$p PMM self-test (alloc/free)"
     assert_in "$log" "[VMM] Virtual memory manager initialized."  "$p VMM init"
+    assert_in "$log" "[CPU] SMEP enabled"                         "$p CPU SMEP enabled (CR4.SMEP)"
+    assert_in "$log" "[CPU] SMAP enabled"                         "$p CPU SMAP enabled (CR4.SMAP)"
     assert_in "$log" "HHDM alias of that frame agrees: OK"        "$p VMM self-test (mapping)"
     assert_in "$log" "W^X enforced: OK"                           "$p W^X enforced"
     assert_in "$log" "[HEAP] Kernel heap initialized."            "$p heap init"
