@@ -37,6 +37,12 @@ const BootInfo = struct {
     // nonzero when the volume lives in a partition, e.g. an ESP at LBA 2048).
     // Every absolute LBA we compute is offset by this, so the same read/write
     // code serves both a raw FAT32 disk and a partition.
+    total_clusters: u32, // count of data clusters in the volume, derived at mount:
+    // (total_sectors - first_data_sector) / sectors_per_cluster. This is the hard
+    // upper bound on a cluster-chain length: a chain can visit each data cluster at
+    // most once, so any walk that follows MORE links than this is cyclic or corrupt.
+    // Every chain walk caps its iteration count here to guarantee termination even
+    // on a malicious/garbage FAT (a circular chain would otherwise hang the kernel).
 };
 
 var bi: BootInfo = undefined;
@@ -132,6 +138,16 @@ fn isDataCluster(c: u32) bool {
     return c >= 2 and c < EOC;
 }
 
+// Maximum number of clusters any single chain walk may follow before we declare
+// the FAT corrupt (circular or absurdly long) and bail out. A well-formed chain
+// visits each of the volume's data clusters at most once, so total_clusters is a
+// tight, generous bound — it never truncates a legitimate file. We add a small
+// floor so a not-yet-mounted or pathological zero-cluster geometry can't pin the
+// cap at 0 and reject every read; +2 covers the reserved cluster numbers.
+fn maxChainLen() u32 {
+    return bi.total_clusters + 2;
+}
+
 // --- Mount -------------------------------------------------------------------
 // Mount the whole disk as one FAT32 volume (the volume begins at LBA 0). This is
 // the common case (run.sh's dev disk); the installer uses mountAt() for an ESP.
@@ -176,6 +192,16 @@ pub fn mountAt(start: u32) bool {
     // to the volume start; clusterToSector adds volume_start for absolute LBAs).
     bi.first_data_sector = bi.reserved_sectors + @as(u32, bi.num_fats) * bi.fat_size;
     bi.volume_start = start; // remember where the volume lives on the disk
+    // Derive the total data-cluster count: the data region's sectors divided by the
+    // cluster size. This is the longest any valid cluster chain can possibly be, and
+    // every chain walk uses it as a loop cap so a circular/corrupt FAT can't hang us.
+    // Guard the subtraction: a bogus BPB with first_data_sector > total_sectors would
+    // underflow, so floor the data region at 0 in that case.
+    const data_sectors: u32 = if (bi.total_sectors > bi.first_data_sector)
+        bi.total_sectors - bi.first_data_sector
+    else
+        0;
+    bi.total_clusters = data_sectors / bi.sectors_per_cluster;
     fat_cache_sector = 0xFFFFFFFF; // invalidate the FAT cache for the new volume
     fat_cache_dirty = false; // nothing pending on a fresh mount
     next_free_cluster = 2; // restart the allocation hint for the new volume
@@ -191,17 +217,24 @@ pub fn mountAt(start: u32) bool {
 const LFN_OFFSETS = [_]u8{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
 
 // Fold one LFN entry's 13 chars into the assembly buffer at its sequenced slot.
+// SECURITY: `seq` comes straight off disk and indexes a fixed 256-byte buffer.
+// A malformed entry with a huge `seq` would put `base = (seq-1)*13` past the end,
+// so we (1) reject any `seq` outside the readable range 1..MAX_LFN_SEQ (the valid
+// FAT range is 1..20; MAX_LFN_SEQ=19 caps us tighter at ~247 chars, well under
+// 256), and (2) bounds-check EVERY write index against lfn.len before storing.
+// With both guards no attacker-controlled entry can overflow `lfn`.
 fn accumulateLfn(ent: []const u8, lfn: *[256]u8, lfn_len: *usize) void {
     const seq = ent[0] & 0x1F; // 1-based position of this chunk in the name
     if (seq == 0 or seq > MAX_LFN_SEQ) return; // ignore odd sequences (cap ~247 chars)
     const base = (@as(usize, seq) - 1) * 13; // where this chunk's chars start
+    if (base >= lfn.len) return; // defensive: whole chunk lies past the buffer
     var i: usize = 0;
     while (i < 13) : (i += 1) {
         const o = LFN_OFFSETS[i];
         const ch = @as(u16, ent[o]) | (@as(u16, ent[o + 1]) << 8);
         if (ch == 0x0000 or ch == 0xFFFF) continue; // name terminator / padding
         const pos = base + i;
-        if (pos < lfn.len) {
+        if (pos < lfn.len) { // per-write bounds check: never index past lfn[255]
             lfn[pos] = if (ch < 0x80) @intCast(ch) else '?'; // we only render ASCII
             if (pos + 1 > lfn_len.*) lfn_len.* = pos + 1;
         }
@@ -244,7 +277,14 @@ fn scanDir(start_cluster: u32, ctx: anytype, comptime onEntry: fn (@TypeOf(ctx),
     var lfn: [256]u8 = undefined; // assembled long-name buffer
     var lfn_len: usize = 0; // current assembled long-name length (0 = none)
     var cluster = start_cluster;
+    var hops: u32 = 0; // clusters followed so far; cap guards against a cyclic FAT
+    const cap = maxChainLen();
     while (isDataCluster(cluster)) { // each cluster in the directory's chain
+        if (hops >= cap) { // followed more links than the volume has clusters -> cycle
+            serial.print("[FAT32] cluster chain too long / cycle detected (scanDir)\n", .{});
+            return;
+        }
+        hops += 1;
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster) : (s += 1) { // each sector in the cluster
             if (!ata.read(clusterToSector(cluster) + s, 1, &sector)) return;
@@ -361,7 +401,14 @@ pub fn cat(path: []const u8) void {
     var remaining = node.size;
     var cluster = node.cluster;
     var buf: [SECTOR]u8 = undefined;
+    var hops: u32 = 0; // chain-length cap: a circular FAT must not loop forever
+    const cap = maxChainLen();
     while (remaining > 0 and isDataCluster(cluster)) {
+        if (hops >= cap) {
+            serial.print("[FAT32] cluster chain too long / cycle detected (cat)\n", .{});
+            return;
+        }
+        hops += 1;
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster and remaining > 0) : (s += 1) {
             if (!ata.read(clusterToSector(cluster) + s, 1, &buf)) return;
@@ -385,7 +432,14 @@ pub fn readFile(path: []const u8, dst: []u8) ?usize {
     var cluster = node.cluster;
     var written: usize = 0;
     var buf: [SECTOR]u8 = undefined;
+    var hops: u32 = 0; // chain-length cap: refuse to follow a circular/corrupt FAT
+    const cap = maxChainLen();
     while (remaining > 0 and isDataCluster(cluster)) {
+        if (hops >= cap) { // corrupt chain: fail the read rather than spinning forever
+            serial.print("[FAT32] cluster chain too long / cycle detected (readFile)\n", .{});
+            return null;
+        }
+        hops += 1;
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster and remaining > 0) : (s += 1) {
             if (!ata.read(clusterToSector(cluster) + s, 1, &buf)) return null;
@@ -412,6 +466,7 @@ pub const FileReader = struct {
     buf: [SECTOR]u8 = undefined, // one cached sector
     buf_len: usize = 0, // valid bytes in `buf`
     buf_pos: usize = 0, // bytes of `buf` already returned
+    hops: u32 = 0, // clusters followed so far; cap stops a cyclic FAT mid-stream
 
     // Copy up to dst.len bytes into dst, refilling the sector cache as needed.
     // Returns the number of bytes copied; 0 means end of file (or a read error).
@@ -422,6 +477,11 @@ pub const FileReader = struct {
                 if (self.sec >= bi.sectors_per_cluster) { // exhausted this cluster
                     self.cluster = nextCluster(self.cluster);
                     self.sec = 0;
+                    self.hops += 1; // count each chain link we follow
+                    if (self.hops >= maxChainLen()) { // cyclic/corrupt FAT -> stop the stream
+                        serial.print("[FAT32] cluster chain too long / cycle detected (FileReader)\n", .{});
+                        break;
+                    }
                 }
                 if (!isDataCluster(self.cluster)) break; // chain ended early
                 if (!ata.read(clusterToSector(self.cluster) + self.sec, 1, &self.buf)) break;
@@ -486,9 +546,10 @@ fn wr32(b: []u8, o: usize, v: u32) void {
     b[o + 3] = @truncate(v >> 24);
 }
 
-// Number of data clusters (valid clusters are 2 .. clusterCount()+1).
+// Number of data clusters (valid clusters are 2 .. clusterCount()+1). Computed
+// once at mount (with an underflow guard) and stored, so this just returns it.
 fn clusterCount() u32 {
-    return (bi.total_sectors - bi.first_data_sector) / bi.sectors_per_cluster;
+    return bi.total_clusters;
 }
 
 // Set the FAT entry for `cluster` to `value`. Edits the write-back cache (which
@@ -541,10 +602,18 @@ fn allocCluster(zero: bool) ?u32 {
     return null; // disk full
 }
 
-// Free an entire cluster chain (mark every entry free).
+// Free an entire cluster chain (mark every entry free). Capped at the volume's
+// cluster count so a circular FAT can't make this spin forever while writing.
 fn freeChain(start: u32) void {
     var c = start;
+    var hops: u32 = 0;
+    const cap = maxChainLen();
     while (isDataCluster(c)) {
+        if (hops >= cap) {
+            serial.print("[FAT32] cluster chain too long / cycle detected (freeChain)\n", .{});
+            return;
+        }
+        hops += 1;
         const nxt = nextCluster(c);
         _ = writeFatEntry(c, 0);
         c = nxt;
@@ -562,7 +631,14 @@ fn findDirLoc(parent_cluster: u32, name: []const u8) ?DirLoc {
     var lfn: [256]u8 = undefined;
     var lfn_len: usize = 0;
     var cluster = parent_cluster;
+    var hops: u32 = 0; // chain-length cap against a circular directory chain
+    const cap = maxChainLen();
     while (isDataCluster(cluster)) {
+        if (hops >= cap) {
+            serial.print("[FAT32] cluster chain too long / cycle detected (findDirLoc)\n", .{});
+            return null;
+        }
+        hops += 1;
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster) : (s += 1) {
             const lba = clusterToSector(cluster) + s;
@@ -624,7 +700,18 @@ fn placeEntry(parent_cluster: u32, slot_index: usize, ent: *const [32]u8) bool {
     var sec_index = slot_index / slotsPerSector(); // which directory sector
     const off = (slot_index % slotsPerSector()) * 32; // byte offset within it
     var cluster = parent_cluster;
+    // This loop already terminates on its own (sec_index strictly decreases each
+    // step), but it still follows nextCluster over an on-disk chain, so we add the
+    // same hop cap as every other walk for consistency / defense-in-depth: a cyclic
+    // FAT can't make us read the same cluster more times than the volume has.
+    var hops: u32 = 0;
+    const cap = maxChainLen();
     while (sec_index >= bi.sectors_per_cluster) : (sec_index -= bi.sectors_per_cluster) {
+        if (hops >= cap) {
+            serial.print("[FAT32] cluster chain too long / cycle detected (placeEntry)\n", .{});
+            return false;
+        }
+        hops += 1;
         cluster = nextCluster(cluster); // step to the cluster holding this sector
         if (!isDataCluster(cluster)) return false;
     }
@@ -646,7 +733,14 @@ fn reserveDirSlots(parent_cluster: u32, need: usize) ?usize {
     var first_free: ?usize = null; // first end-marker (0x00) slot
     var cluster = parent_cluster;
     var last_cluster = parent_cluster; // tail of the chain, for growth
+    var hops: u32 = 0; // chain-length cap against a circular directory chain
+    const cap = maxChainLen();
     while (isDataCluster(cluster)) {
+        if (hops >= cap) {
+            serial.print("[FAT32] cluster chain too long / cycle detected (reserveDirSlots)\n", .{});
+            return null;
+        }
+        hops += 1;
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster) : (s += 1) {
             if (!ata.read(clusterToSector(cluster) + s, 1, &sector)) return null;
@@ -698,7 +792,14 @@ fn createDirEntry(parent_cluster: u32, name: []const u8, attr: u8, first_cluster
 fn aliasExists(parent_cluster: u32, sfn: *const [11]u8) bool {
     var sector: [SECTOR]u8 = undefined;
     var cluster = parent_cluster;
+    var hops: u32 = 0; // chain-length cap against a circular directory chain
+    const cap = maxChainLen();
     while (isDataCluster(cluster)) {
+        if (hops >= cap) {
+            serial.print("[FAT32] cluster chain too long / cycle detected (aliasExists)\n", .{});
+            return false;
+        }
+        hops += 1;
         var s: u32 = 0;
         while (s < bi.sectors_per_cluster) : (s += 1) {
             if (!ata.read(clusterToSector(cluster) + s, 1, &sector)) return false;
