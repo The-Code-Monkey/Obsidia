@@ -57,6 +57,14 @@ const OFF_VENDOR: u8 = 0x00; // u16 vendor id (0xFFFF = no device) + u16 device 
 const OFF_CLASS: u8 = 0x08; // u8 revision, u8 prog-if, u8 subclass, u8 class (high byte)
 const OFF_HEADER_TYPE: u8 = 0x0E; // bit 7 = multifunction; bits 0-6 = header layout
 const OFF_BAR0: u8 = 0x10; // first of six Base Address Registers (type-0 header)
+const OFF_COMMAND: u8 = 0x04; // u16 command (decode enables) low half of the cmd/status dword
+
+// Command-register decode-enable bits. While any of these are set the device is
+// actively decoding accesses to its BAR-named regions; we clear them before a
+// destructive BAR resize probe (see quiesceDecode) and restore them after.
+const CMD_IO_SPACE: u16 = 1 << 0; // respond to I/O-port accesses
+const CMD_MEM_SPACE: u16 = 1 << 1; // respond to memory (MMIO) accesses
+const CMD_BUS_MASTER: u16 = 1 << 2; // initiate DMA as a bus master
 
 // A device we discovered, with the identity fields a driver needs to recognize it
 // and reach its config space again (bus/slot/func address it uniquely).
@@ -114,13 +122,48 @@ fn className(class: u8) []const u8 {
 // The low bits flag the kind; the rest is the base address. To learn a region's
 // SIZE, write all-ones to the BAR and read back: the device returns 0 in the
 // address bits it doesn't decode, so size = ~(readback & mask) + 1. We restore
-// the original value immediately after. (A production driver would clear the
-// command register's I/O/memory-decode bits around this so the device can't be
-// accessed mid-resize; harmless here on a quiescent boot-time scan.)
+// the original value immediately after.
+//
+// QUIESCING THE DEVICE DURING THE PROBE: while we scribble all-ones into a BAR,
+// the device's decode of that region is momentarily nonsensical — and worse, a
+// bus-mastering device could be mid-DMA against the old base. To make the probe
+// safe we clear the command register's I/O-space, memory-space and bus-master
+// decode-enable bits first, do the resize, then restore the EXACT original
+// command word. We touch only the low 16 bits (the command half); the high 16
+// bits (the status half, which is write-1-to-clear) are left untouched by
+// writing back the full original dword unchanged below in the BAR-value restore
+// path's caller — see quiesceDecode/restoreDecode.
+
+// Clear the device's decode-enable bits (I/O, memory, bus-master) and return the
+// ORIGINAL full command/status dword so the caller can restore it verbatim.
+// Reading the whole dword and writing back only with the command low word zeroed
+// for those three bits preserves the status half (it's written back unchanged,
+// and status bits are write-1-to-clear so re-writing the read value is a no-op
+// for any bit that was already set... we instead simply restore the saved dword
+// later, which is the cleanest correct behavior).
+fn quiesceDecode(d: *const Device) u32 {
+    const orig = readDword(d.bus, d.slot, d.func, OFF_COMMAND); // cmd(low) + status(high)
+    const cleared_cmd = @as(u16, @truncate(orig)) & ~(CMD_IO_SPACE | CMD_MEM_SPACE | CMD_BUS_MASTER);
+    // Write back the status half unchanged (high 16 bits of orig) with the
+    // decode bits cleared in the command half. Status is write-1-to-clear, so
+    // re-writing whatever we read does not spuriously clear a bit that wasn't
+    // already set; bits that were set get cleared, which is the conventional and
+    // harmless thing to do on a boot-time scan.
+    writeDword(d.bus, d.slot, d.func, OFF_COMMAND, (orig & 0xFFFF_0000) | cleared_cmd);
+    return orig;
+}
+
+// Restore the command/status dword saved by quiesceDecode (re-enabling whatever
+// decode bits the firmware/Limine had set before we probed).
+fn restoreDecode(d: *const Device, orig: u32) void {
+    writeDword(d.bus, d.slot, d.func, OFF_COMMAND, orig);
+}
 
 // Size a 32-bit BAR at byte offset `off`. `mask` clears the low flag bits
 // (0xFFFFFFFC for I/O, 0xFFFFFFF0 for memory) before the size math.
 fn barSize(d: *const Device, off: u8, mask: u32) u32 {
+    const saved_cmd = quiesceDecode(d); // stop the device decoding during the probe
+    defer restoreDecode(d, saved_cmd); // and re-enable it on every exit path
     const orig = readDword(d.bus, d.slot, d.func, off);
     writeDword(d.bus, d.slot, d.func, off, 0xFFFF_FFFF); // probe: write all-ones
     const readback = readDword(d.bus, d.slot, d.func, off) & mask;
@@ -131,6 +174,8 @@ fn barSize(d: *const Device, off: u8, mask: u32) u32 {
 
 // Size a 64-bit memory BAR, whose value spans the dword at `off` and the next.
 fn barSize64(d: *const Device, off: u8) u64 {
+    const saved_cmd = quiesceDecode(d); // stop the device decoding during the probe
+    defer restoreDecode(d, saved_cmd); // and re-enable it on every exit path
     const orig_lo = readDword(d.bus, d.slot, d.func, off);
     const orig_hi = readDword(d.bus, d.slot, d.func, off + 4);
     writeDword(d.bus, d.slot, d.func, off, 0xFFFF_FFFF);
