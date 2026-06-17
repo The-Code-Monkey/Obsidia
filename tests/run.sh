@@ -215,6 +215,34 @@ assert_in "$TMP/ac97.log" "self-test OK: DMA playback advanced" "AC97: DMA engin
 # And confirm the audio-less default boot stays graceful (no device -> skip).
 assert_in "$TMP/bios.log" "no AC'97 device found"               "AC97: audio-less boot skips cleanly and continues"
 
+# --- AHCI/SATA disk driver (read-only) ---------------------------------------
+# q35 has a built-in ICH9 AHCI controller; we attach a SECOND ich9-ahci HBA with a
+# raw SATA disk (a known marker at sector 0 plus an MBR 0x55AA boot signature) and
+# check the driver enables the HBA, detects the disk + its SATA signature, runs
+# IDENTIFY (model string), and reads sector 0 over bus-master DMA. -boot d forces
+# CD boot since the disk carries a boot signature. The q35 built-in AHCI on the BIOS
+# marker boot above (no disk) already proves the no-disk path; here we prove a real
+# disk works end to end.
+echo "== AHCI/SATA disk (-device ich9-ahci + ide-hd) =="
+AHCIDISK="$TMP/ahci.img"
+truncate -s 16M "$AHCIDISK"
+printf 'OBSIDIA_AHCI_OK\0' | dd of="$AHCIDISK" conv=notrunc bs=1 count=16 2>/dev/null
+printf '\x55\xaa' | dd of="$AHCIDISK" conv=notrunc bs=1 seek=510 count=2 2>/dev/null
+timeout 30 $QEMU -M q35 -m 512M -boot d -cdrom "$ISO" \
+    -drive id=hd0,file="$AHCIDISK",if=none,format=raw \
+    -device ich9-ahci,id=ahci -device ide-hd,drive=hd0,bus=ahci.0 \
+    -serial "file:$TMP/ahci.log" -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/ahci.log" "class 01.06"                          "AHCI: PCI enum found a mass-storage/SATA controller"
+assert_in "$TMP/ahci.log" "AHCI enabled, version"                "AHCI: HBA brought up (AHCI-enable + reset)"
+assert_in "$TMP/ahci.log" "SATA disk confirmed on port"          "AHCI: detected the SATA disk + its device signature"
+assert_in "$TMP/ahci.log" "model='QEMU HARDDISK'"                "AHCI: IDENTIFY DEVICE returned the model string"
+assert_in "$TMP/ahci.log" "LBA0[0..16]='OBSIDIA_AHCI_OK"         "AHCI: read sector 0 contents correctly (DMA)"
+assert_in "$TMP/ahci.log" "boot-signature=true"                  "AHCI: sector-0 MBR 0x55AA boot signature read back"
+assert_in "$TMP/ahci.log" "self-test OK: IDENTIFY model present" "AHCI: IDENTIFY + sector-0 DMA read self-test passed"
+# And confirm a controller-less boot stays graceful: the -M pc (i440fx) ATA boot
+# above has no AHCI HBA, so the driver must report "no controller" and continue.
+assert_in "$TMP/ata.log" "no AHCI controller found"             "AHCI: controller-less boot (-M pc) skips cleanly and continues"
+
 # --- FAT32 filesystem (read-only) --------------------------------------------
 # Format a FAT32 disk (mtools only — no root needed), seed known files including
 # a subdirectory and a long-name file, then boot and drive `ls`/`cat` to confirm

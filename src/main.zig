@@ -21,6 +21,7 @@ const mouse = @import("drivers/mouse.zig"); // PS/2 mouse (scroll wheel -> scrol
 const pci = @import("drivers/pci.zig"); // PCI bus enumeration (config mechanism #1)
 const ac97 = @import("drivers/ac97.zig"); // AC'97 audio (PCM playback over DMA)
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
+const ahci = @import("drivers/ahci.zig"); // AHCI/SATA disk (DMA block device, read-only)
 const rtc = @import("drivers/rtc.zig"); // RTC / CMOS wall-clock (date + time)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
@@ -327,6 +328,13 @@ export fn _start() noreturn {
     // reports "no disk" and the kernel carries on.
     ata.init();
     ata.selfTest();
+
+    // Bring up the AHCI/SATA disk (DMA block device, read-only: IDENTIFY + sector
+    // read). Finds the SATA HBA on q35's ich9-ahci; on a machine without one
+    // (e.g. i440fx / -M pc, or a disk-less boot) it reports "no controller" and
+    // the kernel carries on.
+    ahci.init();
+    ahci.selfTest();
 
     // Read the battery-backed RTC and log the current wall-clock time. No hardware
     // to bring up (the CMOS RTC is always running), so this is just a boot marker;
