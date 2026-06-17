@@ -42,7 +42,6 @@ pub fn parse(reader: *fat32.FileReader) ?Format {
     var riff: [12]u8 = undefined;
     if (reader.read(&riff) != 12) return null; // too short to be a WAV
     if (!std.mem.eql(u8, riff[0..4], "RIFF") or !std.mem.eql(u8, riff[8..12], "WAVE")) {
-        serial.print("[WAV] not a RIFF/WAVE file\n", .{});
         return null;
     }
 
@@ -80,7 +79,6 @@ pub fn parse(reader: *fat32.FileReader) ?Format {
         } else if (std.mem.eql(u8, ck[0..4], "data")) {
             if (!have_fmt) return null; // data before fmt: malformed
             if (afmt != FMT_PCM or bits != 16 or (ch != 1 and ch != 2)) {
-                serial.print("[WAV] unsupported: fmt={d} {d}-bit {d}ch (need 16-bit PCM, 1-2 ch)\n", .{ afmt, bits, ch });
                 return null;
             }
             // Clamp the advertised data length to the bytes actually present, so
@@ -93,7 +91,6 @@ pub fn parse(reader: *fat32.FileReader) ?Format {
             reader.skip(size + (size & 1)); // unknown chunk: skip body + pad byte
         }
     }
-    serial.print("[WAV] no data chunk found\n", .{});
     return null;
 }
 

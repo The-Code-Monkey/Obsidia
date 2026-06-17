@@ -149,7 +149,6 @@ fn construct(getKey: *const fn () u8) void {
         serial.print("install: username and password must not be empty.\n", .{});
         return;
     }
-    serial.print("install: hashing the password (scrypt)...\n", .{});
     var phc_buf: [auth.MAX_HASH]u8 = undefined;
     const phc = auth.hash(heap.allocator(), pbuf[0..plen], &phc_buf) orelse {
         serial.print("install: failed to hash the password.\n", .{});
@@ -165,7 +164,6 @@ fn construct(getKey: *const fn () u8) void {
     const dev = AtaDev{};
 
     // 1. Partition: a GPT with one ESP from LBA 2048 to the last usable sector.
-    serial.print("install: writing GPT (this ERASES the disk)...\n", .{});
     if (!gpt.write(dev, disk, ESP_FIRST_LBA)) {
         serial.print("install: GPT write FAILED.\n", .{});
         return;
@@ -174,7 +172,6 @@ fn construct(getKey: *const fn () u8) void {
     // 2. Format the ESP as FAT32. It spans [2048, last_usable].
     const last_usable = disk - gpt.FIRST_USABLE_LBA;
     const esp_sectors: u32 = @intCast(last_usable - ESP_FIRST_LBA + 1);
-    serial.print("install: formatting the ESP ({d} sectors) as FAT32...\n", .{esp_sectors});
     if (!fatformat.run(dev, ESP_FIRST_LBA, esp_sectors)) {
         serial.print("install: format FAILED.\n", .{});
         return;
@@ -194,7 +191,6 @@ fn construct(getKey: *const fn () u8) void {
     }
 
     // 4. Copy the boot pieces and write the credential.
-    serial.print("install: copying kernel ({d} bytes), bootloader, config, credential...\n", .{kernel.len});
     const writes = .{
         .{ "/boot/kernel.elf", kernel },
         .{ "/EFI/BOOT/BOOTX64.EFI", bootx64 },
@@ -230,7 +226,6 @@ fn clone() void {
         return;
     }
 
-    serial.print("install: cloning {d} sectors (~{d} MiB) to the disk — this erases it...\n", .{ sectors, sectors / 2048 });
     // The system image is mostly empty ESP space (zeros). The target starts
     // blank (a freshly created disk is all zeros), so we skip all-zero chunks:
     // that turns a 64 MiB clone into the few MiB actually in use, which matters
@@ -249,9 +244,6 @@ fn clone() void {
             done += n;
         }
         lba += n;
-        if (lba % (CHUNK * 64) == 0 or lba == sectors) { // progress every ~8 MiB scanned
-            serial.print("install:   {d}/{d} sectors scanned ({d} written)\n", .{ lba, sectors, done });
-        }
     }
     serial.print("install: complete ({d} sectors written, the rest were blank).\n", .{done});
     serial.print("install: power off, remove the installer medium, and boot the disk.\n", .{});
