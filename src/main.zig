@@ -18,6 +18,7 @@ const console = @import("drivers/console.zig"); // on-screen framebuffer text co
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
 const mouse = @import("drivers/mouse.zig"); // PS/2 mouse (scroll wheel -> scrollback)
 const pci = @import("drivers/pci.zig"); // PCI bus enumeration (config mechanism #1)
+const ac97 = @import("drivers/ac97.zig"); // AC'97 audio (PCM playback over DMA)
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
@@ -294,6 +295,10 @@ export fn _start() noreturn {
     // Enumerate the PCI bus: discover every device and its class. The foundation
     // later drivers (audio, AHCI, NIC) use to find and configure their hardware.
     pci.init();
+
+    // AC'97 audio: find the codec (if any), bring it up, and play a short test
+    // tone over bus-master DMA. No-ops when the machine has no AC'97 device.
+    ac97.init();
 
     // Bring up the ATA PIO disk (block device). Probes the primary master; on a
     // machine without a legacy IDE disk (e.g. q35, or a disk-less boot) it simply
