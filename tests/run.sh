@@ -186,6 +186,22 @@ assert_in "$TMP/ata.log" "write/read-back last sector OK"        "ATA: PIO secto
 # disk attached, so the driver must report "no disk" there and still reach BOOT_OK).
 assert_in "$TMP/bios.log" "no device (floating bus" "ATA: disk-less boot reports no disk and continues"
 
+# --- AC'97 audio driver ------------------------------------------------------
+# The default boot has no audio device, so attach an AC'97 codec on q35 and check
+# the driver finds it, brings the codec ready, configures the mixer, and that the
+# bus-master DMA engine actually streams the test tone (the PICB position falls).
+echo "== AC'97 audio (-device AC97) =="
+timeout 15 qemu-system-x86_64 -M q35 -m 512M -cdrom "$ISO" \
+    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
+    -serial "file:$TMP/ac97.log" -display none -no-reboot >/dev/null 2>&1 || true
+assert_in "$TMP/ac97.log" "class 04.01"                          "AC97: PCI enum found a multimedia/audio controller"
+assert_in "$TMP/ac97.log" "[AC97]   codec ready=true"           "AC97: codec came ready out of cold reset"
+assert_in "$TMP/ac97.log" "DAC rate=48000 Hz"                   "AC97: mixer configured (VRA, 48 kHz DAC)"
+assert_in "$TMP/ac97.log" "[AC97]   playback started:"          "AC97: BDL programmed + bus-master DMA started"
+assert_in "$TMP/ac97.log" "self-test OK: DMA playback advanced" "AC97: DMA engine streamed the tone (PICB advanced)"
+# And confirm the audio-less default boot stays graceful (no device -> skip).
+assert_in "$TMP/bios.log" "no AC'97 device found"               "AC97: audio-less boot skips cleanly and continues"
+
 # --- FAT32 filesystem (read-only) --------------------------------------------
 # Format a FAT32 disk (mtools only — no root needed), seed known files including
 # a subdirectory and a long-name file, then boot and drive `ls`/`cat` to confirm
