@@ -207,6 +207,17 @@ pub fn currentId() usize {
 // interrupts disabled so the wakeup can't be lost between deciding to block and
 // blocking; on resume interrupts are still disabled and the caller re-enables.
 pub fn block() void {
+    blockTimeout(0);
+}
+
+// Like block(), but also wakes after `timeout` ticks if nothing wakes us sooner
+// (timeout 0 = block indefinitely). The timer's tick() readies us at the deadline,
+// and wake() readies us earlier; either way we resume just after the yield(). Same
+// contract as block(): the caller MUST hold interrupts disabled (so a wake can't be
+// lost between deciding to block and blocking), and we resume with them disabled.
+// The WaitQueue uses the timeout as a safety net against a missed device interrupt.
+pub fn blockTimeout(timeout: u64) void {
+    threads[current].wake_tick = if (timeout != 0) pic.ticks() + timeout else 0;
     threads[current].state = .blocked;
     yield();
 }
