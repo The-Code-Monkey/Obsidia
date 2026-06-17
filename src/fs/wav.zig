@@ -57,6 +57,17 @@ pub fn parse(reader: *fat32.FileReader) ?Format {
         var ck: [8]u8 = undefined;
         if (reader.read(&ck) != 8) break; // ran out of file
         const size = rd32(&ck, 4);
+        // How many file bytes remain past this chunk header. Every chunk's body is
+        // bounded by this — a malformed WAV can claim an absurd size (e.g.
+        // 0x7FFFFFFF) on a tiny file, and trusting it would make skip()/read() spin
+        // to EOF or hand a garbage length to the player. If the body genuinely
+        // can't fit in what's left, the file is corrupt: reject it (this covers
+        // "data" too, so a bogus data length is caught here rather than streamed).
+        const left = reader.bytesLeft();
+        if (size > left) {
+            serial.print("[WAV] chunk size exceeds file\n", .{});
+            return null;
+        }
         if (std.mem.eql(u8, ck[0..4], "fmt ")) {
             var fb: [16]u8 = undefined; // the common 16-byte PCM fmt body
             if (reader.read(&fb) != 16) return null;
@@ -72,7 +83,12 @@ pub fn parse(reader: *fat32.FileReader) ?Format {
                 serial.print("[WAV] unsupported: fmt={d} {d}-bit {d}ch (need 16-bit PCM, 1-2 ch)\n", .{ afmt, bits, ch });
                 return null;
             }
-            return .{ .channels = ch, .sample_rate = sr, .bits = bits, .data_bytes = size };
+            // Clamp the advertised data length to the bytes actually present, so
+            // playback (Stream.fill) can never read past EOF. After the `size > left`
+            // guard above this is `size`, but the @min keeps the invariant explicit
+            // and robust against any future relaxation of that guard.
+            const data_bytes = @min(size, left);
+            return .{ .channels = ch, .sample_rate = sr, .bits = bits, .data_bytes = data_bytes };
         } else {
             reader.skip(size + (size & 1)); // unknown chunk: skip body + pad byte
         }
