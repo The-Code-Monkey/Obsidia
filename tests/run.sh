@@ -47,6 +47,15 @@ trap 'rm -rf "$TMP" iso_root' EXIT
 
 command -v qemu-system-x86_64 >/dev/null || { echo "qemu-system-x86_64 not found"; exit 1; }
 
+# CPU model for every QEMU boot below. The kernel turns on SMEP/SMAP (CR4.20/21)
+# when CPUID advertises them, but QEMU's default TCG CPU (qemu64) does NOT expose
+# those bits — so we explicitly add +smep,+smap to exercise (and assert) that
+# path. This also proves SMAP doesn't break the ring-3/syscall flow: the only
+# kernel->user dereference (sysWrite) brackets itself with STAC/CLAC, every other
+# boot here runs with SMAP armed. Override with QEMU_CPU=... if needed.
+QEMU_CPU="${QEMU_CPU:-qemu64,+smep,+smap}"
+QEMU="qemu-system-x86_64 -cpu $QEMU_CPU"
+
 # --- Build -------------------------------------------------------------------
 echo "== Build + unit tests =="
 zig build              || { echo "kernel build failed"; exit 1; }
@@ -78,13 +87,13 @@ BOOT_WAIT="${BOOT_WAIT:-3}"
 # Capture a plain boot (no input) to a log file.
 boot_capture() { # boot_capture <log> <mem> [extra qemu args...]
     local log="$1" mem="$2"; shift 2
-    timeout 15 qemu-system-x86_64 -M q35 -m "$mem" "$@" -cdrom "$ISO" \
+    timeout 15 $QEMU -M q35 -m "$mem" "$@" -cdrom "$ISO" \
         -serial "file:$log" -display none -no-reboot >/dev/null 2>&1 || true
 }
 # Boot and feed the shell some input over serial, capturing output.
 boot_shell() { # boot_shell <log> <mem> <input> [extra qemu args...]
     local log="$1" mem="$2" input="$3"; shift 3
-    ( sleep "$BOOT_WAIT"; printf '%b' "$input"; sleep 2 ) | timeout 15 qemu-system-x86_64 \
+    ( sleep "$BOOT_WAIT"; printf '%b' "$input"; sleep 2 ) | timeout 15 $QEMU \
         -M q35 -m "$mem" "$@" -cdrom "$ISO" \
         -chardev stdio,id=c0,logfile="$log",signal=off -serial chardev:c0 \
         -display none -no-reboot >/dev/null 2>&1 || true
@@ -105,6 +114,8 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[PMM] Physical memory manager initialized." "$p PMM init"
     assert_in "$log" "free-count restored: true"                  "$p PMM self-test (alloc/free)"
     assert_in "$log" "[VMM] Virtual memory manager initialized."  "$p VMM init"
+    assert_in "$log" "[CPU] SMEP enabled"                         "$p CPU SMEP enabled (CR4.SMEP)"
+    assert_in "$log" "[CPU] SMAP enabled"                         "$p CPU SMAP enabled (CR4.SMAP)"
     assert_in "$log" "HHDM alias of that frame agrees: OK"        "$p VMM self-test (mapping)"
     assert_in "$log" "W^X enforced: OK"                           "$p W^X enforced"
     assert_in "$log" "uncacheable-MMIO self-test: round-trip OK, PCD set" "$p VMM: uncacheable MMIO mapping (PCD/UC)"
@@ -176,7 +187,7 @@ echo "== ATA PIO disk (i440fx / -M pc) =="
 ATADISK="$TMP/ata.img"
 truncate -s 16M "$ATADISK"
 printf 'OBSIDIA_ATA_OK\0\0' | dd of="$ATADISK" conv=notrunc bs=1 count=16 2>/dev/null
-timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+timeout 15 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
     -drive file="$ATADISK",format=raw,if=ide \
     -serial "file:$TMP/ata.log" -display none -no-reboot >/dev/null 2>&1 || true
 assert_in "$TMP/ata.log" "primary master present: 32768 sectors" "ATA: detects disk size via IDENTIFY (16 MiB)"
@@ -192,7 +203,7 @@ assert_in "$TMP/bios.log" "no device (floating bus" "ATA: disk-less boot reports
 # the driver finds it, brings the codec ready, configures the mixer, and that the
 # bus-master DMA engine actually streams the test tone (the PICB position falls).
 echo "== AC'97 audio (-device AC97) =="
-timeout 15 qemu-system-x86_64 -M q35 -m 512M -cdrom "$ISO" \
+timeout 15 $QEMU -M q35 -m 512M -cdrom "$ISO" \
     -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
     -serial "file:$TMP/ac97.log" -display none -no-reboot >/dev/null 2>&1 || true
 assert_in "$TMP/ac97.log" "class 04.01"                          "AC97: PCI enum found a multimedia/audio controller"
@@ -348,7 +359,7 @@ evil_cmd=""; [ "$HAVE_EVIL" -eq 1 ] && evil_cmd="exec /EVIL.ELF\r"
   [ -n "$elf_cmd" ] && { printf '%b' "$elf_cmd"; sleep 1; }; \
   [ -n "$evil_cmd" ] && { printf '%b' "$evil_cmd"; sleep 1; }; \
   printf 'exec /INIT\r'; sleep 1; printf 'exec0 /INIT0\r'; sleep 1 ) \
-    | timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+    | timeout 15 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$FATDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/fat.log",signal=off -serial chardev:c0 \
       -display none -no-reboot >/dev/null 2>&1 || true
@@ -397,7 +408,7 @@ mcopy -i "$FATDISK" "$TMP/st48.wav" ::/st48.wav
 mcopy -i "$FATDISK" "$TMP/mono44.wav" ::/mono44.wav
 mcopy -i "$FATDISK" "$TMP/bad.wav" ::/bad.wav
 pfifo="$TMP/play.in"; rm -f "$pfifo"; mkfifo "$pfifo"
-qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+$QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
     -drive file="$FATDISK",format=raw,if=ide \
     -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
     -chardev stdio,id=c0,logfile="$TMP/play.log",signal=off -serial chardev:c0 \
@@ -514,7 +525,7 @@ mmd -i "$WRDISK" ::/docs 2>/dev/null
   printf 'edit note.txt\r'; sleep 0.8; printf 'harness editor write\r'; sleep 0.4; \
   printf '\x13'; sleep 0.8; printf '\x18'; sleep 0.5; \
   printf 'cat note.txt\r'; sleep 0.8 ) \
-    | timeout 20 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+    | timeout 20 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$WRDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/wr.log",signal=off -serial chardev:c0 \
       -display none -no-reboot >/dev/null 2>&1 || true
@@ -552,7 +563,7 @@ zig run tools/mkpasswd.zig -- root hunter2 > "$TMP/authline" 2>/dev/null
 mcopy -i "$LOGINDISK" "$TMP/authline" ::/OBSIDIA/AUTH
 ( sleep "$BOOT_WAIT"; printf 'root\r'; sleep 1; printf 'wrongpw\r'; sleep 8; \
   printf 'root\r'; sleep 1; printf 'hunter2\r'; sleep 8; printf 'mem\r'; sleep 3 ) \
-    | timeout 90 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+    | timeout 90 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$LOGINDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/login.log",signal=off -serial chardev:c0 \
       -display none -no-reboot >/dev/null 2>&1 || true
@@ -585,7 +596,7 @@ echo "== Full-system sleep (sleep) =="
 # live, so virtual time (and the LAPIC tick count) advances during the halt
 # regardless of the mask, making any wall-clock freeze comparison meaningless here.
 sfifo="$TMP/sleep.in"; rm -f "$sfifo"; mkfifo "$sfifo"
-timeout 30 qemu-system-x86_64 -M q35 -m 512M -cdrom "$ISO" \
+timeout 30 $QEMU -M q35 -m 512M -cdrom "$ISO" \
     -chardev stdio,id=c0,logfile="$TMP/sleep.log",signal=off -serial chardev:c0 \
     -display none -no-reboot < "$sfifo" >/dev/null 2>&1 &
 spid=$!
@@ -602,13 +613,13 @@ assert_in "$TMP/sleep.log" "awake."       "sleep: a keypress wakes it"
 echo "== Power commands =="
 
 # shutdown: QEMU should power off (qemu exits cleanly, not killed by timeout=124).
-( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 15 qemu-system-x86_64 \
+( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 15 $QEMU \
     -M q35 -m 512M -cdrom "$ISO" -chardev stdio,id=c0,signal=off -serial chardev:c0 \
     -display none -no-reboot >/dev/null 2>&1
 if [ "$?" -ne 124 ]; then ok "shutdown: machine powered off"; else bad "shutdown: qemu did not exit"; fi
 
 # restart: WITHOUT -no-reboot, the reset reboots and the kernel runs a 2nd time.
-( sleep "$BOOT_WAIT"; printf 'restart\r'; sleep 4 ) | timeout 15 qemu-system-x86_64 \
+( sleep "$BOOT_WAIT"; printf 'restart\r'; sleep 4 ) | timeout 15 $QEMU \
     -M q35 -m 512M -cdrom "$ISO" -chardev stdio,id=c0,logfile="$TMP/restart.log",signal=off \
     -serial chardev:c0 -display none >/dev/null 2>&1 || true
 boots=$(grep -ac "Kernel entered _start" "$TMP/restart.log")
@@ -618,7 +629,7 @@ if [ "$boots" -ge 2 ]; then ok "restart: machine rebooted (booted ${boots}x)"; e
 if command -v socat >/dev/null && command -v convert >/dev/null; then
     echo "== Framebuffer render =="
     sock="$TMP/mon.sock"; ppm="$TMP/fb.ppm"
-    ( sleep "$((BOOT_WAIT + 2))" ) | qemu-system-x86_64 -M q35 -m 512M -vga std -cdrom "$ISO" \
+    ( sleep "$((BOOT_WAIT + 2))" ) | $QEMU -M q35 -m 512M -vga std -cdrom "$ISO" \
         -monitor "unix:$sock,server,nowait" \
         -chardev stdio,id=c0,signal=off -serial chardev:c0 \
         -display none -no-reboot >/dev/null 2>&1 &
@@ -651,7 +662,7 @@ if command -v socat >/dev/null && command -v convert >/dev/null && command -v co
     sock="$TMP/sb.sock"; before="$TMP/sb_before.ppm"; after="$TMP/sb_after.ppm"
     log="$TMP/scroll.log"; fifo="$TMP/sb.in"
     rm -f "$fifo"; mkfifo "$fifo"
-    qemu-system-x86_64 -M q35 -m 512M -vga std -cdrom "$ISO" \
+    $QEMU -M q35 -m 512M -vga std -cdrom "$ISO" \
         -chardev stdio,id=c0,logfile="$log",signal=off -serial chardev:c0 \
         -monitor "unix:$sock,server,nowait" \
         -display none -no-reboot <"$fifo" >/dev/null 2>&1 &
@@ -714,7 +725,7 @@ if xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
     truncate -s 64M "$CDISK"
 
     cfifo="$TMP/c.in"; rm -f "$cfifo"; mkfifo "$cfifo"
-    timeout 240 qemu-system-x86_64 -M pc -m 2G -boot d -cdrom "$CISO" \
+    timeout 240 $QEMU -M pc -m 2G -boot d -cdrom "$CISO" \
         -drive file="$CDISK",format=raw,if=ide \
         -chardev stdio,id=c0,logfile="$TMP/construct.log",signal=off -serial chardev:c0 \
         -display none -no-reboot < "$cfifo" >/dev/null 2>&1 &
@@ -745,7 +756,7 @@ if xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
     # Boot the constructed disk under UEFI and log in (the real proof it boots).
     if [ "${#uefi_args[@]}" -gt 0 ]; then
         bfifo="$TMP/b.in"; rm -f "$bfifo"; mkfifo "$bfifo"
-        timeout 150 qemu-system-x86_64 -M pc "${uefi_args[@]}" -m 2G -boot c \
+        timeout 150 $QEMU -M pc "${uefi_args[@]}" -m 2G -boot c \
             -drive file="$CDISK",format=raw,if=ide \
             -chardev stdio,id=c0,logfile="$TMP/construct_boot.log",signal=off -serial chardev:c0 \
             -display none -no-reboot < "$bfifo" >/dev/null 2>&1 &
