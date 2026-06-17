@@ -49,6 +49,18 @@ pub inline fn outl(port: u16, data: u32) void {
     );
 }
 
+// Read one 16-bit word from an I/O port and return it. AC'97 talks to its codec
+// mixer and several bus-master registers (status, position-in-buffer) in 16-bit
+// units, so its driver reads them through this.
+pub inline fn inw(port: u16) u16 {
+    var data: u16 = undefined; // destination for the word we read
+    asm volatile ("inw %dx, %ax"
+        : [data] "={ax}" (data), // capture AX into `data`
+        : [port] "{dx}" (port), // port number goes in DX
+    );
+    return data; // hand the word back to the caller
+}
+
 // Read one 32-bit dword from an I/O port and return it (the PCI config data port).
 pub inline fn inl(port: u16) u32 {
     var data: u32 = undefined; // destination for the dword we read
