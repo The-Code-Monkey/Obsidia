@@ -365,6 +365,13 @@ const PF_X: u32 = 1; // p_flags: segment is executable
 const PF_W: u32 = 2; // p_flags: segment is writable
 // PF_R (4) is implied for everything we map; we never make a page unreadable.
 
+// First address ABOVE the canonical low half (user space): every user mapping
+// must lie strictly below it. Mirrors USER_LIMIT in src/arch/syscall.zig, which
+// guards syscall buffers — here it guards where a PT_LOAD segment may land, so a
+// crafted ELF can never map a segment over the kernel/HHDM (ring 0) or over the
+// kernel half of a process space (ring 3).
+const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+
 const ET_EXEC: u16 = 2; // a position-DEPENDENT executable (fixed load addresses)
 const ET_DYN: u16 = 3; // a position-INDEPENDENT executable / shared object
 const EM_X86_64: u16 = 62; // the machine type for x86-64
@@ -422,9 +429,19 @@ fn loadElf(file: []const u8) ?u64 {
         serial.print("[LOADER]   ELF rejected: bad program header table ({d} x {d} bytes).\n", .{ e_phnum, e_phentsize });
         return null;
     }
-    // The whole program header table must lie within the file we read.
-    const phtab_end = e_phoff + @as(u64, e_phnum) * @as(u64, e_phentsize);
-    if (phtab_end > file.len) {
+    // The whole program header table must lie within the file we read. Compute
+    // its byte span with OVERFLOW-SAFE math (*%, +%) so a crafted e_phoff/e_phnum
+    // can't wrap past file.len and slip the bounds check: if the table size itself
+    // overflows a u64, or e_phoff + size wraps below e_phoff, the file is bogus.
+    const phtab_size = @as(u64, e_phnum) *% @as(u64, e_phentsize); // entries * entry size
+    if (phtab_size / @as(u64, e_phnum) != @as(u64, e_phentsize)) {
+        // size * count overflowed u64 — impossible for a real table, so reject.
+        // (e_phnum != 0 was already established above, so the divide is safe.)
+        serial.print("[LOADER]   ELF rejected: program header table size overflows.\n", .{});
+        return null;
+    }
+    const phtab_end = e_phoff +% phtab_size; // first byte past the table
+    if (phtab_end < e_phoff or phtab_end > file.len) { // wrapped, or runs past EOF
         serial.print("[LOADER]   ELF rejected: program headers run past end of file.\n", .{});
         return null;
     }
@@ -461,13 +478,45 @@ fn loadElf(file: []const u8) ?u64 {
         const p_filesz = rd64(phdr, 32); // how many bytes come from the file
         const p_memsz = rd64(phdr, 40); // total in-memory size (>= filesz; tail is .bss)
 
+        // --- Bounds-check the segment's virtual range BEFORE mapping anything ---
+        // A crafted ELF can name any p_vaddr; without this, loadElf() would map a
+        // segment wherever the header says — potentially over the kernel image,
+        // the HHDM, or (in a process space) the shared kernel half. Reject any
+        // segment whose [p_vaddr, p_vaddr+p_memsz) range escapes user space.
+        const seg_end_check = p_vaddr +% p_memsz; // exclusive end (overflow-safe add)
+        if (seg_end_check < p_vaddr) { // the add wrapped: p_memsz pushed past u64 max
+            serial.print("[LOADER]   ELF rejected: segment {d} address range overflows.\n", .{ph});
+            teardown();
+            return null;
+        }
+        if (target_space != 0) {
+            // Ring 3: the whole segment must live STRICTLY in the low (user) half.
+            // p_vaddr below the limit and the exclusive end at-or-below it keeps
+            // the entire range in user space (slot 0..255).
+            if (!(p_vaddr < USER_LIMIT and seg_end_check <= USER_LIMIT)) {
+                serial.print("[LOADER]   ELF rejected: segment {d} vaddr 0x{x} outside user space.\n", .{ ph, p_vaddr });
+                teardown();
+                return null;
+            }
+        } else {
+            // Ring 0: a kernel image must live in the higher half. A segment whose
+            // vaddr falls in the user range is a user binary mislabeled for kernel
+            // execution — reject it rather than run user code at ring 0.
+            if (p_vaddr < USER_LIMIT) {
+                serial.print("[LOADER]   ELF rejected: segment {d} vaddr 0x{x} is in the user half (ring-0 load).\n", .{ ph, p_vaddr });
+                teardown();
+                return null;
+            }
+        }
+
         if (p_memsz == 0) continue; // an empty segment maps nothing
         if (p_memsz < p_filesz) { // a malformed header — bss can't be negative
             serial.print("[LOADER]   ELF rejected: segment {d} has memsz < filesz.\n", .{ph});
             teardown();
             return null;
         }
-        if (p_offset + p_filesz > file.len) { // its file bytes must be present
+        const file_end = p_offset +% p_filesz; // overflow-safe end of the file region
+        if (file_end < p_offset or file_end > file.len) { // wrapped, or past EOF
             serial.print("[LOADER]   ELF rejected: segment {d} file bytes past end of file.\n", .{ph});
             teardown();
             return null;
@@ -478,7 +527,12 @@ fn loadElf(file: []const u8) ?u64 {
         // containing the last byte. `delta` is how far p_vaddr sits into its
         // first page — the file bytes start there, not at the page boundary.
         const seg_start = pageDown(p_vaddr);
-        const seg_end = p_vaddr + p_memsz; // exclusive
+        const seg_end = p_vaddr + p_memsz; // exclusive (overflow already ruled out above)
+        if (seg_end < seg_start) { // belt-and-braces: never compute a wrapped page count
+            serial.print("[LOADER]   ELF rejected: segment {d} page range overflows.\n", .{ph});
+            teardown();
+            return null;
+        }
         const npages = (seg_end - seg_start + PAGE_SIZE - 1) / PAGE_SIZE;
         if (mapped_count + npages > MAX_PAGES) {
             serial.print("[LOADER]   ELF rejected: segment {d} exceeds the {d}-page cap.\n", .{ ph, MAX_PAGES });

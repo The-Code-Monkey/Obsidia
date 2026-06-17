@@ -265,6 +265,53 @@ LDS
     [ -s "$out" ]   # success only if a non-empty ELF was produced
 }
 
+# make_evil_elf <file> : build an OUT-OF-BOUNDS ELF whose first PT_LOAD segment is
+# linked AT USER_LIMIT (0x0000_8000_0000_0000) — the first address above the user
+# half. A correct loader must REFUSE to map it (the segment would escape user
+# space and could land over the kernel half); a buggy loader would map and run it.
+# Same freestanding-asm program as make_init_elf, but its marker is distinct so we
+# can assert it NEVER prints (i.e. the evil code never executed). Returns non-zero
+# (leaving "$1" absent) if the toolchain can't build it, so the caller can skip.
+make_evil_elf() {
+    local out="$1" d
+    d=$(mktemp -d) || return 1
+    cat > "$d/evil.s" <<'ASM'
+# Same write()+exit() init, but with a marker that proves it ran if it ever does.
+.section .text
+.global _start
+_start:
+    movl    $1, %eax                # SYS_write
+    movl    $1, %edi                # fd = 1 (stdout)
+    lea     msg(%rip), %rsi         # rsi = &msg (RIP-relative)
+    movl    $(msg_end - msg), %edx  # len
+    syscall                         # write(1, msg, len)
+    movl    $3, %eax                # SYS_exit
+    xorl    %edi, %edi              # code = 0
+    syscall                         # exit(0)
+1:  jmp     1b
+.section .rodata
+msg:
+    .ascii  "EVIL.ELF: out-of-bounds segment RAN!\n"
+msg_end:
+ASM
+    # Linker script: place .text at USER_LIMIT itself, so the first PT_LOAD's
+    # p_vaddr == 0x0000_8000_0000_0000 — at/above the user limit. The loader's
+    # ring-3 bounds check (p_vaddr < USER_LIMIT) must reject this.
+    cat > "$d/evil.ld" <<'LDS'
+ENTRY(_start)
+SECTIONS {
+    . = 0x800000000000;
+    .text   : { *(.text*) }
+    . = ALIGN(0x1000);
+    .rodata : { *(.rodata*) }
+}
+LDS
+    zig cc -target x86_64-freestanding-none -nostdlib -c "$d/evil.s" -o "$d/evil.o" 2>/dev/null || { rm -rf "$d"; return 1; }
+    zig ld.lld -o "$out" -T "$d/evil.ld" --static -z max-page-size=0x1000 "$d/evil.o" 2>/dev/null || { rm -rf "$d"; return 1; }
+    rm -rf "$d"
+    [ -s "$out" ]   # success only if a non-empty ELF was produced
+}
+
 fattmp=$(mktemp)
 printf 'Hello from FAT32 on Obsidia!\n' > "$fattmp"; mcopy -i "$FATDISK" "$fattmp" ::/HELLO.TXT
 mmd -i "$FATDISK" ::/docs 2>/dev/null
@@ -285,11 +332,20 @@ HAVE_ELF=0
 if make_init_elf "$fattmp"; then mcopy -i "$FATDISK" "$fattmp" ::/INIT.ELF; HAVE_ELF=1; else
     echo "  (note: could not build /INIT.ELF with the zig toolchain; ELF-path checks will be skipped)"
 fi
+# Seed the OUT-OF-BOUNDS "evil" ELF too (only meaningful if the ELF path works).
+# Driving `exec /EVIL.ELF` proves the loader's vaddr bounds check rejects a
+# segment that would escape user space. Tied to HAVE_ELF since it shares the path.
+HAVE_EVIL=0
+if [ "$HAVE_ELF" -eq 1 ] && make_evil_elf "$fattmp"; then mcopy -i "$FATDISK" "$fattmp" ::/EVIL.ELF; HAVE_EVIL=1; else
+    [ "$HAVE_ELF" -eq 1 ] && echo "  (note: could not build /EVIL.ELF; the out-of-bounds rejection check will be skipped)"
+fi
 rm -f "$fattmp"
 elf_cmd=""; [ "$HAVE_ELF" -eq 1 ] && elf_cmd="exec /INIT.ELF\r"
+evil_cmd=""; [ "$HAVE_EVIL" -eq 1 ] && evil_cmd="exec /EVIL.ELF\r"
 ( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
   printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 0.4; \
   [ -n "$elf_cmd" ] && { printf '%b' "$elf_cmd"; sleep 1; }; \
+  [ -n "$evil_cmd" ] && { printf '%b' "$evil_cmd"; sleep 1; }; \
   printf 'exec /INIT\r'; sleep 1; printf 'exec0 /INIT0\r'; sleep 1 ) \
     | timeout 15 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$FATDISK",format=raw,if=ide \
@@ -398,6 +454,21 @@ if [ "$HAVE_ELF" -eq 1 ]; then
     # Re-runnable: boot self-test + shell `exec /INIT.ELF` = >=2 ELF runs.
     elfs=$(grep -ac "INIT.ELF: hello from a real ELF!" "$TMP/fat.log")
     if [ "$elfs" -ge 2 ]; then ok "init(elf): re-runnable (boot self-test + shell exec = ${elfs} runs)"; else bad "init(elf): expected >=2 runs (boot + shell exec), saw ${elfs}"; fi
+
+    # Out-of-bounds ELF (shell `exec /EVIL.ELF`): a crafted ELF whose first PT_LOAD
+    # is linked AT USER_LIMIT, so its segment would escape the user half. The loader
+    # MUST reject it at the bounds check and the evil code MUST never execute. We
+    # assert BOTH: the rejection marker appears, AND the evil marker never does.
+    if [ "$HAVE_EVIL" -eq 1 ]; then
+        assert_in "$TMP/fat.log" "ELF rejected: segment"             "init(elf): out-of-bounds PT_LOAD vaddr is rejected (bounds check)"
+        if grep -qaF -- "EVIL.ELF: out-of-bounds segment RAN!" "$TMP/fat.log"; then
+            bad "init(elf): SECURITY — the out-of-bounds ELF executed (loader mapped it)"
+        else
+            ok "init(elf): the out-of-bounds ELF never ran (its marker is absent)"
+        fi
+    else
+        echo "  (skipping out-of-bounds ELF rejection check: /EVIL.ELF unavailable)"
+    fi
 else
     echo "  (skipping ELF-path checks: toolchain could not build /INIT.ELF)"
 fi
