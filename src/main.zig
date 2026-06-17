@@ -25,6 +25,7 @@ const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
+const kstack = @import("sched/kstack.zig"); // guarded kernel-stack region (init before address-space clones)
 const usermode = @import("arch/usermode.zig"); // ring 3 (user mode) entry
 const syscall = @import("arch/syscall.zig"); // syscall/sysret ABI (STAR/LSTAR/SFMASK)
 const install = @import("install.zig"); // in-guest installer (clones the system image)
@@ -272,6 +273,12 @@ export fn _start() noreturn {
     // Pass the kernel's physical + virtual load base (so we can re-map it) and
     // the HHDM offset (so we can re-map all of physical RAM).
     vmm.init(exec_resp.physical_base, exec_resp.virtual_base, hhdm_resp.offset);
+
+    // Build the guarded kernel-stack region's page-table path now — BEFORE any
+    // per-process address space is cloned (createAddressSpace copies the kernel
+    // half by PML4 entry), so every process inherits the shared subtree the kernel
+    // stacks live in (a process traps/syscalls onto one while its own CR3 is live).
+    kstack.init();
 
     // Now that we run on OUR page tables (kernel pages S=0, user pages U=1),
     // turn on SMEP/SMAP: ring 0 can no longer execute (SMEP) or read/write
