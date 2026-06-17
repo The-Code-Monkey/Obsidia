@@ -62,9 +62,10 @@ pub fn disable() void {
 }
 
 // Re-route every already-registered IRQ through the new route_hook (the APIC).
+// A line counts as "registered" if it has at least one handler in its chain.
 pub fn rerouteRegistered() void {
-    for (handlers, 0..) |h, i| {
-        if (h != null) {
+    for (handlers, 0..) |line, i| {
+        if (line.count != 0) {
             if (route_hook) |f| f(@intCast(i));
         }
     }
@@ -146,13 +147,46 @@ fn timerTick() void {
 }
 
 // --- IRQ dispatch ------------------------------------------------------------
+// SHARED, LEVEL-TRIGGERED IRQ LINES. On real PC hardware (and QEMU's PCI bus)
+// several devices commonly wire their interrupt to ONE physical IRQ line — e.g.
+// an audio controller and a NIC may both assert PIRQ-routed IRQ11. The line is
+// level-triggered: it stays asserted as long as ANY sharer has an interrupt
+// pending. So a single line needs a CHAIN of handlers, not just one. The old
+// design kept exactly one handler per line and overwrote it on the second
+// register(), silently disabling the first device. We now keep a small fixed-
+// size array per line and, on each interrupt, call EVERY registered handler.
+//
+// The shared-IRQ contract: each device handler reads its own status register
+// first; if its device didn't raise this interrupt it returns immediately
+// (a cheap no-op). Calling all handlers is therefore correct and safe — the
+// one device that did assert the line clears its condition (de-asserting the
+// level), and the bystanders do nothing. We cannot tell from the PIC alone
+// WHICH sharer fired, so "call everyone" is the standard, only-correct policy.
 const IrqHandler = *const fn () void; // a handler is just a function pointer
-var handlers: [16]?IrqHandler = [_]?IrqHandler{null} ** 16; // one slot per IRQ line
+const MAX_SHARERS: usize = 4; // up to 4 devices may share a single IRQ line
 
-// Register a handler for an IRQ line and unmask it. With the APIC active, the
-// unmask happens at the I/O APIC (route_hook); otherwise at the PIC.
+// One IRQ line: a fixed array of handlers plus how many are populated. Fixed
+// size keeps us allocator-free (this runs before the heap exists) and bounds
+// the per-interrupt dispatch work.
+const IrqLine = struct {
+    chain: [MAX_SHARERS]?IrqHandler = [_]?IrqHandler{null} ** MAX_SHARERS,
+    count: usize = 0, // number of valid entries in `chain` (always packed [0..count))
+};
+var handlers: [16]IrqLine = [_]IrqLine{.{}} ** 16; // one chain per IRQ line
+
+// Register (APPEND) a handler for an IRQ line and unmask it. Multiple calls for
+// the same line stack onto the chain rather than overwriting, so shared-line
+// devices coexist. With the APIC active, the unmask happens at the I/O APIC
+// (route_hook); otherwise at the PIC. Re-unmasking an already-unmasked line on
+// the second sharer is harmless and idempotent.
 pub fn register(irq: u4, handler: IrqHandler) void {
-    handlers[irq] = handler; // remember the handler
+    const line = &handlers[irq];
+    if (line.count >= MAX_SHARERS) { // chain full: refuse rather than clobber a sharer
+        serial.print("[PIC] IRQ{d} sharer chain full ({d}); handler dropped.\n", .{ irq, MAX_SHARERS });
+        return;
+    }
+    line.chain[line.count] = handler; // append at the end of the packed chain
+    line.count += 1; // grow the chain
     if (route_hook) |f| f(irq) else clearMask(irq); // let the IRQ through
 }
 
@@ -177,10 +211,20 @@ pub fn handleIrq(vector: u8) void {
     // wouldn't deliver the next interrupt to the thread we switch to.
     eoi(irq);
 
-    if (handlers[irq]) |h| { // do we have a handler?
-        h(); // run it (may not return here if it preempts us)
-    } else {
+    // Dispatch to EVERY registered sharer on this line. Each handler checks its
+    // own device's status and returns fast if the interrupt wasn't theirs, so
+    // running all of them is the correct shared-line behavior. We read `count`
+    // once into a local: a handler may context-switch away (the timer's
+    // preemption hook), and we want a stable bound over the loop.
+    const line = &handlers[irq];
+    const n = line.count;
+    if (n == 0) {
         serial.print("[PIC] Unhandled IRQ{d} (vector {d}).\n", .{ irq, vector });
+        return;
+    }
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (line.chain[i]) |h| h(); // run each sharer (one of them may preempt us)
     }
 }
 
