@@ -614,6 +614,13 @@ else bad "RTC: boot marker time is malformed"; fi
 if grep -qaE '20[0-9][0-9]-[0-1][0-9]-[0-3][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9] UTC' "$TMP/shell.log"; then
     ok "shell: date printed a plausible YYYY-MM-DD HH:MM:SS UTC line"
 else bad "shell: date did not print a well-formed timestamp"; fi
+# `uptime` is now wall-clock-aware: besides the elapsed-seconds line, it prints the
+# boot wall-clock ("up since: ...") captured at init(). Assert that line is present
+# and carries a well-formed timestamp. (`uptime` is driven in the shell sequence
+# above; the existing "ticks @ 100 Hz" assertion still guards the elapsed line.)
+if grep -qaE 'up since: 20[0-9][0-9]-[0-1][0-9]-[0-3][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9] UTC' "$TMP/shell.log"; then
+    ok "shell: uptime printed an 'up since' wall-clock line (RTC boot time)"
+else bad "shell: uptime did not print a well-formed 'up since' timestamp"; fi
 
 # --- Login (scrypt) ----------------------------------------------------------
 # Seed a disk with /OBSIDIA/AUTH (root:hunter2), then drive a WRONG password

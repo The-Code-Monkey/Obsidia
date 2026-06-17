@@ -181,10 +181,24 @@ pub fn printDateTime(dt: DateTime) void {
     });
 }
 
-// Boot marker: read the RTC once and log the current wall-clock time. Purely
-// informational — the driver has no hardware to set up, the RTC is always running.
+// The wall-clock instant captured at boot, recorded once by init(). We keep it so
+// commands like `uptime` can report when the system came up, not just how long
+// it's been running. Zero-initialized; init() overwrites it before anything reads
+// it (init runs at boot, long before the shell is interactive).
+var boot_time: DateTime = .{ .year = 0, .month = 0, .day = 0, .hour = 0, .minute = 0, .second = 0 };
+
+// Read back the wall-clock time that was captured when the system booted. Callers
+// use this together with now() to show an "up since ... / now ..." span.
+pub fn bootTime() DateTime {
+    return boot_time;
+}
+
+// Boot marker: read the RTC once, remember it as the boot wall-clock, and log it.
+// Purely informational otherwise — the driver has no hardware to set up, the RTC
+// is always running.
 pub fn init() void {
     const dt = now();
+    boot_time = dt; // record the moment of boot for later (e.g. `uptime`)
     serial.print("[RTC] RTC initialized: ", .{});
     printDateTime(dt);
     serial.print("\n", .{});
