@@ -484,9 +484,15 @@ fn execute(raw: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "date")) { // current wall-clock time from the RTC
         rtc.printDateTime(rtc.now()); // read + format "YYYY-MM-DD HH:MM:SS UTC"
         serial.print("\n", .{});
-    } else if (std.mem.eql(u8, cmd, "uptime")) { // seconds since boot
+    } else if (std.mem.eql(u8, cmd, "uptime")) { // seconds since boot + wall-clock span
         const t = pic.ticks(); // 100 Hz tick counter
         serial.print("uptime: {d}.{d:0>2}s ({d} ticks @ 100 Hz)\n", .{ t / 100, t % 100, t });
+        serial.print("up since: ", .{}); // the wall-clock instant captured at boot
+        rtc.printDateTime(rtc.bootTime()); // "YYYY-MM-DD HH:MM:SS UTC"
+        serial.print("\n", .{});
+        serial.print("now:      ", .{}); // the current wall-clock time, for comparison
+        rtc.printDateTime(rtc.now()); // "YYYY-MM-DD HH:MM:SS UTC"
+        serial.print("\n", .{});
     } else if (std.mem.eql(u8, cmd, "crash")) { // demo the IDT crash dump
         serial.print("triggering a page fault to demo the crash dump...\n", .{});
         const bad: *volatile u8 = @ptrFromInt(0xdeadbeef); // unmapped address (u8 = no alignment requirement)
