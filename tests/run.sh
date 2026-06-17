@@ -325,6 +325,11 @@ waitfor "play: streamed|no such file|no audio" "$TMP/play.log" "$ppid"
 exec 6>&-; sleep 0.3; kill $ppid 2>/dev/null; wait $ppid 2>/dev/null
 assert_in "$TMP/play.log" "play: streamed 131072 bytes of /sound.pcm"          "AC97: play streamed the whole PCM file from FAT32"
 assert_in "$TMP/play.log" "[AC97] play: streamed 131072 bytes (32768 frames)"  "AC97: DMA ring refilled across the file (frame count)"
+assert_in "$TMP/play.log" "interrupt line IRQ"                                 "AC97: hooked the device's PCI interrupt line"
+# Playback must be interrupt-driven: the completion IRQ fires once per buffer, so
+# a multi-buffer file yields several. Assert the count is non-zero (not polled).
+pirqs=$(grep -aoE "[0-9]+ completion IRQ" "$TMP/play.log" | grep -oE "^[0-9]+" | head -1)
+if [ "${pirqs:-0}" -ge 1 ]; then ok "AC97: playback was interrupt-driven (${pirqs} completion IRQs)"; else bad "AC97: no completion IRQs (playback fell back to polling)"; fi
 
 # --- Init loader (ELF64 + flat binary off the FAT32 disk) ---------------------
 # Stage 5: the loader runs an init binary as a real RING-3 PROCESS — its own
