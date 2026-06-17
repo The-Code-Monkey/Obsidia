@@ -138,6 +138,10 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[PCI] Enumeration complete:"               "$p PCI: bus enumeration completed (config mechanism #1)"
     assert_in "$log" "class 01.06 prog-if 01"                    "$p PCI: decoded the AHCI controller (class/subclass/prog-if)"
     assert_in "$log" "BAR5: MMIO32"                              "$p PCI: decoded + sized a device BAR (MMIO)"
+    assert_in "$log" "[DMA] DMA buffer allocator initialized."   "$p DMA: contiguous <4 GiB buffer allocator init"
+    assert_in "$log" "aligned=true nonzero=true below-4G=true"   "$p DMA: buffer page-aligned, nonzero, 32-bit-addressable"
+    assert_in "$log" "contiguous=true hhdm-round-trip=true"      "$p DMA: frames contiguous + HHDM alias round-trips"
+    assert_in "$log" "[DMA]     freed; free-count restored: true" "$p DMA: free returns the whole run (no leak)"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
