@@ -385,8 +385,14 @@ pub fn selfTestAddressSpace() void {
     asm volatile ("cli");
     switchTo(as);
     const p: *volatile u64 = @ptrFromInt(va);
+    // `va` is mapped U=1, so a ring-0 access to it is exactly what SMAP blocks.
+    // This self-test legitimately writes through a user mapping, so lift the
+    // guard (STAC) for the access and re-arm it (CLAC) right after — mirroring
+    // the syscall write path. Without this, SMAP #PFs on `p.* = MAGIC`.
+    asm volatile ("stac");
     p.* = MAGIC;
     const readback = p.*;
+    asm volatile ("clac");
     switchTo(pml4_phys); // back to the kernel address space
     asm volatile ("sti");
 
