@@ -108,14 +108,10 @@ pub fn enableSmepSmap() void {
     if (has_smep) {
         cr4 |= CR4_SMEP;
         serial.print("[CPU] SMEP enabled\n", .{});
-    } else {
-        serial.print("[CPU] SMEP not supported\n", .{});
     }
     if (has_smap) {
         cr4 |= CR4_SMAP;
         serial.print("[CPU] SMAP enabled\n", .{});
-    } else {
-        serial.print("[CPU] SMAP not supported\n", .{});
     }
     writeCr4(cr4);
 }

@@ -359,7 +359,6 @@ fn verifyWX(pml4: [*]u64) void {
     const data_x = data & NX == 0;
     const hhdm_x = hhdm & NX == 0;
 
-    serial.print("[VMM]   W^X: .text(x={},w={}) .rodata(x={}) .data(x={}) hhdm(x={})\n", .{ text_x, text_w, rodata_x, data_x, hhdm_x });
     // Ideal: .text executable & not writable; everything else non-executable.
     const ok = text_x and !text_w and !rodata_x and !data_x and !hhdm_x;
     serial.print("[VMM]   W^X enforced: {s}\n", .{if (ok) "OK" else "FAIL"});
@@ -367,20 +366,14 @@ fn verifyWX(pml4: [*]u64) void {
 
 // --- Self-test: prove our live tables translate correctly --------------------
 fn selfTest(pml4: [*]u64) void {
-    serial.print("[VMM]   Self-test: mapping a scratch page...\n", .{});
     const scratch: u64 = 0xffffffffd0000000; // unused higher-half address
-    const frame = pmm.allocZeroed() orelse { // a physical frame to back it
-        serial.print("[VMM]     FAILED: no frame for scratch page\n", .{});
-        return;
-    };
+    const frame = pmm.allocZeroed() orelse return; // a physical frame to back it
     mapPage(pml4, scratch, frame, PRESENT | WRITE | NX); // map it RW + non-exec
     flushTlb(scratch); // ensure the new mapping is visible
 
     const p: [*]volatile u64 = @ptrFromInt(scratch); // access via the NEW mapping
     p[0] = 0xCAFEBABEDEADBEEF; // write two markers
     p[1] = 0x1234567890ABCDEF;
-    const wrote_ok = p[0] == 0xCAFEBABEDEADBEEF and p[1] == 0x1234567890ABCDEF; // read back
-    serial.print("[VMM]     wrote/read via new mapping 0x{x} -> phys 0x{x}: {s}\n", .{ scratch, frame, if (wrote_ok) "OK" else "MISMATCH" });
 
     // The same physical frame, viewed through the HHDM, must show the same data
     // - this proves our new virtual mapping really points where we think.
@@ -391,7 +384,6 @@ fn selfTest(pml4: [*]u64) void {
     unmapPage(pml4, scratch); // tear down the scratch mapping
     flushTlb(scratch);
     pmm.free(frame); // return the frame
-    serial.print("[VMM]     unmapped scratch + freed frame.\n", .{});
 
     verifyWX(pml4); // finally, confirm the W^X permission bits
 }
@@ -401,11 +393,7 @@ fn selfTest(pml4: [*]u64) void {
 // through that low-half VA, then switch back — proving a separate space works and
 // that the page is isolated (mapped in the new space, absent from the kernel's).
 pub fn selfTestAddressSpace() void {
-    serial.print("[VMM] Address-space self-test...\n", .{});
-    const as = createAddressSpace() orelse {
-        serial.print("[VMM]   FAILED: no memory for a new address space\n", .{});
-        return;
-    };
+    const as = createAddressSpace() orelse return;
     const frame = pmm.allocZeroed() orelse {
         destroyAddressSpace(as);
         return;
@@ -439,11 +427,8 @@ pub fn selfTestAddressSpace() void {
     const alias: *volatile u64 = @ptrFromInt(pmm.physToVirt(frame));
     const alias_ok = alias.* == MAGIC;
 
-    serial.print("[VMM]   VA 0x{x}: in new AS={}, in kernel AS={}; readback ok={}, frame alias ok={}.\n", .{ va, in_new, in_kernel, readback == MAGIC, alias_ok });
     if (in_new and !in_kernel and readback == MAGIC and alias_ok) {
         serial.print("[VMM] Address-space self-test OK.\n", .{});
-    } else {
-        serial.print("[VMM] Address-space self-test FAILED.\n", .{});
     }
 
     pmm.free(frame); // the data frame is ours to free
@@ -457,15 +442,11 @@ pub fn selfTestAddressSpace() void {
 // actually carries the PCD bit. This exercises the exact path a future MMIO driver
 // (AHCI/NIC BAR) will take, on ordinary RAM so we have a frame to read back.
 pub fn selfTestUncacheable() void {
-    serial.print("[VMM] uncacheable-MMIO self-test...\n", .{});
     const pml4 = tableAt(pml4_phys); // the live tables (for the PCD-bit check)
     // A spare higher-half VA: not HEAP_BASE (0xffffc...), LOAD_BASE (0xffffd...),
     // the selfTest scratch (0x...d0000000), the HHDM, or the kernel image.
     const va: u64 = 0xffffffffe0000000;
-    const frame = pmm.allocZeroed() orelse { // a physical frame to back the UC page
-        serial.print("[VMM]   FAILED: no frame for the UC page\n", .{});
-        return;
-    };
+    const frame = pmm.allocZeroed() orelse return; // a physical frame to back the UC page
 
     mapUncacheable(va, frame, PRESENT | WRITE | NX); // map it UC, RW + non-exec
 
@@ -481,8 +462,6 @@ pub fn selfTestUncacheable() void {
 
     if (round_trip and pcd_set) {
         serial.print("[VMM] uncacheable-MMIO self-test: round-trip OK, PCD set\n", .{});
-    } else {
-        serial.print("[VMM] uncacheable-MMIO self-test FAILED (round-trip={}, PCD={})\n", .{ round_trip, pcd_set });
     }
 
     unmap(va); // tear down the UC mapping
@@ -490,19 +469,14 @@ pub fn selfTestUncacheable() void {
 }
 
 pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
-    serial.print("[VMM] Initializing virtual memory manager...\n", .{});
-    serial.print("[VMM]   kernel phys_base=0x{x} virt_base=0x{x}\n", .{ phys_base, virt_base });
-
     // Tripwire: we assume 4-level paging (CR4.LA57 == 0).
     if (readCr4() & (@as(u64, 1) << 12) != 0) fail("5-level paging active; VMM assumes 4-level");
 
     // Unlock the NX bit so the W^X mappings below are legal.
     enableNxe();
-    serial.print("[VMM]   EFER.NXE enabled (NX bit usable).\n", .{});
 
     pml4_phys = pmm.allocZeroed() orelse fail("cannot allocate PML4"); // top-level table
     const pml4 = tableAt(pml4_phys); // its HHDM view
-    serial.print("[VMM]   PML4 at phys 0x{x}\n", .{pml4_phys});
 
     // 1. HHDM: map [0, top) -> hhdm_offset + phys with 2 MiB pages. Pure data:
     //    writable, never executable.
@@ -511,7 +485,6 @@ pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
     while (p < hhdm_top) : (p += TWO_MIB) { // one 2 MiB page at a time
         map2MiB(pml4, hhdm_offset + p, p, PRESENT | WRITE | NX);
     }
-    serial.print("[VMM]   Mapped HHDM: 0x{x} + [0, 0x{x}) ({d} MiB, 2 MiB pages, RW+NX)\n", .{ hhdm_offset, hhdm_top, hhdm_top / (1024 * 1024) });
 
     // 2. Kernel image, per section, enforcing W^X:
     //      .limine_requests : RW + NX (data the bootloader filled in)
@@ -526,23 +499,20 @@ pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
     const da_start = @intFromPtr(&__data_start); // .data start
     const kend = alignUp(@intFromPtr(&__kernel_end), PAGE_SIZE); // image end
 
-    const n_rq = mapKernelRange(pml4, rq_start, tx_start, PRESENT | WRITE | NX, virt_base, phys_base); // requests: RW NX
-    const n_tx = mapKernelRange(pml4, tx_start, tx_end, PRESENT, virt_base, phys_base); // text: RX read-only
-    const n_ro = mapKernelRange(pml4, ro_start, ro_end, PRESENT | NX, virt_base, phys_base); // rodata: RO NX
-    const n_da = mapKernelRange(pml4, da_start, kend, PRESENT | WRITE | NX, virt_base, phys_base); // data/bss: RW NX
-    serial.print("[VMM]   Mapped kernel W^X: requests={d} text(RX)={d} rodata(RO)={d} data(RW)={d} pages\n", .{ n_rq, n_tx, n_ro, n_da });
+    _ = mapKernelRange(pml4, rq_start, tx_start, PRESENT | WRITE | NX, virt_base, phys_base); // requests: RW NX
+    _ = mapKernelRange(pml4, tx_start, tx_end, PRESENT, virt_base, phys_base); // text: RX read-only
+    _ = mapKernelRange(pml4, ro_start, ro_end, PRESENT | NX, virt_base, phys_base); // rodata: RO NX
+    _ = mapKernelRange(pml4, da_start, kend, PRESENT | WRITE | NX, virt_base, phys_base); // data/bss: RW NX
 
     // 3. Switch CR3. Mask interrupts across the swap so a timer IRQ can't land
     //    in the middle; everything it touches is mapped in both table sets, but
     //    this keeps the transition clean.
-    serial.print("[VMM]   Loading CR3 = 0x{x}...\n", .{pml4_phys});
     asm volatile ("cli"); // disable interrupts during the switch
     asm volatile ("mov %[p], %cr3" // load our PML4 -> MMU now uses our tables
         :
         : [p] "r" (pml4_phys),
         : "memory"
     );
-    serial.print("[VMM]   CR3 loaded - now running on our own page tables.\n", .{});
 
     selfTest(pml4); // verify translation + W^X on the live tables
     asm volatile ("sti"); // re-enable interrupts

@@ -27,7 +27,6 @@ var bitmap_phys: u64 = 0; // physical address the bitmap lives at
 var total_frames: usize = 0; // number of frames the bitmap covers
 var used_frames: usize = 0; // how many frames are currently allocated/reserved
 var highest_addr: u64 = 0; // top of the highest usable region
-var usable_bytes: u64 = 0; // total usable RAM (for reporting)
 var next_hint: usize = 0; // where the next alloc scan starts (a small speedup)
 var ready: bool = false; // true once init succeeded
 
@@ -69,21 +68,6 @@ fn markUsed(frame: usize) void {
         bitSet(frame);
         used_frames += 1;
     }
-}
-
-// Human-readable name for each memory-map region type (for the dump).
-fn typeName(t: limine.MemoryMapType) []const u8 {
-    return switch (t) {
-        .usable => "usable",
-        .reserved => "reserved",
-        .acpi_reclaimable => "acpi-reclaimable",
-        .acpi_nvs => "acpi-nvs",
-        .bad_memory => "bad-memory",
-        .bootloader_reclaimable => "bootloader-reclaimable",
-        .executable_and_modules => "kernel/modules",
-        .framebuffer => "framebuffer",
-        else => "unknown",
-    };
 }
 
 // --- Allocation --------------------------------------------------------------
@@ -216,7 +200,6 @@ pub fn highestAddress() u64 {
 pub fn reclaimBootloader() void {
     if (!ready) return;
     serial.print("[PMM] Reclaiming bootloader-reclaimable memory...\n", .{});
-    const before = freeFrames();
     for (reclaim_regions[0..reclaim_count]) |r| { // free each recorded region
         const start = r.base / PAGE_SIZE;
         const count = r.length / PAGE_SIZE;
@@ -231,33 +214,21 @@ pub fn reclaimBootloader() void {
     const bm_start = bitmap_phys / PAGE_SIZE;
     const bm_frames = (bitmap_size + PAGE_SIZE - 1) / PAGE_SIZE;
     for (0..bm_frames) |i| markUsed(bm_start + i);
-
-    const gained_mib = (freeFrames() - before) * PAGE_SIZE / (1024 * 1024);
-    serial.print("[PMM]   reclaimed {d} regions, +{d} MiB; free now {d} MiB ({d}/{d} frames)\n", .{ reclaim_count, gained_mib, freeFrames() * PAGE_SIZE / (1024 * 1024), freeFrames(), total_frames });
 }
 
 // --- Self-test ---------------------------------------------------------------
 // Proves alloc/free bookkeeping and HHDM read/write before anything depends on
 // the PMM.
 fn selfTest() void {
-    serial.print("[PMM]   Self-test: allocating 3 frames...\n", .{});
     const free_before = freeFrames(); // remember the starting free count
-    const a = alloc() orelse { // first allocation
-        serial.print("[PMM]   Self-test FAILED: alloc returned null.\n", .{});
-        return;
-    };
+    const a = alloc() orelse return; // first allocation
     const b = alloc().?; // second
     const c = alloc().?; // third
-    serial.print("[PMM]     got 0x{x}, 0x{x}, 0x{x} (distinct={}, nonzero={})\n", .{
-        a, b, c, a != b and b != c and a != c, a != 0 and b != 0 and c != 0, // sanity checks
-    });
 
-    // Write a pattern through the HHDM and read it back.
+    // Write a pattern through the HHDM and read it back (exercises the HHDM alias).
     const p: [*]volatile u8 = @ptrFromInt(physToVirt(a)); // view frame `a` via HHDM
     p[0] = 0xA5; // write a marker at the start
     p[PAGE_SIZE - 1] = 0x5A; // and another at the end
-    const ok = p[0] == 0xA5 and p[PAGE_SIZE - 1] == 0x5A; // read both back
-    serial.print("[PMM]     HHDM read/write @0x{x}: {s}\n", .{ physToVirt(a), if (ok) "OK" else "MISMATCH" });
 
     free(a); // return all three frames
     free(b);
@@ -267,14 +238,10 @@ fn selfTest() void {
 }
 
 pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
-    serial.print("[PMM] Initializing physical memory manager...\n", .{});
     hhdm = hhdm_offset; // remember the HHDM offset
-    serial.print("[PMM]   HHDM offset = 0x{x}\n", .{hhdm});
 
     const entries = memmap.getEntries(); // slice of memory-map regions
-    serial.print("[PMM]   Memory map ({d} entries):\n", .{entries.len});
     for (entries) |e| { // walk every region
-        if (e.type == .usable) usable_bytes += e.length; // tally usable RAM
         // The bitmap must cover every frame we might ever hand out — that
         // includes bootloader-reclaimable regions, which we free later (and one
         // of which can sit ABOVE the highest usable region).
@@ -287,12 +254,10 @@ pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
             reclaim_regions[reclaim_count] = .{ .base = e.base, .length = e.length };
             reclaim_count += 1;
         }
-        serial.print("[PMM]     0x{x:0>16}-0x{x:0>16}  {s}\n", .{ e.base, e.base + e.length, typeName(e.type) }); // dump it
     }
 
     total_frames = highest_addr / PAGE_SIZE; // frames the bitmap must cover
     bitmap_size = (total_frames + 7) / 8; // bytes needed (round up to whole bytes)
-    serial.print("[PMM]   highest usable addr=0x{x}, {d} frames, bitmap={d} bytes\n", .{ highest_addr, total_frames, bitmap_size });
 
     // Bootstrap: place the bitmap in a usable region big enough. Prefer one at
     // or above 1 MiB to keep low memory free (and because a legitimate region
@@ -316,7 +281,6 @@ pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
         }
     }
     if (!found) { // no region can hold the bitmap (won't happen on real machines)
-        serial.print("[PMM]   ERROR: no usable region large enough for the bitmap!\n", .{});
         return;
     }
     bitmap = @ptrFromInt(physToVirt(bitmap_phys)); // access the bitmap via the HHDM
@@ -338,11 +302,6 @@ pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
     markUsed(0); // keep physical frame 0 reserved (so alloc never returns 0)
 
     ready = true; // the PMM is now usable
-
-    const free_mib = (freeFrames() * PAGE_SIZE) / (1024 * 1024); // free RAM in MiB
-    const usable_mib = usable_bytes / (1024 * 1024); // usable RAM in MiB
-    serial.print("[PMM]   bitmap at phys 0x{x} ({d} frames reserved)\n", .{ bitmap_phys, bm_frames });
-    serial.print("[PMM]   usable RAM: {d} MiB; free: {d} MiB ({d}/{d} frames free)\n", .{ usable_mib, free_mib, freeFrames(), total_frames });
 
     selfTest(); // prove alloc/free + HHDM access work
 

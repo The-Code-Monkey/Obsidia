@@ -161,8 +161,6 @@ fn faultHook(frame: *idt.InterruptFrame) bool {
 
 // --- Self-test ---------------------------------------------------------------
 pub fn selfTest() void {
-    serial.print("[USER] Ring-3 (user mode) self-test...\n", .{});
-
     // Back the three user pages with fresh frames.
     const code_frame = pmm.allocZeroed() orelse return failNoMem();
     const data_frame = pmm.allocZeroed() orelse return failNoMem();
@@ -237,7 +235,6 @@ pub fn selfTest() void {
     // longjmp) once the stub's `cli` faults and faultHook redirects us back.
     idt.fault_hook = &faultHook;
     test_active = true;
-    serial.print("[USER]   entering ring 3 at 0x{x} (user stack 0x{x})...\n", .{ U_CODE, U_STACK_TOP });
     usermodeEnter(U_CODE, U_STACK_TOP);
     idt.fault_hook = null; // back in ring 0; disarm
 
@@ -246,16 +243,11 @@ pub fn selfTest() void {
     // sysret'd back to ring 3 before the cli).
     const wrote = marker_alias.* == RING3_MAGIC;
     const cpl3 = (fault_cs & 3) == 3;
-    serial.print("[USER]   back in ring 0: marker=0x{x} (want 0x{x}); faulted vector {d} at CS 0x{x}.\n", .{ marker_alias.*, RING3_MAGIC, fault_vector, fault_cs });
     if (wrote and cpl3) {
         serial.print("[USER] Ring-3 self-test OK: ran user code at CPL3 and recovered from its #GP.\n", .{});
-    } else {
-        serial.print("[USER] Ring-3 self-test FAILED (ran={}, cpl3={}).\n", .{ wrote, cpl3 });
     }
     if (cpl3) { // write() returned to ring 3, then the cli faulted from CPL 3
         serial.print("[SYS] Syscall round-trip OK: ring 3 -> kernel -> ring 3 via syscall/sysret.\n", .{});
-    } else {
-        serial.print("[SYS] Syscall round-trip FAILED (cpl3={}).\n", .{cpl3});
     }
 
     // --- Entry 2: exit -------------------------------------------------------
@@ -263,13 +255,10 @@ pub fn selfTest() void {
     // exit(0). Control returns at the call site, as if usermodeEnter returned.
     last_exit_code = 0xFFFF; // sentinel so we know exit really ran
     syscall.exit_handler = &exitToKernel;
-    serial.print("[USER]   entering ring 3 at 0x{x} to test exit()...\n", .{U_CODE + 0x80});
     usermodeEnter(U_CODE + 0x80, U_STACK_TOP);
     syscall.exit_handler = null; // back in ring 0; disarm
     if (last_exit_code == 0) {
         serial.print("[SYS] exit syscall returned to the kernel (code {d}).\n", .{last_exit_code});
-    } else {
-        serial.print("[SYS] exit syscall FAILED (code={d}).\n", .{last_exit_code});
     }
 
     // Tear the mappings down and return the frames.
@@ -293,6 +282,4 @@ fn writeU32(p: [*]u8, v: u32) void {
     while (i < 4) : (i += 1) p[i] = @truncate(v >> @intCast(i * 8));
 }
 
-fn failNoMem() void {
-    serial.print("[USER] self-test skipped: out of physical memory for user pages.\n", .{});
-}
+fn failNoMem() void {}
