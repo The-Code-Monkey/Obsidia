@@ -180,6 +180,112 @@ fn verifyPlayback() void {
     }
 }
 
+// True once a codec has been found and configured (the shell's `play` gate).
+pub fn isPresent() bool {
+    return present;
+}
+
+// --- Streaming playback ------------------------------------------------------
+// Playback longer than the boot tone streams PCM through a refilling DMA ring:
+// a handful of buffers cycled through the 32-entry BDL. The engine plays buffers
+// in order (wrapping the BDL at 32); we keep refilling the ones it has already
+// passed so it never runs dry, until the source is exhausted.
+const RING: usize = 8; // DMA buffers in the ring (must be <= 32 BDL entries)
+const RING_FRAMES: usize = 2048; // frames per buffer (~43 ms at 48 kHz)
+const RING_BYTES: usize = RING_FRAMES * 4; // 16-bit stereo => 4 bytes/frame
+
+// A source of PCM bytes: write up to dst.len bytes into a DMA buffer and return
+// how many were written; 0 means end of stream.
+pub const FillFn = *const fn (ctx: *anyopaque, dst: []u8) usize;
+
+// Make BDL entry `idx` valid, pointing at ring buffer (idx % RING) which now holds
+// `n_bytes` of PCM. The BDL slot wraps at 32; the backing buffer wraps at RING.
+fn publishDesc(desc: [*]Descriptor, ring: []const dma.Buffer, idx: usize, n_bytes: usize) void {
+    desc[idx % 32] = .{
+        .addr = @intCast(ring[idx % RING].phys),
+        .samples = @intCast(n_bytes / 2), // 2 bytes per 16-bit sample
+        .control = DESC_IOC | DESC_BUP,
+    };
+}
+
+// Stream 16-bit stereo 48 kHz PCM from `fill` to the codec, blocking until the
+// source is exhausted. Returns the total number of bytes played.
+pub fn play(ctx: *anyopaque, fill: FillFn) usize {
+    if (!present) {
+        serial.print("[AC97] play: no audio device.\n", .{});
+        return 0;
+    }
+
+    // Allocate the ring (each buffer individually contiguous + 32-bit-addressable).
+    var ring: [RING]dma.Buffer = undefined;
+    var got: usize = 0;
+    while (got < RING) : (got += 1) {
+        ring[got] = dma.alloc(RING_BYTES) orelse break;
+    }
+    if (got < RING) { // out of DMA memory: release what we took and bail
+        for (ring[0..got]) |b| dma.free(b);
+        serial.print("[AC97] play: could not allocate the DMA ring.\n", .{});
+        return 0;
+    }
+    defer for (ring[0..RING]) |b| dma.free(b); // always reclaim the ring
+
+    const desc: [*]Descriptor = @ptrCast(@alignCast(bdl_buf.virt)); // reuse the 32-entry BDL
+
+    io.outb(nabm + PO_CR, CR_RR); // reset the stream
+    while (io.inb(nabm + PO_CR) & CR_RR != 0) {}
+    io.outl(nabm + PO_BDBAR, @intCast(bdl_buf.phys)); // point at our BDL
+
+    var total: usize = 0; // bytes streamed so far
+    var prod: usize = 0; // buffers filled + published (monotonic)
+    var eof = false;
+
+    // Prime the whole ring before starting the engine.
+    while (prod < RING) {
+        const n = fill(ctx, ring[prod % RING].bytes());
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        publishDesc(desc, &ring, prod, n);
+        total += n;
+        prod += 1;
+    }
+    if (prod == 0) return 0; // empty source: nothing to play
+
+    io.outb(nabm + PO_LVI, @intCast((prod - 1) % 32)); // last valid buffer
+    io.outb(nabm + PO_CR, CR_RPBM); // run the bus master
+
+    var civ_abs: usize = 0; // absolute index of the buffer the engine is on now
+    while (true) {
+        const civ = io.inb(nabm + PO_CIV); // 0..31, the BDL slot in play
+        civ_abs += (@as(usize, civ) + 32 - (civ_abs % 32)) % 32; // advance, handling the wrap
+
+        // Refill every buffer the engine has passed; we stay at most RING ahead, so
+        // buffer (prod % RING) is free exactly when prod < civ_abs + RING.
+        while (!eof and prod < civ_abs + RING) {
+            const n = fill(ctx, ring[prod % RING].bytes());
+            if (n == 0) {
+                eof = true;
+                break;
+            }
+            publishDesc(desc, &ring, prod, n);
+            total += n;
+            prod += 1;
+            io.outb(nabm + PO_LVI, @intCast((prod - 1) % 32)); // extend the valid range
+        }
+
+        if (io.inw(nabm + PO_SR) & SR_DCH != 0) { // engine halted
+            if (eof) break; // finished everything we produced
+            io.outb(nabm + PO_CR, CR_RPBM); // underran: re-arm and let it resume
+        }
+        delayTicks(1); // ~10 ms; one buffer is ~43 ms, so we poll several times per buffer
+    }
+
+    io.outb(nabm + PO_CR, 0); // stop the engine
+    serial.print("[AC97] play: streamed {d} bytes ({d} frames).\n", .{ total, total / 4 });
+    return total;
+}
+
 pub fn init() void {
     serial.print("[AC97] Initializing AC'97 audio...\n", .{});
     const dev = pci.findByClass(CLASS_MULTIMEDIA, SUBCLASS_AUDIO) orelse {

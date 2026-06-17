@@ -399,6 +399,55 @@ pub fn readFile(path: []const u8, dst: []u8) ?usize {
     return written;
 }
 
+// --- Streaming reads ---------------------------------------------------------
+// readFile() needs a buffer big enough for the whole file. Streaming consumers
+// (e.g. audio playback) instead pull a file in bounded chunks: open() returns a
+// cursor, and repeated read() calls walk the cluster chain a sector at a time,
+// copying out as many bytes as the caller asks for. Memory use stays constant no
+// matter how large the file is.
+pub const FileReader = struct {
+    cluster: u32, // current cluster in the chain
+    sec: u32 = 0, // next sector to read within `cluster`
+    remaining: u32, // file bytes not yet handed to a refill
+    buf: [SECTOR]u8 = undefined, // one cached sector
+    buf_len: usize = 0, // valid bytes in `buf`
+    buf_pos: usize = 0, // bytes of `buf` already returned
+
+    // Copy up to dst.len bytes into dst, refilling the sector cache as needed.
+    // Returns the number of bytes copied; 0 means end of file (or a read error).
+    pub fn read(self: *FileReader, dst: []u8) usize {
+        var out: usize = 0;
+        while (out < dst.len and (self.buf_pos < self.buf_len or self.remaining > 0)) {
+            if (self.buf_pos >= self.buf_len) { // cache empty: pull the next sector
+                if (self.sec >= bi.sectors_per_cluster) { // exhausted this cluster
+                    self.cluster = nextCluster(self.cluster);
+                    self.sec = 0;
+                }
+                if (!isDataCluster(self.cluster)) break; // chain ended early
+                if (!ata.read(clusterToSector(self.cluster) + self.sec, 1, &self.buf)) break;
+                self.sec += 1;
+                self.buf_len = @min(self.remaining, @as(u32, SECTOR)); // clamp the last sector to EOF
+                self.buf_pos = 0;
+                self.remaining -= @intCast(self.buf_len);
+            }
+            const n = @min(dst.len - out, self.buf_len - self.buf_pos); // copy what fits
+            @memcpy(dst[out .. out + n], self.buf[self.buf_pos .. self.buf_pos + n]);
+            out += n;
+            self.buf_pos += n;
+        }
+        return out;
+    }
+};
+
+// Open a file for streaming. Returns a cursor, or null if unmounted / missing /
+// a directory.
+pub fn open(path: []const u8) ?FileReader {
+    if (!mounted) return null;
+    const node = resolve(path) orelse return null;
+    if (node.is_dir) return null;
+    return .{ .cluster = node.cluster, .remaining = node.size };
+}
+
 // === Write path ==============================================================
 // Enough FAT32 write support for a text editor to save: overwrite an existing
 // file (growing/shrinking its cluster chain) or create a new one with an 8.3

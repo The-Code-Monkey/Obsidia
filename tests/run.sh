@@ -302,6 +302,30 @@ assert_in "$TMP/fat.log" "Hello from FAT32 on Obsidia!"    "FAT32: reads a file'
 assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a nested path (/docs/notes.txt)"
 assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
 
+# --- AC'97 play <file.pcm> (FAT32 + AC97, -M pc) -----------------------------
+# Stream a raw PCM file from the FAT32 disk to the codec. Boot -M pc with both the
+# IDE disk and an AC'97 device, then drive `play`. The file is 128 KiB (> one ring
+# of 8x8 KiB DMA buffers), so the ring must refill repeatedly across the file; we
+# assert the shell and the driver both report the full byte count streamed.
+# Content is irrelevant to the streaming path, so a fixed-size random file is fine.
+echo "== AC'97 play <file.pcm> (-M pc) =="
+PCM="$TMP/sound.pcm"
+head -c 131072 /dev/urandom > "$PCM" # 128 KiB = 32768 stereo frames
+mcopy -i "$FATDISK" "$PCM" ::/sound.pcm
+pfifo="$TMP/play.in"; rm -f "$pfifo"; mkfifo "$pfifo"
+qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
+    -drive file="$FATDISK",format=raw,if=ide \
+    -audiodev none,id=snd0 -device AC97,audiodev=snd0 \
+    -chardev stdio,id=c0,logfile="$TMP/play.log",signal=off -serial chardev:c0 \
+    -display none -no-reboot <"$pfifo" >/dev/null 2>&1 &
+ppid=$!
+exec 6>"$pfifo" # hold the input FIFO open so QEMU never sees EOF
+waitfor "Type 'help'" "$TMP/play.log" "$ppid"; sleep 0.3; printf 'play /sound.pcm\r' >&6
+waitfor "play: streamed|no such file|no audio" "$TMP/play.log" "$ppid"
+exec 6>&-; sleep 0.3; kill $ppid 2>/dev/null; wait $ppid 2>/dev/null
+assert_in "$TMP/play.log" "play: streamed 131072 bytes of /sound.pcm"          "AC97: play streamed the whole PCM file from FAT32"
+assert_in "$TMP/play.log" "[AC97] play: streamed 131072 bytes (32768 frames)"  "AC97: DMA ring refilled across the file (frame count)"
+
 # --- Init loader (ELF64 + flat binary off the FAT32 disk) ---------------------
 # Stage 5: the loader runs an init binary as a real RING-3 PROCESS — its own
 # address space, USER pages, a user stack — that signals completion with the
