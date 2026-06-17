@@ -97,6 +97,7 @@ var nabm: u16 = 0; // NABM (bus master) I/O base — BAR1
 var bdl_buf: dma.Buffer = undefined; // the buffer descriptor list
 var pcm_buf: dma.Buffer = undefined; // the PCM sample buffer the BDL points at
 var irq_line: u8 = 0xFF; // the device's PCI interrupt line (0xFF = none)
+var vra_ok: bool = false; // codec supports variable-rate audio (per-stream DAC rate)
 
 // Interrupt-driven playback state. The completion IRQ wakes the play thread so
 // the CPU sleeps between buffers instead of polling. Touched from IRQ context.
@@ -162,12 +163,21 @@ fn setupCodec() void {
     // Variable-rate audio: if the codec supports it, enable it and set the DAC to
     // our rate; otherwise the codec runs at its fixed 48 kHz (which is our rate).
     const ext = io.inw(nam + NAM_EXT_ID);
-    if (ext & EXT_VRA != 0) {
+    vra_ok = ext & EXT_VRA != 0;
+    if (vra_ok) {
         io.outw(nam + NAM_EXT_CTRL, io.inw(nam + NAM_EXT_CTRL) | EXT_VRA); // enable VRA
         io.outw(nam + NAM_DAC_RATE, @intCast(SAMPLE_RATE)); // request our rate
     }
     const rate = io.inw(nam + NAM_DAC_RATE); // read back what the codec accepted
-    serial.print("[AC97]   mixer: volume max, VRA={}, DAC rate={d} Hz\n", .{ ext & EXT_VRA != 0, rate });
+    serial.print("[AC97]   mixer: volume max, VRA={}, DAC rate={d} Hz\n", .{ vra_ok, rate });
+}
+
+// Set the PCM-out DAC sample rate (Hz) via variable-rate audio. A no-op without
+// VRA, where the codec stays at its fixed 48 kHz. Clamps to the 16-bit register.
+fn setDacRate(rate: u32) void {
+    if (!vra_ok) return;
+    const r: u16 = if (rate == 0 or rate > 48000) 48000 else @intCast(rate);
+    io.outw(nam + NAM_DAC_RATE, r);
 }
 
 // Build a one-entry BDL pointing at the tone buffer and start the DMA engine.
@@ -236,13 +246,14 @@ fn publishDesc(desc: [*]Descriptor, ring: []const dma.Buffer, idx: usize, n_byte
     };
 }
 
-// Stream 16-bit stereo 48 kHz PCM from `fill` to the codec, blocking until the
-// source is exhausted. Returns the total number of bytes played.
-pub fn play(ctx: *anyopaque, fill: FillFn) usize {
+// Stream 16-bit stereo PCM from `fill` to the codec at `rate` Hz, blocking until
+// the source is exhausted. Returns the total number of bytes played.
+pub fn play(rate: u32, ctx: *anyopaque, fill: FillFn) usize {
     if (!present) {
         serial.print("[AC97] play: no audio device.\n", .{});
         return 0;
     }
+    setDacRate(rate); // variable-rate audio: match the source's sample rate
 
     // Allocate the ring (each buffer individually contiguous + 32-bit-addressable).
     var ring: [RING]dma.Buffer = undefined;

@@ -302,16 +302,30 @@ assert_in "$TMP/fat.log" "Hello from FAT32 on Obsidia!"    "FAT32: reads a file'
 assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a nested path (/docs/notes.txt)"
 assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
 
-# --- AC'97 play <file.pcm> (FAT32 + AC97, -M pc) -----------------------------
-# Stream a raw PCM file from the FAT32 disk to the codec. Boot -M pc with both the
-# IDE disk and an AC'97 device, then drive `play`. The file is 128 KiB (> one ring
-# of 8x8 KiB DMA buffers), so the ring must refill repeatedly across the file; we
-# assert the shell and the driver both report the full byte count streamed.
-# Content is irrelevant to the streaming path, so a fixed-size random file is fine.
-echo "== AC'97 play <file.pcm> (-M pc) =="
-PCM="$TMP/sound.pcm"
-head -c 131072 /dev/urandom > "$PCM" # 128 KiB = 32768 stereo frames
-mcopy -i "$FATDISK" "$PCM" ::/sound.pcm
+# --- AC'97 play (raw PCM + WAV) (FAT32 + AC97, -M pc) ------------------------
+# Stream audio from the FAT32 disk to the codec. Boot -M pc with both the IDE disk
+# and an AC'97 device, then drive `play` for three files exercising every path:
+#   - a raw 128 KiB .pcm (> one ring of 8x8 KiB buffers, so the ring refills),
+#   - a stereo 48 kHz .wav (header parse + straight-through streaming),
+#   - a mono 44.1 kHz .wav (header parse + variable-rate + mono->stereo expansion).
+# Content is irrelevant to the streaming path, so random data suffices.
+
+# le <value> <nbytes>: emit a little-endian integer as raw bytes.
+le() { local v=$1 n=$2 i; for ((i = 0; i < n; i++)); do printf "\\$(printf '%03o' $((v & 255)))"; v=$((v >> 8)); done; }
+# mkwav <out> <channels> <rate> <data_bytes>: a canonical 16-bit PCM WAV.
+mkwav() {
+    local out=$1 ch=$2 rate=$3 data=$4
+    { printf 'RIFF'; le $((36 + data)) 4; printf 'WAVE'
+      printf 'fmt '; le 16 4; le 1 2; le "$ch" 2; le "$rate" 4; le $((rate * ch * 2)) 4; le $((ch * 2)) 2; le 16 2
+      printf 'data'; le "$data" 4; head -c "$data" /dev/urandom; } > "$out"
+}
+echo "== AC'97 play (raw PCM + WAV, -M pc) =="
+head -c 131072 /dev/urandom > "$TMP/sound.pcm" # 128 KiB raw = 32768 stereo frames
+mkwav "$TMP/st48.wav" 2 48000 65536           # stereo 48 kHz, 65536 data bytes
+mkwav "$TMP/mono44.wav" 1 44100 32768          # mono 44.1 kHz, 32768 data bytes -> 65536 stereo
+mcopy -i "$FATDISK" "$TMP/sound.pcm" ::/sound.pcm
+mcopy -i "$FATDISK" "$TMP/st48.wav" ::/st48.wav
+mcopy -i "$FATDISK" "$TMP/mono44.wav" ::/mono44.wav
 pfifo="$TMP/play.in"; rm -f "$pfifo"; mkfifo "$pfifo"
 qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
     -drive file="$FATDISK",format=raw,if=ide \
@@ -321,11 +335,20 @@ qemu-system-x86_64 -M pc -m 512M -boot d -cdrom "$ISO" \
 ppid=$!
 exec 6>"$pfifo" # hold the input FIFO open so QEMU never sees EOF
 waitfor "Type 'help'" "$TMP/play.log" "$ppid"; sleep 0.3; printf 'play /sound.pcm\r' >&6
-waitfor "play: streamed|no such file|no audio" "$TMP/play.log" "$ppid"
+waitfor "streamed 131072 bytes of /sound.pcm" "$TMP/play.log" "$ppid"; sleep 0.2; printf 'play /st48.wav\r' >&6
+waitfor "streamed .* of /st48.wav" "$TMP/play.log" "$ppid"; sleep 0.2; printf 'play /mono44.wav\r' >&6
+waitfor "streamed .* of /mono44.wav" "$TMP/play.log" "$ppid"
 exec 6>&-; sleep 0.3; kill $ppid 2>/dev/null; wait $ppid 2>/dev/null
-assert_in "$TMP/play.log" "play: streamed 131072 bytes of /sound.pcm"          "AC97: play streamed the whole PCM file from FAT32"
-assert_in "$TMP/play.log" "[AC97] play: streamed 131072 bytes (32768 frames)"  "AC97: DMA ring refilled across the file (frame count)"
+# Raw PCM path.
+assert_in "$TMP/play.log" "play: streamed 131072 bytes of /sound.pcm"          "AC97: play streamed a raw .pcm file from FAT32"
+assert_in "$TMP/play.log" "[AC97] play: streamed 131072 bytes (32768 frames)"  "AC97: DMA ring refilled across the raw file (frame count)"
 assert_in "$TMP/play.log" "interrupt line IRQ"                                 "AC97: hooked the device's PCI interrupt line"
+# Stereo WAV: header parsed, data streamed straight through.
+assert_in "$TMP/play.log" "WAV 48000 Hz, 2 ch, 16-bit, 65536 data bytes"       "AC97: parsed a stereo 48 kHz WAV header"
+assert_in "$TMP/play.log" "play: streamed 65536 bytes of /st48.wav"            "AC97: streamed the stereo WAV data chunk"
+# Mono 44.1 kHz WAV: variable-rate + mono expanded to stereo (32768 -> 65536).
+assert_in "$TMP/play.log" "WAV 44100 Hz, 1 ch, 16-bit, 32768 data bytes"       "AC97: parsed a mono 44.1 kHz WAV header"
+assert_in "$TMP/play.log" "play: streamed 65536 bytes of /mono44.wav"          "AC97: mono WAV expanded to stereo (32768 -> 65536) at 44.1 kHz"
 # Playback must be interrupt-driven: the completion IRQ fires once per buffer, so
 # a multi-buffer file yields several. Assert the count is non-zero (not polled).
 pirqs=$(grep -aoE "[0-9]+ completion IRQ" "$TMP/play.log" | grep -oE "^[0-9]+" | head -1)

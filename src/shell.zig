@@ -21,6 +21,7 @@ const heap = @import("mm/heap.zig"); // allocator for the scrypt verify
 const install = @import("install.zig"); // the `install` command (in-guest installer)
 const editor = @import("editor.zig"); // the `edit` command (text editor)
 const ac97 = @import("drivers/ac97.zig"); // the `play` command (AC'97 audio)
+const wav = @import("fs/wav.zig"); // WAV (RIFF) parsing for `play`
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -347,10 +348,21 @@ fn handleChar(c: u8) void {
 }
 
 // Bridge a fat32.FileReader to ac97's FillFn: hand the player the next chunk of
-// the file each time it needs to refill a DMA buffer.
+// the file each time it needs to refill a DMA buffer (raw-PCM path).
 fn fillFromReader(ctx: *anyopaque, dst: []u8) usize {
     const r: *fat32.FileReader = @ptrCast(@alignCast(ctx));
     return r.read(dst);
+}
+
+// Bridge a wav.Stream to ac97's FillFn (WAV path: data-chunk-limited, mono->stereo).
+fn fillWav(ctx: *anyopaque, dst: []u8) usize {
+    const s: *wav.Stream = @ptrCast(@alignCast(ctx));
+    return s.fill(dst);
+}
+
+// Does `path` end in ".wav" (case-insensitive)? Selects the WAV vs raw-PCM path.
+fn hasWavExt(path: []const u8) bool {
+    return path.len >= 4 and std.ascii.eqlIgnoreCase(path[path.len - 4 ..], ".wav");
 }
 
 // --- Command dispatch --------------------------------------------------------
@@ -364,7 +376,7 @@ fn execute(raw: []const u8) void {
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
         serial.print("          cd [dir], ls [path], cat <path>, edit <path>, exec <path>,\n", .{});
-        if (ac97.isPresent()) serial.print("          play <file.pcm> (16-bit stereo 48 kHz),\n", .{});
+        if (ac97.isPresent()) serial.print("          play <file> (.wav or 16-bit stereo 48 kHz .pcm),\n", .{});
         if (install.available()) serial.print("          install (clone Obsidia onto the disk),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
         serial.print("  (up/down = history, left/right/home/end = move, del = delete,\n", .{});
@@ -410,9 +422,9 @@ fn execute(raw: []const u8) void {
             var pbuf: [256]u8 = undefined;
             fat32.cat(resolvePath(args, &pbuf));
         }
-    } else if (std.mem.eql(u8, cmd, "play")) { // stream a raw PCM file to the AC'97 codec
+    } else if (std.mem.eql(u8, cmd, "play")) { // stream an audio file to the AC'97 codec
         if (args.len == 0) {
-            serial.print("usage: play <file.pcm>  (16-bit stereo 48 kHz raw PCM)\n", .{});
+            serial.print("usage: play <file>  (.wav, or raw 16-bit stereo 48 kHz .pcm)\n", .{});
         } else if (!ac97.isPresent()) {
             serial.print("play: no audio device\n", .{});
         } else {
@@ -420,8 +432,17 @@ fn execute(raw: []const u8) void {
             const path = resolvePath(args, &pbuf);
             if (fat32.open(path)) |reader| {
                 var r = reader; // stable storage for the streaming cursor
-                const n = ac97.play(&r, &fillFromReader);
-                serial.print("play: streamed {d} bytes of {s}\n", .{ n, path });
+                if (hasWavExt(path)) { // .wav: parse the header, then stream the data chunk
+                    if (wav.parse(&r)) |fmt| {
+                        var stream = wav.Stream{ .reader = &r, .remaining = fmt.data_bytes, .channels = fmt.channels };
+                        serial.print("play: WAV {d} Hz, {d} ch, {d}-bit, {d} data bytes\n", .{ fmt.sample_rate, fmt.channels, fmt.bits, fmt.data_bytes });
+                        const n = ac97.play(fmt.sample_rate, &stream, &fillWav);
+                        serial.print("play: streamed {d} bytes of {s}\n", .{ n, path });
+                    } else serial.print("play: not a playable WAV: {s}\n", .{path});
+                } else { // anything else: treat as raw 16-bit stereo 48 kHz PCM
+                    const n = ac97.play(48000, &r, &fillFromReader);
+                    serial.print("play: streamed {d} bytes of {s}\n", .{ n, path });
+                }
             } else serial.print("play: no such file: {s}\n", .{path});
         }
     } else if (std.mem.eql(u8, cmd, "exec")) { // load + run an ELF or flat binary as a ring-3 process

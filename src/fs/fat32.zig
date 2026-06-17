@@ -437,6 +437,18 @@ pub const FileReader = struct {
         }
         return out;
     }
+
+    // Advance the cursor by `n` bytes without copying them out (used to skip over
+    // chunks a parser doesn't care about, e.g. WAV metadata). Stops early at EOF.
+    pub fn skip(self: *FileReader, n: usize) void {
+        var left = n;
+        var sink: [256]u8 = undefined;
+        while (left > 0) {
+            const got = self.read(sink[0..@min(left, sink.len)]);
+            if (got == 0) break; // hit EOF
+            left -= got;
+        }
+    }
 };
 
 // Open a file for streaming. Returns a cursor, or null if unmounted / missing /
