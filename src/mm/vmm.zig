@@ -175,6 +175,24 @@ pub fn unmap(virt: u64) void {
     flushTlb(virt);
 }
 
+// True if `virt` has a present mapping in the live tables — a non-creating walk
+// (same descent as unmapPage). Used to verify invariants without faulting, e.g.
+// that a stack's guard page is unmapped while the stack itself is mapped.
+pub fn isMapped(virt: u64) bool {
+    const pml4 = tableAt(pml4_phys);
+    if (pml4[idx(virt, 39)] & PRESENT == 0) return false; // no PDPT
+    const pdpt = tableAt(pml4[idx(virt, 39)] & ADDR_MASK);
+    const pdpte = pdpt[idx(virt, 30)];
+    if (pdpte & PRESENT == 0) return false; // no PD
+    if (pdpte & HUGE != 0) return true; // a present 1 GiB leaf covers virt
+    const pd = tableAt(pdpte & ADDR_MASK);
+    const pde = pd[idx(virt, 21)];
+    if (pde & PRESENT == 0) return false; // no PT (or 2 MiB hole)
+    if (pde & HUGE != 0) return true; // a present 2 MiB leaf covers virt
+    const pt = tableAt(pde & ADDR_MASK);
+    return pt[idx(virt, 12)] & PRESENT != 0; // the 4 KiB leaf
+}
+
 // Map a single 4 KiB page as UNCACHEABLE (UC) — the mapping device drivers use
 // for MMIO. Identical to map() but forces the leaf PTE's PCD (Page Cache Disable)
 // bit on. With the PAT left at its reset default, the (PAT,PCD,PWT) = (0,1,0)
