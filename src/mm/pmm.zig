@@ -91,17 +91,44 @@ fn typeName(t: limine.MemoryMapType) []const u8 {
 // (frame 0 is permanently reserved so a valid result can't look like null).
 pub fn alloc() ?u64 {
     if (!ready) return null; // PMM not initialized
-    var i = next_hint; // start scanning from the hint
-    var scanned: usize = 0; // how many frames we've examined
-    while (scanned < total_frames) : (scanned += 1) { // at most one full sweep
+    var i = next_hint; // start scanning from the hint (a frame index)
+    var scanned: usize = 0; // how many frames we've examined (caps at one sweep)
+    // Scan a BYTE (8 frames) at a time instead of bit-by-bit. A byte equal to
+    // 0xFF means all 8 of its frames are used, so we skip it with a single
+    // comparison; otherwise we locate the first free frame inside it with a
+    // bit-twiddle (@ctz on the inverted byte = index of the lowest 0 bit). This
+    // turns long runs of allocated frames from 8 bit-tests into one byte read.
+    while (scanned < total_frames) { // at most one full sweep over every frame
         if (i >= total_frames) i = 0; // wrap around to the start
+        // Try to fast-path a whole byte only when `i` sits on a byte boundary
+        // AND the entire byte's 8 frames are in range. The final partial byte
+        // at `total_frames` (and any mid-byte hint) falls through to per-bit.
+        if (i % 8 == 0 and i + 8 <= total_frames) {
+            const byte = bitmap[i / 8]; // the 8 frames starting at `i`
+            if (byte == 0xFF) { // all 8 used: skip the whole byte at once
+                i += 8;
+                scanned += 8; // examined 8 frames' worth
+                continue;
+            }
+            // At least one bit is 0 (free). ~byte sets those free bits; @ctz
+            // gives the index of the lowest set bit = first free frame in range.
+            const bit: usize = @ctz(~byte); // 0..7, guaranteed valid since byte != 0xFF
+            const frame = i + bit; // absolute frame index of that free frame
+            bitSet(frame); // claim it
+            used_frames += 1;
+            next_hint = frame + 1; // next search starts just past it
+            return @as(u64, frame) * PAGE_SIZE; // frame index -> physical address
+        }
+        // Slow path: not byte-aligned, or the final partial byte near
+        // total_frames. Test this single frame.
         if (!bitTest(i)) { // found a free frame
             bitSet(i); // claim it
             used_frames += 1;
             next_hint = i + 1; // next search starts just past it
             return @as(u64, i) * PAGE_SIZE; // frame index -> physical address
         }
-        i += 1; // try the next frame
+        i += 1; // this frame was used — try the next one
+        scanned += 1; // examined one more frame
     }
     return null; // swept everything, none free
 }

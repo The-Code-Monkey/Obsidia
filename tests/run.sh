@@ -354,15 +354,28 @@ fi
 rm -f "$fattmp"
 elf_cmd=""; [ "$HAVE_ELF" -eq 1 ] && elf_cmd="exec /INIT.ELF\r"
 evil_cmd=""; [ "$HAVE_EVIL" -eq 1 ] && evil_cmd="exec /EVIL.ELF\r"
-( sleep "$BOOT_WAIT"; printf 'ls /\r'; sleep 0.4; printf 'cat /HELLO.TXT\r'; sleep 0.4; \
-  printf 'cat /docs/notes.txt\r'; sleep 0.4; printf 'cat /a-long-filename.txt\r'; sleep 0.4; \
-  [ -n "$elf_cmd" ] && { printf '%b' "$elf_cmd"; sleep 1; }; \
-  [ -n "$evil_cmd" ] && { printf '%b' "$evil_cmd"; sleep 1; }; \
-  printf 'exec /INIT\r'; sleep 1; printf 'exec0 /INIT0\r'; sleep 1 ) \
-    | timeout 15 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
-      -drive file="$FATDISK",format=raw,if=ide \
-      -chardev stdio,id=c0,logfile="$TMP/fat.log",signal=off -serial chardev:c0 \
-      -display none -no-reboot >/dev/null 2>&1 || true
+# Drive the cat/exec checks over a held-open FIFO, gating the start on the shell
+# prompt and the end on exec0's unique success marker, with a generous timeout.
+# (The old fixed-sleep + `timeout 15` form flaked under a loaded CI/TCG boot: the
+# tail commands — exec /INIT, exec0 /INIT0 — were killed before they ran.)
+ffifo="$TMP/fat.in"; rm -f "$ffifo"; mkfifo "$ffifo"
+timeout 60 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
+    -drive file="$FATDISK",format=raw,if=ide \
+    -chardev stdio,id=c0,logfile="$TMP/fat.log",signal=off -serial chardev:c0 \
+    -display none -no-reboot <"$ffifo" >/dev/null 2>&1 &
+fpid=$!
+exec 7>"$ffifo" # hold the input open so QEMU never sees EOF
+waitfor "Type 'help'" "$TMP/fat.log" "$fpid"; sleep 0.3
+printf 'ls /\rcat /HELLO.TXT\rcat /docs/notes.txt\rcat /a-long-filename.txt\r' >&7; sleep 0.5
+[ -n "$elf_cmd" ] && { printf '%b' "$elf_cmd" >&7; sleep 0.5; }
+[ -n "$evil_cmd" ] && { printf '%b' "$evil_cmd" >&7; sleep 0.5; }
+printf 'exec /INIT\r' >&7; sleep 0.5
+printf 'exec0 /INIT0\r' >&7
+# exec0/INIT0's "init returned 0xb017b007" marker is produced ONLY by this shell
+# command (the boot self-test never runs the ring-0 path), so waiting for it
+# guarantees every earlier command was processed too (the shell is sequential).
+waitfor "init returned 0xb017b007" "$TMP/fat.log" "$fpid"; sleep 0.5
+exec 7>&-; kill $fpid 2>/dev/null; wait $fpid 2>/dev/null
 assert_in "$TMP/fat.log" "[FAT32] mounted:"                "FAT32: mounts the volume (reads the BPB)"
 assert_in "$TMP/fat.log" "HELLO.TXT"                       "FAT32: lists root directory (8.3 name)"
 assert_in "$TMP/fat.log" "a-long-filename.txt"             "FAT32: assembles long file names (LFN)"
