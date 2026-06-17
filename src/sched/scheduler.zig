@@ -9,7 +9,7 @@
 // later step makes it preemptive by calling yield() from the timer interrupt.
 
 const serial = @import("../drivers/serial.zig");
-const heap = @import("../mm/heap.zig");
+const kstack = @import("kstack.zig"); // guarded kernel stacks (unmapped guard page per stack)
 const pic = @import("../arch/pic.zig"); // timer tick hook + tick counter
 const sync = @import("sync.zig"); // honor the print lock (don't switch mid-print)
 const mutex = @import("mutex.zig"); // blocking Mutex (used by the mutex self-test)
@@ -19,8 +19,7 @@ const syscall = @import("../arch/syscall.zig"); // per-process syscall kernel st
 const usermode = @import("../arch/usermode.zig"); // enterRing3 (first user dispatch)
 const pmm = @import("../mm/pmm.zig"); // frames for the demo's user pages
 
-const STACK_SIZE = 32 * 1024; // 32 KiB per thread (the shell uses std.fmt etc.)
-const MAX_THREADS = 16;
+const MAX_THREADS = 16; // also the number of guarded stack slots (kstack.MAX_STACKS)
 
 // The low-level context switch, written in assembly (a normal Zig function with
 // a compiler prologue would corrupt the hand-managed stack). It saves the
@@ -93,14 +92,15 @@ fn setupMain() void {
 // it lands in threadExit.
 pub fn spawn(name: []const u8, func: *const fn () void) void {
     if (thread_count >= MAX_THREADS) return;
-    const stack = heap.allocator().alloc(u8, STACK_SIZE) catch {
+    const gs = kstack.alloc(thread_count) orelse { // guarded stack for this thread slot
         serial.print("[SCHED]   failed to allocate a thread stack\n", .{});
         return;
     };
+    const stack = @as([*]u8, @ptrFromInt(gs.bottom))[0 .. gs.top - gs.bottom]; // record of the mapped region
 
     // 16-byte-aligned top. After switchContext's `ret` pops `func`, rsp will be
     // (top - 8), i.e. 8 mod 16 — the alignment the ABI expects at a call entry.
-    const top = (@intFromPtr(stack.ptr) + stack.len) & ~@as(usize, 0xF);
+    const top = gs.top & ~@as(usize, 0xF); // page-aligned already; mask kept for clarity
     var sp: usize = top;
     push(&sp, @intFromPtr(&threadExit)); // where the thread lands if it returns
     push(&sp, @intFromPtr(&threadStart)); // switchContext's `ret` enters the trampoline
@@ -253,11 +253,12 @@ fn threadExit() noreturn {
 // this and NOT wait on a process that was never created (see runUser).
 pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) bool {
     if (thread_count >= MAX_THREADS) return false;
-    const stack = heap.allocator().alloc(u8, STACK_SIZE) catch {
+    const gs = kstack.alloc(thread_count) orelse { // guarded kernel stack for this slot
         serial.print("[SCHED]   failed to allocate a user kernel stack\n", .{});
         return false;
     };
-    const top = (@intFromPtr(stack.ptr) + stack.len) & ~@as(usize, 0xF);
+    const stack = @as([*]u8, @ptrFromInt(gs.bottom))[0 .. gs.top - gs.bottom]; // record of the mapped region
+    const top = gs.top & ~@as(usize, 0xF);
     var sp: usize = top;
     push(&sp, @intFromPtr(&threadExit)); // fallback (userStart never returns here)
     push(&sp, @intFromPtr(&userStart)); // switchContext's `ret` enters this trampoline
