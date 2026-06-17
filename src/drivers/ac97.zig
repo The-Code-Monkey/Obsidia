@@ -21,7 +21,9 @@
 const pci = @import("pci.zig"); // find the device + reach its config space
 const dma = @import("../mm/dma.zig"); // contiguous <4 GiB DMA buffers
 const serial = @import("serial.zig"); // logging + the in/out port helpers
-const pic = @import("../arch/pic.zig"); // timer ticks, for bounded delays
+const pic = @import("../arch/pic.zig"); // timer ticks + IRQ handler registration
+const apic = @import("../arch/apic.zig"); // route the PCI interrupt via the I/O APIC
+const scheduler = @import("../sched/scheduler.zig"); // block/wake the play thread on IRQs
 const io = serial; // the port-I/O helpers (inb/inw/inl/outb/outw/outl) live here
 
 // PCI class/subclass for an AC'97 controller: multimedia (0x04), audio (0x01).
@@ -57,10 +59,15 @@ const GLOB_STA: u16 = 0x30; // 32-bit: global status (codec ready)
 // PCM-OUT control register (PO_CR) bits.
 const CR_RPBM: u8 = 1 << 0; // run/pause bus master: 1 = run, 0 = pause
 const CR_RR: u8 = 1 << 1; // reset this stream's registers (self-clears)
+const CR_LVBIE: u8 = 1 << 2; // interrupt when the last valid buffer completes
+const CR_IOCE: u8 = 1 << 4; // interrupt on completion of any IOC-flagged buffer
 
 // PCM-OUT status register (PO_SR) bits.
 const SR_DCH: u16 = 1 << 0; // DMA controller halted (no more buffers to play)
 const SR_CELV: u16 = 1 << 1; // current index has reached the last valid buffer
+const SR_LVBCI: u16 = 1 << 2; // last-valid-buffer completion interrupt (write-1-clear)
+const SR_BCIS: u16 = 1 << 3; // buffer completion interrupt status (write-1-clear)
+const SR_INT: u16 = SR_LVBCI | SR_BCIS; // the interrupt-cause bits we handle/clear
 
 // Global control / status bits.
 const GC_COLD_RESET: u32 = 1 << 1; // 1 = out of cold reset (normal operation)
@@ -89,6 +96,26 @@ var nam: u16 = 0; // NAM (mixer) I/O base — BAR0
 var nabm: u16 = 0; // NABM (bus master) I/O base — BAR1
 var bdl_buf: dma.Buffer = undefined; // the buffer descriptor list
 var pcm_buf: dma.Buffer = undefined; // the PCM sample buffer the BDL points at
+var irq_line: u8 = 0xFF; // the device's PCI interrupt line (0xFF = none)
+
+// Interrupt-driven playback state. The completion IRQ wakes the play thread so
+// the CPU sleeps between buffers instead of polling. Touched from IRQ context.
+var play_tid: usize = 0; // the thread blocked inside play()
+var play_active: bool = false; // true only while play() is streaming
+var completed: bool = false; // set by the IRQ when a buffer finished
+var irq_count: u64 = 0; // completion interrupts seen (for the self-report)
+
+// PCM-OUT completion interrupt handler. Level-triggered + the EOI-before-handler
+// dispatch means we may be called once spuriously per real interrupt, so this is
+// idempotent: act only if an interrupt-cause bit is set, clear it, wake play().
+fn irqHandler() void {
+    const sr = io.inw(nabm + PO_SR);
+    if (sr & SR_INT == 0) return; // not our completion (or the spurious second call)
+    io.outw(nabm + PO_SR, SR_INT); // write-1-clear the cause bits (deasserts the line)
+    irq_count += 1;
+    completed = true;
+    if (play_active) scheduler.wake(play_tid); // let the play thread refill
+}
 
 // Spin for `n` timer ticks (~10 ms each). The iteration cap guarantees we return
 // even if ticks somehow stall, so init can never hang here.
@@ -193,6 +220,7 @@ pub fn isPresent() bool {
 const RING: usize = 8; // DMA buffers in the ring (must be <= 32 BDL entries)
 const RING_FRAMES: usize = 2048; // frames per buffer (~43 ms at 48 kHz)
 const RING_BYTES: usize = RING_FRAMES * 4; // 16-bit stereo => 4 bytes/frame
+const WAIT_TICKS: u64 = 2; // ~20 ms fallback wait if a completion IRQ is missed
 
 // A source of PCM bytes: write up to dst.len bytes into a DMA buffer and return
 // how many were written; 0 means end of stream.
@@ -252,8 +280,17 @@ pub fn play(ctx: *anyopaque, fill: FillFn) usize {
     }
     if (prod == 0) return 0; // empty source: nothing to play
 
+    // Arm interrupt-driven streaming: the completion IRQ will wake this thread so
+    // the CPU sleeps between buffers rather than polling. (irq_line == 0xFF means
+    // no usable line — the timeout in the loop then drives refills on its own.)
+    play_tid = scheduler.currentId();
+    completed = false;
+    irq_count = 0;
+    play_active = true;
+    defer play_active = false;
+
     io.outb(nabm + PO_LVI, @intCast((prod - 1) % 32)); // last valid buffer
-    io.outb(nabm + PO_CR, CR_RPBM); // run the bus master
+    io.outb(nabm + PO_CR, CR_RPBM | CR_IOCE | CR_LVBIE); // run + interrupt on completion
 
     var civ_abs: usize = 0; // absolute index of the buffer the engine is on now
     while (true) {
@@ -276,13 +313,18 @@ pub fn play(ctx: *anyopaque, fill: FillFn) usize {
 
         if (io.inw(nabm + PO_SR) & SR_DCH != 0) { // engine halted
             if (eof) break; // finished everything we produced
-            io.outb(nabm + PO_CR, CR_RPBM); // underran: re-arm and let it resume
+            io.outb(nabm + PO_CR, CR_RPBM | CR_IOCE | CR_LVBIE); // underran: re-arm + resume
         }
-        delayTicks(1); // ~10 ms; one buffer is ~43 ms, so we poll several times per buffer
+
+        // Sleep until the completion IRQ wakes us, or WAIT_TICKS elapses as a
+        // safety net (a missed/late interrupt just adds a little latency, never an
+        // underrun — the ring holds ~340 ms). The CPU yields to other threads.
+        completed = false;
+        scheduler.sleep(WAIT_TICKS);
     }
 
     io.outb(nabm + PO_CR, 0); // stop the engine
-    serial.print("[AC97] play: streamed {d} bytes ({d} frames).\n", .{ total, total / 4 });
+    serial.print("[AC97] play: streamed {d} bytes ({d} frames), {d} completion IRQ(s).\n", .{ total, total / 4, irq_count });
     return total;
 }
 
@@ -303,6 +345,20 @@ pub fn init() void {
     // Let the device decode its I/O BARs and drive DMA.
     const cmd = pci.readDword(dev.bus, dev.slot, dev.func, PCI_COMMAND);
     pci.writeDword(dev.bus, dev.slot, dev.func, PCI_COMMAND, cmd | CMD_IO_SPACE | CMD_BUS_MASTER);
+
+    // Hook the device's PCI interrupt line so streaming playback (play()) can be
+    // woken by buffer-completion interrupts instead of polling. PCI INTx is
+    // level-triggered + active-low, so route it accordingly. The boot tone below
+    // still polls (it runs before the scheduler exists); only play() uses the IRQ.
+    irq_line = @intCast(pci.readDword(dev.bus, dev.slot, dev.func, 0x3C) & 0xFF);
+    if (irq_line != 0 and irq_line != 0xFF and irq_line < 16) {
+        pic.register(@intCast(irq_line), &irqHandler); // install + unmask
+        apic.routeIrqPci(irq_line); // re-route with PCI (level/low) semantics
+        serial.print("[AC97]   interrupt line IRQ{d} (PCI INTx)\n", .{irq_line});
+    } else {
+        serial.print("[AC97]   no usable interrupt line ({d}); play() will poll\n", .{irq_line});
+        irq_line = 0xFF;
+    }
 
     setupCodec();
 

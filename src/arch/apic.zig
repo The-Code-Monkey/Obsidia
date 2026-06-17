@@ -137,6 +137,30 @@ pub fn routeIrq(irq: u8) void {
     serial.print("[APIC]   IRQ{d} -> GSI{d} -> vector {d} (IOAPIC {d}, entry {d})\n", .{ irq, gsi, vector, io.id, idx });
 }
 
+// Route a PCI INTx line to its vector via the I/O APIC. PCI interrupts differ
+// from the ISA IRQs routeIrq handles: they are LEVEL-triggered and ACTIVE-LOW
+// (and may be shared between devices). Device drivers (e.g. AC'97) call this for
+// their interrupt line. Honors an ACPI GSI override if one exists, then forces
+// the PCI polarity/trigger. Unmasks the line.
+pub fn routeIrqPci(irq: u8) void {
+    if (!active) return;
+    var gsi: u32 = irq; // default: identity mapping
+    for (acpi.isos()) |iso| { // a remap override still applies (rare for PCI)
+        if (iso.source == irq) gsi = iso.gsi;
+    }
+    const vector: u32 = VECTOR_OFFSET + irq;
+    const io = ioApicForGsi(gsi) orelse {
+        serial.print("[APIC]   no I/O APIC handles GSI {d} (PCI IRQ{d})\n", .{ gsi, irq });
+        return;
+    };
+    const idx = gsi - io.gsi_base;
+    const low: u32 = vector | (1 << 13) | (1 << 15); // active-low (13) + level-triggered (15)
+    const high: u32 = bsp_id << 24; // destination APIC ID
+    ioWrite(io, 0x10 + idx * 2 + 1, high); // high half (dest) first
+    ioWrite(io, 0x10 + idx * 2, low); // low half unmasks the line
+    serial.print("[APIC]   PCI IRQ{d} -> GSI{d} -> vector {d} (level/low, IOAPIC {d}, entry {d})\n", .{ irq, gsi, vector, io.id, idx });
+}
+
 pub fn init() void {
     if (!acpi.isReady()) { // need the MADT data
         serial.print("[APIC] ACPI not available; staying on the PIC.\n", .{});
