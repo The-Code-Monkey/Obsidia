@@ -1,4 +1,4 @@
-// AHCI / SATA disk driver — READ ONLY (IDENTIFY + sector read over DMA).
+// AHCI / SATA disk driver — IDENTIFY + sector read AND write over DMA.
 //
 // AHCI (Advanced Host Controller Interface) is the modern way to talk to SATA
 // disks: instead of the CPU shovelling every word through an I/O port (the way
@@ -117,6 +117,7 @@ const TFD_ERR: u32 = 1 << 0; // error
 // --- ATA commands carried in the Command FIS ---------------------------------
 const ATA_IDENTIFY: u8 = 0xEC; // IDENTIFY DEVICE: 256 words (512 B) of disk info
 const ATA_READ_DMA_EXT: u8 = 0x25; // READ DMA EXT: 48-bit-LBA DMA sector read
+const ATA_WRITE_DMA_EXT: u8 = 0x35; // WRITE DMA EXT: 48-bit-LBA DMA sector write
 
 pub const SECTOR_SIZE: usize = 512; // bytes per sector (fixed for SATA disks)
 
@@ -161,7 +162,7 @@ const CmdHeader = packed struct {
     ctbau: u32, // command table base upper 32 bits (0 for us, <4 GiB)
     rsv: u128, // reserved (16 bytes)
 };
-const CH_WRITE: u16 = 1 << 6; // DW0 bit 6: this command writes to the device (unused here)
+const CH_WRITE: u16 = 1 << 6; // DW0 bit 6: this command writes to the device (set for WRITE DMA EXT)
 
 // A PRDT (Physical Region Descriptor Table) entry: one chunk of the data buffer.
 // dba = physical base; dbc = byte count minus one (bit 0 must be 1 => even length).
@@ -334,13 +335,16 @@ fn issueCommand(p: u32, slot: u5) bool {
 
 // Build the command header (slot 0) + command table for a single-PRDT transfer of
 // `byte_count` bytes into/out of `data_phys`, carrying ATA command `command` at
-// 48-bit `lba` for `count` sectors. This is a read-only driver, so the command
-// always reads. Programs the command table's CFIS and its one PRDT entry, and the
-// command header that points at the table. Returns false on an invalid length.
+// 48-bit `lba` for `count` sectors. `write` selects the data direction: when true
+// (WRITE DMA EXT) we OR the command-header write bit (CH_WRITE / DW0 bit 6) so the
+// HBA DMA-reads our data buffer and pushes it to the device; when false (read /
+// IDENTIFY) the bit stays clear and the HBA DMA-writes into our buffer. Programs the
+// command table's CFIS and its one PRDT entry, and the command header that points at
+// the table. Returns false on an invalid length.
 //
 // The caller must have confirmed the port is idle (slot 0 not in flight) FIRST —
 // this overwrites the live command list/table the HBA DMA-reads while running.
-fn buildCommand(command: u8, lba: u64, count: u16, data_phys: u64, byte_count: usize) bool {
+fn buildCommand(command: u8, lba: u64, count: u16, data_phys: u64, byte_count: usize, is_write: bool) bool {
     // A PRDT entry encodes (byte_count - 1) in bits 0..21 and requires an EVEN byte
     // count (so the encoded bit 0 is 1). Reject zero/odd/over-max lengths up front
     // rather than emit an illegal descriptor or underflow `byte_count - 1`.
@@ -352,6 +356,7 @@ fn buildCommand(command: u8, lba: u64, count: u16, data_phys: u64, byte_count: u
     // CFL = command FIS length in DWORDS. A Register H2D FIS is 20 bytes = 5 DWORDs
     // (its on-the-wire bit-size, NOT @sizeOf, which is padded to the backing int).
     h.flags = @intCast(@bitSizeOf(FisRegH2D) / 32); // CFL in bits 0..4; W/A/P left 0 (read)
+    if (is_write) h.flags |= CH_WRITE; // DW0 bit 6: HBA reads our buffer and writes the device
     h.prdtl = 1; // exactly one PRDT entry
     h.prdbc = 0; // the HBA fills in the byte count it transferred
     h.ctba = @intCast(ctbl_buf.phys); // command table base (phys, <4 GiB)
@@ -400,7 +405,7 @@ fn buildCommand(command: u8, lba: u64, count: u16, data_phys: u64, byte_count: u
 // false on failure.
 fn identify(p: u32) bool {
     if (!waitNotBusy(p)) return false; // device idle + slot 0 free before we mutate the table
-    if (!buildCommand(ATA_IDENTIFY, 0, 0, data_buf.phys, SECTOR_SIZE)) return false;
+    if (!buildCommand(ATA_IDENTIFY, 0, 0, data_buf.phys, SECTOR_SIZE, false)) return false; // read direction
     if (!issueCommand(p, 0)) return false;
 
     // IDENTIFY data is 256 little-endian words; the model string is words 27..46,
@@ -430,11 +435,30 @@ pub fn read(lba: u64, count: u16, dst: []u8) bool {
     if (dst.len < bytes) return false; // caller's buffer too small
 
     if (!waitNotBusy(port)) return false; // device idle + slot 0 free before we mutate the table
-    if (!buildCommand(ATA_READ_DMA_EXT, lba, count, data_buf.phys, bytes)) return false;
+    if (!buildCommand(ATA_READ_DMA_EXT, lba, count, data_buf.phys, bytes, false)) return false; // read direction
     if (!issueCommand(port, 0)) return false;
 
     @memcpy(dst[0..bytes], data_buf.virt[0..bytes]); // copy out of the DMA buffer
     return true;
+}
+
+// Write `count` sectors starting at `lba` from `src` (>= count*512 bytes) to the
+// disk via bus-master DMA. Mirrors read() but REVERSES the data direction: we copy
+// the caller's bytes INTO the DMA data buffer BEFORE issuing, then hand the HBA a
+// WRITE DMA EXT command with the command-header write bit set so its DMA engine
+// reads our buffer and pushes it to the device. Returns false on bad args, no disk,
+// or a task-file error. DESTRUCTIVE — overwrites the named sectors on the disk.
+pub fn write(lba: u64, count: u16, src: []const u8) bool {
+    if (!present) return false; // no disk to write to
+    if (count == 0) return false; // nothing to write
+    const bytes = @as(usize, count) * SECTOR_SIZE;
+    if (bytes > data_buf.len) return false; // would overrun our DMA data buffer
+    if (src.len < bytes) return false; // caller's buffer too small to supply the data
+
+    if (!waitNotBusy(port)) return false; // device idle + slot 0 free before we mutate the table
+    @memcpy(data_buf.virt[0..bytes], src[0..bytes]); // stage the data in the DMA buffer BEFORE issuing
+    if (!buildCommand(ATA_WRITE_DMA_EXT, lba, count, data_buf.phys, bytes, true)) return false; // write direction
+    return issueCommand(port, 0); // HBA DMA-reads data_buf and writes it to the disk
 }
 
 // Disk present and usable? (Mirrors ata.isPresent — a future FS layer can check.)
@@ -666,5 +690,49 @@ pub fn selfTest() void {
         serial.print("[AHCI] self-test OK: IDENTIFY model present + sector-0 DMA read succeeded.\n", .{});
     } else {
         serial.print("[AHCI] self-test FAILED (model_ok={}, read_ok={}).\n", .{ model_ok, read_ok });
+    }
+
+    // --- WRITE-path self-test (non-destructive) ------------------------------
+    // Exercise write() round-trip on a SCRATCH sector (LBA 1, well clear of the
+    // MBR/boot sector at LBA 0). The recipe is: read+SAVE the sector's original
+    // bytes, write a known pattern, read it back and verify byte-for-byte, then
+    // RESTORE the original bytes so the disk is left exactly as we found it. Every
+    // sub-step is gated so a failure short-circuits without leaving the scratch
+    // sector clobbered (we still attempt the restore if the verify ran).
+    const SCRATCH_LBA: u64 = 1; // sector 1: scratch, never the boot sector (LBA 0)
+    var saved: [SECTOR_SIZE]u8 = undefined; // the sector's original contents (to restore)
+    var pattern: [SECTOR_SIZE]u8 = undefined; // the known pattern we write then verify
+    var verify: [SECTOR_SIZE]u8 = undefined; // what we read back after the write
+
+    // A deterministic, non-trivial pattern so a stuck/zeroing path can't pass by luck.
+    var i: usize = 0;
+    while (i < SECTOR_SIZE) : (i += 1) pattern[i] = @truncate((i *% 7) +% 0x5A);
+
+    // 1. Save the original contents so we can put them back.
+    const save_ok = read(SCRATCH_LBA, 1, &saved);
+    // 2. Write the known pattern (only if the save succeeded — never write blind).
+    const write_ok = save_ok and write(SCRATCH_LBA, 1, &pattern);
+    // 3. Read it back and compare every byte.
+    var verify_ok = false;
+    if (write_ok and read(SCRATCH_LBA, 1, &verify)) {
+        verify_ok = true;
+        var j: usize = 0;
+        while (j < SECTOR_SIZE) : (j += 1) {
+            if (verify[j] != pattern[j]) {
+                verify_ok = false; // mismatch: the round-trip did not preserve the data
+                break;
+            }
+        }
+    }
+    // 4. Restore the original bytes so the self-test leaves the disk untouched. We
+    //    restore whenever the save succeeded (even if verify failed), so a partial
+    //    write can't strand the scratch sector with the test pattern.
+    const restore_ok = save_ok and write(SCRATCH_LBA, 1, &saved);
+
+    serial.print("[AHCI]   self-test: write save-ok={}, write-ok={}, verify-ok={}, restore-ok={}\n", .{ save_ok, write_ok, verify_ok, restore_ok });
+    if (write_ok and verify_ok and restore_ok) {
+        serial.print("[AHCI] write self-test OK: WRITE DMA EXT round-trip verified + original restored.\n", .{});
+    } else {
+        serial.print("[AHCI] write self-test FAILED (save={}, write={}, verify={}, restore={}).\n", .{ save_ok, write_ok, verify_ok, restore_ok });
     }
 }
