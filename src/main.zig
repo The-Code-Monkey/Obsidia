@@ -13,6 +13,7 @@ const apic = @import("arch/apic.zig"); // modern interrupt controller (LAPIC + I
 const pmm = @import("mm/pmm.zig"); // physical frame allocator
 const vmm = @import("mm/vmm.zig"); // page tables / virtual memory
 const heap = @import("mm/heap.zig"); // kernel heap (std.mem.Allocator)
+const dma = @import("mm/dma.zig"); // contiguous <4 GiB buffers for bus-master DMA
 const console = @import("drivers/console.zig"); // on-screen framebuffer text console
 const keyboard = @import("drivers/keyboard.zig"); // PS/2 keyboard input
 const mouse = @import("drivers/mouse.zig"); // PS/2 mouse (scroll wheel -> scrollback)
@@ -285,6 +286,10 @@ export fn _start() noreturn {
     } else {
         serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable, staying on PIC)\n", .{});
     }
+
+    // DMA buffer allocator: physically-contiguous, <4 GiB, zeroed buffers for
+    // the bus-master devices the PCI drivers below will drive (audio/AHCI/NIC).
+    dma.init();
 
     // Enumerate the PCI bus: discover every device and its class. The foundation
     // later drivers (audio, AHCI, NIC) use to find and configure their hardware.

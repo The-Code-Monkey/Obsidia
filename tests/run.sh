@@ -138,6 +138,10 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[PCI] Enumeration complete:"               "$p PCI: bus enumeration completed (config mechanism #1)"
     assert_in "$log" "class 01.06 prog-if 01"                    "$p PCI: decoded the AHCI controller (class/subclass/prog-if)"
     assert_in "$log" "BAR5: MMIO32"                              "$p PCI: decoded + sized a device BAR (MMIO)"
+    assert_in "$log" "[DMA] DMA buffer allocator initialized."   "$p DMA: contiguous <4 GiB buffer allocator init"
+    assert_in "$log" "aligned=true nonzero=true below-4G=true"   "$p DMA: buffer page-aligned, nonzero, 32-bit-addressable"
+    assert_in "$log" "contiguous=true hhdm-round-trip=true"      "$p DMA: frames contiguous + HHDM alias round-trips"
+    assert_in "$log" "[DMA]     freed; free-count restored: true" "$p DMA: free returns the whole run (no leak)"
 }
 
 # --- Boot-marker tests, both firmwares ---------------------------------------
@@ -490,15 +494,17 @@ if command -v socat >/dev/null && command -v convert >/dev/null && command -v co
         -display none -no-reboot <"$fifo" >/dev/null 2>&1 &
     qpid=$!
     exec 3>"$fifo" # hold the serial input FIFO open so QEMU never sees EOF
-    sleep "$((BOOT_WAIT + 2))"
+    # Gate every step on the kernel's own log markers rather than fixed sleeps:
+    # under a loaded CI (TCG) the old fixed windows were too tight, so the
+    # PageDown's "live" marker occasionally didn't land before we killed QEMU.
+    waitfor "Type 'help'" "$log" "$qpid"; sleep 0.5 # shell up, console live
     echo "screendump $before" | socat - "unix-connect:$sock" >/dev/null 2>&1 # live screen
-    sleep 0.6
+    sleep 0.3
     printf '\x1b[5~\x1b[5~\x1b[5~' >&3 # Page Up x3 (scroll back)
-    sleep 0.6
+    waitfor "scrollback up:" "$log" "$qpid"; sleep 0.4 # wait until the scroll registered
     echo "screendump $after" | socat - "unix-connect:$sock" >/dev/null 2>&1 # scrolled screen
-    sleep 0.6
     printf '\x1b[6~\x1b[6~\x1b[6~\x1b[6~\x1b[6~' >&3 # Page Down x5 (back to live)
-    sleep 0.6
+    waitfor "scrollback: live" "$log" "$qpid"; sleep 0.2 # wait until we reach the bottom
     exec 3>&-; sleep 0.3; kill $qpid 2>/dev/null; wait $qpid 2>/dev/null
     # Serial markers: at least one scroll-up happened, and a PageDown reached live.
     assert_in "$log" "scrollback up:"          "scrollback: PageUp scrolled the view back"
