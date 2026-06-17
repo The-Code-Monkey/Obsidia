@@ -136,6 +136,17 @@ fn capacityOf(memory: []u8) usize {
 // Allocator.alloc: get a raw block, place an aligned payload inside it, stash a header.
 fn vtAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
     const req = alignment.toByteUnits(); // requested alignment in bytes
+    // Overflow guard: an absurd `len` (or `req`) could make the header+align+len
+    // sum below wrap around the usize space and produce a tiny `need`, handing
+    // out a block far smaller than asked. Reject anything that cannot possibly
+    // fit in the heap region BEFORE doing the arithmetic that could wrap. The
+    // heap can never serve a block larger than its whole span, so this rejects
+    // no real allocation. The comparisons are written so the check itself can't
+    // overflow: each subtraction's left side is proven >= its right side first.
+    const HEAP_SPAN: usize = HEAP_MAX - HEAP_BASE; // largest a block could ever be
+    if (len > HEAP_SPAN) return null; // payload alone won't fit
+    if (req > HEAP_SPAN - len) return null; // payload + worst-case padding won't fit
+    if (@sizeOf(AllocHeader) > HEAP_SPAN - len - req) return null; // + header won't fit
     const need = @sizeOf(AllocHeader) + req + len; // worst-case raw size (header + padding + data)
     var blk = rawAlloc(need); // try the free list
     if (blk == null) { // out of free space?
