@@ -23,7 +23,7 @@ const dma = @import("../mm/dma.zig"); // contiguous <4 GiB DMA buffers
 const serial = @import("serial.zig"); // logging + the in/out port helpers
 const pic = @import("../arch/pic.zig"); // timer ticks + IRQ handler registration
 const apic = @import("../arch/apic.zig"); // route the PCI interrupt via the I/O APIC
-const scheduler = @import("../sched/scheduler.zig"); // block/wake the play thread on IRQs
+const waitqueue = @import("../sched/waitqueue.zig"); // block/wake the play thread on IRQs
 const io = serial; // the port-I/O helpers (inb/inw/inl/outb/outw/outl) live here
 
 // PCI class/subclass for an AC'97 controller: multimedia (0x04), audio (0x01).
@@ -99,11 +99,9 @@ var pcm_buf: dma.Buffer = undefined; // the PCM sample buffer the BDL points at
 var irq_line: u8 = 0xFF; // the device's PCI interrupt line (0xFF = none)
 var vra_ok: bool = false; // codec supports variable-rate audio (per-stream DAC rate)
 
-// Interrupt-driven playback state. The completion IRQ wakes the play thread so
-// the CPU sleeps between buffers instead of polling. Touched from IRQ context.
-var play_tid: usize = 0; // the thread blocked inside play()
-var play_active: bool = false; // true only while play() is streaming
-var completed: bool = false; // set by the IRQ when a buffer finished
+// Interrupt-driven playback: the completion IRQ signals this wait queue, waking
+// the play thread to refill so the CPU sleeps between buffers instead of polling.
+var pcm_wq: waitqueue.WaitQueue = .{};
 var irq_count: u64 = 0; // completion interrupts seen (for the self-report)
 
 // PCM-OUT completion interrupt handler. Level-triggered + the EOI-before-handler
@@ -114,8 +112,7 @@ fn irqHandler() void {
     if (sr & SR_INT == 0) return; // not our completion (or the spurious second call)
     io.outw(nabm + PO_SR, SR_INT); // write-1-clear the cause bits (deasserts the line)
     irq_count += 1;
-    completed = true;
-    if (play_active) scheduler.wake(play_tid); // let the play thread refill
+    pcm_wq.signal(); // wake the play thread to refill (no-op if it isn't waiting)
 }
 
 // Spin for `n` timer ticks (~10 ms each). The iteration cap guarantees we return
@@ -291,14 +288,10 @@ pub fn play(rate: u32, ctx: *anyopaque, fill: FillFn) usize {
     }
     if (prod == 0) return 0; // empty source: nothing to play
 
-    // Arm interrupt-driven streaming: the completion IRQ will wake this thread so
-    // the CPU sleeps between buffers rather than polling. (irq_line == 0xFF means
-    // no usable line — the timeout in the loop then drives refills on its own.)
-    play_tid = scheduler.currentId();
-    completed = false;
+    // Arm interrupt-driven streaming: the completion IRQ signals pcm_wq, waking us
+    // to refill so the CPU sleeps between buffers. (irq_line == 0xFF means no usable
+    // line — wait()'s timeout then drives refills on its own.)
     irq_count = 0;
-    play_active = true;
-    defer play_active = false;
 
     io.outb(nabm + PO_LVI, @intCast((prod - 1) % 32)); // last valid buffer
     io.outb(nabm + PO_CR, CR_RPBM | CR_IOCE | CR_LVBIE); // run + interrupt on completion
@@ -327,11 +320,10 @@ pub fn play(rate: u32, ctx: *anyopaque, fill: FillFn) usize {
             io.outb(nabm + PO_CR, CR_RPBM | CR_IOCE | CR_LVBIE); // underran: re-arm + resume
         }
 
-        // Sleep until the completion IRQ wakes us, or WAIT_TICKS elapses as a
+        // Block until the completion IRQ signals us, or WAIT_TICKS elapses as a
         // safety net (a missed/late interrupt just adds a little latency, never an
         // underrun — the ring holds ~340 ms). The CPU yields to other threads.
-        completed = false;
-        scheduler.sleep(WAIT_TICKS);
+        _ = pcm_wq.wait(WAIT_TICKS);
     }
 
     io.outb(nabm + PO_CR, 0); // stop the engine
