@@ -12,6 +12,7 @@
 // importing the scheduler directly.
 
 const scheduler = @import("scheduler.zig"); // block(), wake(id), currentId()
+const sync = @import("sync.zig"); // IF-aware critical-section helpers
 
 // The maximum number of threads that can be queued waiting on a single mutex.
 // MAX_THREADS in the scheduler is 16, so a queue this size can never overflow:
@@ -23,27 +24,10 @@ const MAX_WAITERS = 16;
 // never collide with a valid id.
 const NO_OWNER: usize = ~@as(usize, 0);
 
-// Capture the current interrupt-enable flag (IF, bit 9 of RFLAGS) and then mask
-// interrupts. We return whether IF *was* set so the caller can restore exactly
-// the state it came in with — this mirrors how scheduler.yield() is IF-aware, so
-// a Mutex works correctly whether called with interrupts on (normal thread
-// context) or already off (e.g. nested inside another cli region).
-fn saveAndDisableInterrupts() bool {
-    var flags: u64 = undefined; // receives the pushed RFLAGS
-    asm volatile ("pushfq; popq %[f]; cli" // snapshot RFLAGS, then disable interrupts
-        : [f] "=r" (flags),
-        :
-        : "memory"
-    );
-    return (flags & 0x200) != 0; // bit 9 = IF; true if interrupts were enabled
-}
-
-// Restore the interrupt flag we captured: re-enable only if it was on before.
-// We never blindly `sti`, so calling lock/unlock from an already-cli region (or
-// from interrupt context) doesn't silently turn interrupts back on.
-fn restoreInterrupts(if_was: bool) void {
-    if (if_was) asm volatile ("sti"); // re-enable interrupts iff they were on
-}
+// IF-aware critical sections live in sync.zig (shared with WaitQueue). Aliased
+// here so the lock/unlock bodies below read unchanged.
+const saveAndDisableInterrupts = sync.saveAndDisableInterrupts;
+const restoreInterrupts = sync.restoreInterrupts;
 
 pub const Mutex = struct {
     // The id of the thread currently holding the lock, or NO_OWNER if free.
