@@ -21,6 +21,7 @@ const heap = @import("mm/heap.zig"); // allocator for the scrypt verify
 const install = @import("install.zig"); // the `install` command (in-guest installer)
 const editor = @import("editor.zig"); // the `edit` command (text editor)
 const ac97 = @import("drivers/ac97.zig"); // the `play` command (AC'97 audio)
+const rtc = @import("drivers/rtc.zig"); // the `date` command (RTC wall-clock)
 const wav = @import("fs/wav.zig"); // WAV (RIFF) parsing for `play`
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
@@ -375,7 +376,7 @@ fn execute(raw: []const u8) void {
 
     if (std.mem.eql(u8, cmd, "help")) { // list commands
         serial.print("commands: help, clear, echo <text>, mem, uptime, history, ps,\n", .{});
-        serial.print("          cd [dir], ls [path], cat <path>, edit <path>, exec <path>,\n", .{});
+        serial.print("          cd [dir], ls [path], cat <path>, edit <path>, exec <path>, date,\n", .{});
         if (ac97.isPresent()) serial.print("          play <file> (.wav or 16-bit stereo 48 kHz .pcm),\n", .{});
         if (install.available()) serial.print("          install (clone Obsidia onto the disk),\n", .{});
         serial.print("          sleep (full-system sleep til keypress), restart, shutdown, crash\n", .{});
@@ -480,6 +481,9 @@ fn execute(raw: []const u8) void {
         const free_mib = free * pmm.PAGE_SIZE / (1024 * 1024); // free MiB
         const total_mib = total * pmm.PAGE_SIZE / (1024 * 1024); // total MiB
         serial.print("memory: {d}/{d} frames free ({d}/{d} MiB)\n", .{ free, total, free_mib, total_mib });
+    } else if (std.mem.eql(u8, cmd, "date")) { // current wall-clock time from the RTC
+        rtc.printDateTime(rtc.now()); // read + format "YYYY-MM-DD HH:MM:SS UTC"
+        serial.print("\n", .{});
     } else if (std.mem.eql(u8, cmd, "uptime")) { // seconds since boot
         const t = pic.ticks(); // 100 Hz tick counter
         serial.print("uptime: {d}.{d:0>2}s ({d} ticks @ 100 Hz)\n", .{ t / 100, t % 100, t });

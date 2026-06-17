@@ -22,6 +22,7 @@ const pci = @import("drivers/pci.zig"); // PCI bus enumeration (config mechanism
 const ac97 = @import("drivers/ac97.zig"); // AC'97 audio (PCM playback over DMA)
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
 const ahci = @import("drivers/ahci.zig"); // AHCI/SATA disk (DMA block device, read-only)
+const rtc = @import("drivers/rtc.zig"); // RTC / CMOS wall-clock (date + time)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
@@ -334,6 +335,11 @@ export fn _start() noreturn {
     // the kernel carries on.
     ahci.init();
     ahci.selfTest();
+
+    // Read the battery-backed RTC and log the current wall-clock time. No hardware
+    // to bring up (the CMOS RTC is always running), so this is just a boot marker;
+    // the `date` shell command reads it live.
+    rtc.init();
 
     // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
     fat32.selfTest();
