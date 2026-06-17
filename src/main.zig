@@ -86,19 +86,14 @@ fn readModules() void {
         const bytes = @as([*]const u8, @ptrCast(file.address))[0..file.size];
         if (endsWithIgnoreCase(path, "AUTH")) {
             auth_module = bytes;
-            serial.print("[OBSIDIA] module: auth credential ({d} bytes)\n", .{file.size});
         } else if (endsWithIgnoreCase(path, "SYSTEM.IMG")) {
             system_module = bytes;
-            serial.print("[OBSIDIA] module: system image ({d} bytes)\n", .{file.size});
         } else if (endsWithIgnoreCase(path, "BOOTX64.EFI")) {
             bootx64_module = bytes;
-            serial.print("[OBSIDIA] module: bootloader BOOTX64.EFI ({d} bytes)\n", .{file.size});
         } else if (endsWithIgnoreCase(path, "INSTALLED.CONF")) {
             installed_conf_module = bytes;
-            serial.print("[OBSIDIA] module: installed limine.conf ({d} bytes)\n", .{file.size});
         } else if (endsWithIgnoreCase(path, "KERNEL.ELF")) {
             kernel_module = bytes;
-            serial.print("[OBSIDIA] module: kernel image ({d} bytes)\n", .{file.size});
         }
     }
 }
@@ -151,10 +146,8 @@ var rng_state: u64 = 0x9E3779B97F4A7C15; // golden-ratio seed, stirred per call
 // the existing TSC-stirred xorshift64. Freestanding-safe (no std.Thread/OS).
 fn cryptoRandomSeed(buffer: []u8) void {
     if (cpu.rdrandFill(buffer)) {
-        serial.print("[OBSIDIA] RNG: rdrand\n", .{});
         return;
     }
-    serial.print("[OBSIDIA] RNG: rdtsc\n", .{});
     for (buffer) |*b| {
         rng_state ^= rdtsc() *% 0x2545F4914F6CDD1D; // mix in fresh cycle counts
         rng_state ^= rng_state << 13; // xorshift64 scramble
@@ -204,7 +197,6 @@ fn hcf() noreturn {
 export fn _start() noreturn {
     // Serial first, so we can see everything that follows — including failures.
     serial.init(); // bring up COM1
-    serial.print("========================================\n", .{}); // banner
     serial.print("[OBSIDIA] Kernel entered _start.\n", .{});
 
     // Verify the bootloader supports the boot-protocol revision we asked for.
@@ -212,7 +204,6 @@ export fn _start() noreturn {
         serial.print("[OBSIDIA] PANIC: base revision not supported\n", .{});
         hcf(); // unsupported -> we can't safely continue
     }
-    serial.print("[OBSIDIA] Base revision OK.\n", .{});
 
     // Replace Limine's GDT with our own (segments + TSS).
     gdt.init();
@@ -261,9 +252,6 @@ export fn _start() noreturn {
             .green_shift = fb.green_mask_shift,
             .blue_shift = fb.blue_mask_shift,
         };
-        serial.print("[OBSIDIA] Framebuffer acquired: {}x{} @ 0x{x}\n", .{ fb.width, fb.height, @intFromPtr(fb.address) });
-    } else {
-        serial.print("[OBSIDIA] WARN: no framebuffer response\n", .{});
     }
 
     // Take over paging: build our own page tables and load CR3. After this we
@@ -307,8 +295,6 @@ export fn _start() noreturn {
         apic.init();
         // Calibrate + start the LAPIC timer (retires the PIT as the timer source).
         apic.initTimer(100); // 100 Hz, matching the old PIT rate
-    } else {
-        serial.print("[OBSIDIA] WARN: no RSDP response (ACPI unavailable, staying on PIC)\n", .{});
     }
 
     // DMA buffer allocator: physically-contiguous, <4 GiB, zeroed buffers for
@@ -344,9 +330,7 @@ export fn _start() noreturn {
     // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
     fat32.selfTest();
 
-    serial.print("[OBSIDIA] Kernel initialized successfully.\n", .{});
     serial.print("BOOT_OK\n", .{}); // the marker our test harness greps for
-    serial.print("========================================\n", .{});
 
     // Switch off Limine's boot stack (which lives in bootloader-reclaimable
     // memory) onto our own kernel stack, then reclaim that memory and start the
