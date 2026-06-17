@@ -107,6 +107,7 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "[VMM] Virtual memory manager initialized."  "$p VMM init"
     assert_in "$log" "HHDM alias of that frame agrees: OK"        "$p VMM self-test (mapping)"
     assert_in "$log" "W^X enforced: OK"                           "$p W^X enforced"
+    assert_in "$log" "uncacheable-MMIO self-test: round-trip OK, PCD set" "$p VMM: uncacheable MMIO mapping (PCD/UC)"
     assert_in "$log" "[HEAP] Kernel heap initialized."            "$p heap init"
     assert_in "$log" "create/destroy=true, slice=true, ArrayList=true" "$p heap self-test (std allocator)"
     assert_in "$log" "[CON] Framebuffer console initialized."     "$p framebuffer console init"

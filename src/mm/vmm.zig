@@ -29,6 +29,8 @@ const FOUR_GIB: u64 = 0x100000000; // minimum HHDM span (covers RAM + MMIO)
 const PRESENT: u64 = 1 << 0; // entry is valid
 const WRITE: u64 = 1 << 1; // writes allowed
 const USER: u64 = 1 << 2; // U/S: accessible from ring 3 (CPL 3) when set
+const PWT: u64 = 1 << 3; // Page Write-Through (PAT index bit 0)
+const PCD: u64 = 1 << 4; // Page Cache Disable (PAT index bit 1) -> UC with default PAT
 const HUGE: u64 = 1 << 7; // PS bit (2 MiB page when set at PD level)
 const NX: u64 = 1 << 63; // No-eXecute (usable only once EFER.NXE is set)
 const ADDR_MASK: u64 = 0x000FFFFFFFFFF000; // bits 12..51 hold the physical address
@@ -172,9 +174,28 @@ pub fn unmap(virt: u64) void {
     unmapPage(tableAt(pml4_phys), virt); // remove the mapping
     flushTlb(virt);
 }
+
+// Map a single 4 KiB page as UNCACHEABLE (UC) — the mapping device drivers use
+// for MMIO. Identical to map() but forces the leaf PTE's PCD (Page Cache Disable)
+// bit on. With the PAT left at its reset default, the (PAT,PCD,PWT) = (0,1,0)
+// encoding selects memory type UC (strong uncacheable): no PAT MSR reprogramming
+// is needed, so this is the simplest correct way to get UC pages.
+//
+// Why MMIO must be uncacheable: a BAR window is device registers, not RAM. If the
+// CPU were allowed to cache it, reads could return a stale cached copy instead of
+// the live hardware state, writes could sit in a write-back line and never reach
+// the device (or reach it coalesced / reordered), and a status register that the
+// device updates on its own would never appear to change. UC forces every access
+// straight through to the device in program order, which is what register I/O
+// (and memory-mapped doorbells / DMA descriptors that must be observed) require.
+pub fn mapUncacheable(virt: u64, phys: u64, flags: u64) void {
+    mapPage(tableAt(pml4_phys), virt, phys, flags | PCD); // PCD -> UC leaf
+    flushTlb(virt); // drop any stale (possibly cacheable) TLB entry
+}
 pub const FLAG_WRITE = WRITE; // re-exported so callers can request writable pages
 pub const FLAG_NX = NX; // ...and non-executable pages
 pub const FLAG_USER = USER; // ...and pages reachable from ring 3 (user mode)
+pub const FLAG_UC = PCD; // ...and uncacheable (PCD) pages, for MMIO
 
 // --- Per-process address spaces ----------------------------------------------
 // The kernel lives entirely in the higher half (PML4 entries 256..511: HHDM,
@@ -403,6 +424,45 @@ pub fn selfTestAddressSpace() void {
 
     pmm.free(frame); // the data frame is ours to free
     destroyAddressSpace(as); // free the space's tables + PML4
+}
+
+// --- Uncacheable-MMIO self-test ----------------------------------------------
+// Prove mapUncacheable() works: allocate a frame, map it UC at a spare kernel VA,
+// round-trip a pattern through the UC mapping (UC is uncached, NOT broken — plain
+// loads/stores still work, they just bypass the cache), and confirm the leaf PTE
+// actually carries the PCD bit. This exercises the exact path a future MMIO driver
+// (AHCI/NIC BAR) will take, on ordinary RAM so we have a frame to read back.
+pub fn selfTestUncacheable() void {
+    serial.print("[VMM] uncacheable-MMIO self-test...\n", .{});
+    const pml4 = tableAt(pml4_phys); // the live tables (for the PCD-bit check)
+    // A spare higher-half VA: not HEAP_BASE (0xffffc...), LOAD_BASE (0xffffd...),
+    // the selfTest scratch (0x...d0000000), the HHDM, or the kernel image.
+    const va: u64 = 0xffffffffe0000000;
+    const frame = pmm.allocZeroed() orelse { // a physical frame to back the UC page
+        serial.print("[VMM]   FAILED: no frame for the UC page\n", .{});
+        return;
+    };
+
+    mapUncacheable(va, frame, PRESENT | WRITE | NX); // map it UC, RW + non-exec
+
+    // Round-trip a pattern through the UC mapping — UC bypasses the cache but
+    // ordinary reads/writes must still land in the backing frame correctly.
+    const p: [*]volatile u64 = @ptrFromInt(va); // access via the UC mapping
+    p[0] = 0xC0DE_FACE_1234_5678; // write a marker through the UC page
+    const round_trip = p[0] == 0xC0DE_FACE_1234_5678; // read it back
+
+    // Read the leaf PTE back from the live tables and confirm PCD is set.
+    const leaf = queryEntry(pml4, va) orelse 0; // the 4 KiB leaf entry
+    const pcd_set = leaf & PCD != 0; // the cache-disable bit we OR'd in
+
+    if (round_trip and pcd_set) {
+        serial.print("[VMM] uncacheable-MMIO self-test: round-trip OK, PCD set\n", .{});
+    } else {
+        serial.print("[VMM] uncacheable-MMIO self-test FAILED (round-trip={}, PCD={})\n", .{ round_trip, pcd_set });
+    }
+
+    unmap(va); // tear down the UC mapping
+    pmm.free(frame); // return the frame
 }
 
 pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
