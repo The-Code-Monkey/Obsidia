@@ -134,13 +134,53 @@ fn putpixel(x: usize, y: usize, color: u32) void {
     ptr.* = color; // store the color
 }
 
+// Fill a `w` x `h` pixel rectangle whose top-left is at (x0, y0) with a single
+// solid `color`, using row-stride bulk copies instead of one volatile store per
+// pixel. This is the hot path for screen clears and the post-scroll bottom-row
+// fill: for a 1280x800 screen that is ~1M pixels, so the old per-pixel volatile
+// stores dominated the cost of every clear/scroll.
+//
+// Strategy: build a short run of the fill color in a small stack buffer, then
+// stamp it across each row in template-sized chunks with std.mem.copyForwards
+// (which lowers to an optimized memcpy). The existing move-up scroll already
+// memmoves the whole framebuffer as plain RAM, so a non-volatile bulk store is
+// equally correct here; we keep the volatile putpixel only for the cursor's
+// tiny spans where elision could bite. Like putpixel, this assumes 32 bpp.
+//
+// The template is deliberately small (1 KiB), not a full scanline: this runs on
+// the live print path (newline -> scrollFb -> fillRect, under preemptDisable)
+// where the 32 KiB thread stack is shared with std.fmt etc., so a multi-KiB
+// frame here is undesirable. The chunk loop makes any width correct, and even
+// at 1280 px wide that is only ~5 memcpys per row — still vastly cheaper than
+// the old ~1280 volatile stores per row.
+const FILL_TMPL_PX: usize = 256; // pixels per fill template (256 * 4 B = 1 KiB)
+
+fn fillRect(x0: usize, y0: usize, w: usize, h: usize, color: u32) void {
+    if (w == 0 or h == 0) return; // empty rectangle: nothing to do
+    const bpp_bytes = fb.bpp / 8; // bytes per pixel (4 at 32 bpp)
+
+    var rowbuf: [FILL_TMPL_PX]u32 = undefined; // the reusable solid-color run
+    const tmpl = @min(w, rowbuf.len); // pixels we can template in one go
+    var i: usize = 0;
+    while (i < tmpl) : (i += 1) rowbuf[i] = color;
+    const tmpl_src = @as([*]const u8, @ptrCast(&rowbuf)); // bytes of the template
+
+    var y: usize = y0;
+    while (y < y0 + h) : (y += 1) { // each scanline of the rectangle
+        const base = fb.address + y * fb.pitch + x0 * bpp_bytes; // row start address
+        var done: usize = 0; // pixels written on this row so far
+        while (done < w) { // copy the template across (one pass unless w > tmpl)
+            const chunk = @min(w - done, tmpl); // pixels to copy this iteration
+            const dst = @as([*]u8, @ptrFromInt(base + done * bpp_bytes))[0 .. chunk * bpp_bytes];
+            std.mem.copyForwards(u8, dst, tmpl_src[0 .. chunk * bpp_bytes]);
+            done += chunk;
+        }
+    }
+}
+
 // Paint every pixel with the background color (no cursor/state changes).
 fn blankScreen() void {
-    var y: usize = 0;
-    while (y < fb.height) : (y += 1) { // every scanline
-        var x: usize = 0;
-        while (x < fb.width) : (x += 1) putpixel(x, y, bg); // every pixel
-    }
+    fillRect(0, 0, fb.width, fb.height, bg); // one bulk fill of the whole screen
     cursor_drawn = false; // the old cursor underline is gone with the cleared pixels
 }
 
@@ -175,19 +215,35 @@ fn clear() void {
 }
 
 // Draw glyph `c` into text cell (col, row).
+//
+// Hot path: one glyph is drawn per printed character, font.width * font.height
+// pixels (128 for our 8x16 font). The old code did one volatile putpixel per
+// pixel, recomputing the byte offset (y*pitch + x*bpp) every store. Here we
+// build the glyph row's pixels in a small stack buffer (foreground where the
+// bit is set, background otherwise) and write the whole row as ONE contiguous
+// span via copyForwards, recomputing the offset only once per row.
 fn drawGlyph(c: u8, col: usize, row: usize) void {
     const gi: usize = if (c < font.count) c else '?'; // fall back to '?' if missing
     const glyph = font.glyphs[gi * font.bytes_per_glyph ..]; // start of this glyph
+    const bpp_bytes = fb.bpp / 8; // bytes per pixel (4 at 32 bpp)
     const px = col * font.width; // pixel x of the cell
     const py = row * font.height; // pixel y of the cell
+
+    // One glyph row is at most font.width pixels (<= 8 here). Buffer it, then
+    // blast it to the framebuffer as a single contiguous run.
+    var rowbuf: [font.width]u32 = undefined;
+    const span = font.width * bpp_bytes; // bytes in one glyph row
+
     var gy: usize = 0;
     while (gy < font.height) : (gy += 1) { // each row of the glyph
         const bits = glyph[gy * font.bytes_per_row]; // 1 byte (width <= 8)
         var gx: usize = 0;
-        while (gx < font.width) : (gx += 1) { // each column
-            const on = (bits & (@as(u8, 0x80) >> @intCast(gx))) != 0; // bit 7 = leftmost
-            putpixel(px + gx, py + gy, if (on) fg else bg); // foreground or background
+        while (gx < font.width) : (gx += 1) { // pick fg/bg per column (bit 7 = leftmost)
+            rowbuf[gx] = if (bits & (@as(u8, 0x80) >> @intCast(gx)) != 0) fg else bg;
         }
+        const base = fb.address + (py + gy) * fb.pitch + px * bpp_bytes; // row start
+        const dst = @as([*]u8, @ptrFromInt(base))[0..span];
+        std.mem.copyForwards(u8, dst, @as([*]const u8, @ptrCast(&rowbuf))[0..span]);
     }
 }
 
@@ -202,11 +258,10 @@ fn scrollFb() void {
     const src = @as([*]u8, @ptrFromInt(fb.address + row_bytes))[0..len]; // source = one row down
     std.mem.copyForwards(u8, dst, src); // move everything up (forward copy is safe here)
 
-    var y: usize = (rows - 1) * font.height; // first pixel row of the last text row
-    while (y < fb.height) : (y += 1) { // clear the freed bottom row
-        var x: usize = 0;
-        while (x < fb.width) : (x += 1) putpixel(x, y, bg);
-    }
+    // Clear the freed bottom region with a single bulk row-stride fill instead
+    // of a volatile store per pixel.
+    const top = (rows - 1) * font.height; // first pixel row of the last text row
+    fillRect(0, top, fb.width, fb.height - top, bg);
 }
 
 // Advance to the start of the next line. The live window's top advances (and the
