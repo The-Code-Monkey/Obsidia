@@ -16,7 +16,7 @@ Obsidia — Full System Specification
 
 .. note::
 
-   This specification is synthesized from the project ``README.md``, the per-module
+   This specification is synthesized from the project ``README.rst``, the per-module
    documentation under ``docs/``, and a direct reading of the source under ``src/`` and the
    build/run/test scripts. Where the prose documentation and the source disagreed, the
    **source is treated as authoritative** and the discrepancy is called out inline (for
@@ -711,7 +711,7 @@ Real password hashing with **scrypt** in PHC string format
 
 .. note::
 
-   The source (``src/auth.zig``) uses ``ln = 12``; the prose ``README.md`` / ``docs/auth.md``
+   The source (``src/auth.zig``) uses ``ln = 12``; the prose ``README.rst`` / ``docs/auth.rst``
    say ``ln = 14``. The integer-only, single-threaded scrypt was chosen over Argon2id because
    Zig's Argon2 spawns threads, which have no implementation on a freestanding target.
 
@@ -750,7 +750,7 @@ starts. The ``install`` command appears only when a payload is present.
 
 .. note::
 
-   The prose ``docs/install.md`` describes only Option A as current and calls Option B a
+   The prose ``docs/install.rst`` describes only Option A as current and calls Option B a
    future feature; the source implements **both**, and the integration harness exercises the
    in-kernel Option B end to end.
 
@@ -894,7 +894,7 @@ Test harness
 
 * **Host unit tests** (``src/tests.zig``, compiled for the native target) cover keyboard
   scancode translation + escape sequences, console PSF font parsing, scrypt hash/verify,
-  GPT layout + CRC, FAT32 ``mkfs`` layout, and LFN encoding. (The prose ``docs/tests.md``
+  GPT layout + CRC, FAT32 ``mkfs`` layout, and LFN encoding. (The prose ``docs/tests.rst``
   lists only keyboard + console; the source aggregates all six.)
 * **Integration harness** (``tests/run.sh``) builds the kernel, runs the unit tests, assembles
   the ISO, then boots headless under **both legacy BIOS and UEFI**, asserting every subsystem
