@@ -55,7 +55,6 @@ pub fn init() void {
     vmm.map(REGION, frame, vmm.FLAG_WRITE | vmm.FLAG_NX); // builds PML4->PDPT->PD->PT
     vmm.unmap(REGION); // clear the leaf (keeps the tables); REGION stays unmapped (slot 0 guard)
     pmm.free(frame); // the probe frame is no longer referenced
-    serial.print("[KSTACK] guarded kernel-stack region ready @0x{x} ({d} slots, {d} KiB each + guard)\n", .{ REGION, MAX_STACKS, STACK_SIZE / 1024 });
 }
 
 // The (unmapped) guard-page address for slot `i`.

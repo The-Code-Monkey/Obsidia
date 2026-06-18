@@ -123,8 +123,6 @@ fn onIrq() void {
 
 // --- Init --------------------------------------------------------------------
 pub fn init() void {
-    serial.print("[MOUSE] Initializing PS/2 mouse...\n", .{});
-
     // Mask interrupts for the whole polling handshake. Otherwise the keyboard's
     // IRQ1 handler races us: requesting a controller byte (e.g. the config byte)
     // fills the shared output buffer with AUX clear, which looks exactly like a

@@ -371,16 +371,13 @@ fn worker() void {
         serial.print("[SCHED]   {s}: iteration {d}\n", .{ name, k });
         yield(); // hand off to the other worker
     }
-    serial.print("[SCHED]   {s}: done\n", .{name});
     // falls through to threadExit
 }
 
 pub fn selfTest() void {
-    serial.print("[SCHED] Cooperative scheduler self-test...\n", .{});
     setupMain();
     spawn("A", &worker);
     spawn("B", &worker);
-    serial.print("[SCHED]   spawned 2 threads; running round-robin...\n", .{});
     while (aliveCount() > 0) yield(); // run the workers to completion
     serial.print("[SCHED]   back in main; all threads finished.\n", .{});
     serial.print("[SCHED] Scheduler self-test complete.\n", .{});
@@ -393,10 +390,6 @@ fn pworker() void {
     while (round < 3) : (round += 1) {
         const target = pic.ticks() + 20; // ~200 ms; busy-wait, NO yield
         while (pic.ticks() < target) {} // the timer preempts us out of this loop
-        // Print atomically (serial is slow; masking avoids preemption mid-line).
-        asm volatile ("cli");
-        serial.print("[SCHED]   preempt {s}: round {d}\n", .{ name, round });
-        asm volatile ("sti");
     }
     asm volatile ("cli");
     serial.print("[SCHED]   preempt {s}: finished (never called yield)\n", .{name});
@@ -404,13 +397,11 @@ fn pworker() void {
 }
 
 pub fn preemptDemo() void {
-    serial.print("[SCHED] Preemptive scheduler demo (timer-driven)...\n", .{});
     setupMain(); // reset: adopt the current context as thread 0
     spawn("P1", &pworker);
     spawn("P2", &pworker);
     preempting = true;
     pic.on_tick = &tick; // each timer tick now preempts to the next thread
-    serial.print("[SCHED]   preemption ON; 2 workers busy-loop without yielding.\n", .{});
     while (aliveCount() > 0) {} // main busy-waits; the timer schedules the workers
     pic.on_tick = null; // stop preempting
     preempting = false;
@@ -459,7 +450,6 @@ fn sleepWorker() void {
 }
 
 pub fn blockSleepDemo() void {
-    serial.print("[SCHED] Blocking-sleep self-test...\n", .{});
     setupMain();
     spawn("sleeper", &sleepWorker);
     preempting = true;
@@ -467,7 +457,6 @@ pub fn blockSleepDemo() void {
     while (aliveCount() > 0) {} // main waits; the sleeper blocks then wakes + exits
     pic.on_tick = null;
     preempting = false;
-    serial.print("[SCHED] Blocking-sleep self-test complete.\n", .{});
 }
 
 // --- One-shot blocking-mutex self-test ---------------------------------------
@@ -524,7 +513,6 @@ fn mtxWorker() void {
 }
 
 pub fn mutexDemo() void {
-    serial.print("[SCHED] Blocking-mutex self-test...\n", .{});
     setupMain(); // adopt the boot context as thread 0 (main)
     // Reset all shared state so the test is deterministic on repeated runs.
     mtx_lock = mutex.Mutex.init();
@@ -547,7 +535,6 @@ pub fn mutexDemo() void {
     } else {
         serial.print("[MUTEX] FAIL: counter={d} (expected {d}), violation={}\n", .{ mtx_counter, expected, mtx_violation });
     }
-    serial.print("[SCHED] Blocking-mutex self-test complete.\n", .{});
 }
 
 // --- User-process self-test --------------------------------------------------
@@ -579,7 +566,6 @@ fn wr32(p: [*]u8, v: u32) void {
 }
 
 pub fn userProcessDemo() void {
-    serial.print("[SCHED] User-process self-test (ring 3 + own address space)...\n", .{});
     setupMain();
     demo_kcounter = 0;
 
@@ -636,7 +622,6 @@ pub fn userProcessDemo() void {
     syscall.exit_handler = null;
 
     const user_iters = counter.*;
-    serial.print("[SCHED]   user process ran {d} ring-3 iterations; kernel thread ran {d}.\n", .{ user_iters, demo_kcounter });
     if (user_iters == DEMO_ITERS and demo_kcounter == DEMO_ITERS) {
         serial.print("[SCHED] User-process self-test OK: ring-3 process + kernel thread co-scheduled across address spaces.\n", .{});
     } else {
