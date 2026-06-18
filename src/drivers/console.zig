@@ -528,7 +528,6 @@ pub fn scrollToBottom() void {
 
 // Set up the console over a given framebuffer.
 pub fn init(info: FramebufferInfo) void {
-    serial.print("[CON] Initializing framebuffer console...\n", .{});
     fb = info; // remember the framebuffer
     cols = fb.width / font.width; // text grid size
     rows = fb.height / font.height;
@@ -551,8 +550,6 @@ pub fn init(info: FramebufferInfo) void {
     blankScreen(); // blank the pixels (state is already homed)
     ready = true; // now usable
 
-    serial.print("[CON]   fb=0x{x} {d}x{d}, pitch={d}, bpp={d}\n", .{ fb.address, fb.width, fb.height, fb.pitch, fb.bpp });
-    serial.print("[CON]   font {d}x{d}, grid {d}x{d} chars\n", .{ font.width, font.height, cols, rows });
     serial.print("[CON]   scrollback: {d} lines retained (PageUp/PageDown to scroll)\n", .{SB_LINES});
 
     // Draw a banner straight to the framebuffer so there's something to see.

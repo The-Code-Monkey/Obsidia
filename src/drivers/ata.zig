@@ -117,8 +117,6 @@ fn waitDataRequest() bool {
 // when no disk is attached: it detects that and leaves `present` false, so the
 // rest of the kernel (and disk-less boots) carry on unaffected.
 pub fn init() void {
-    serial.print("[ATA] Probing primary bus (master @ port 0x{x})...\n", .{IO_BASE});
-
     outb(DRIVE_HEAD, 0xA0); // select the master drive (0xA0), CHS/LBA bits zero for now
     delay400ns(); // let the selection settle
 

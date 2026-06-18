@@ -157,7 +157,6 @@ fn onIrq() void {
 }
 
 pub fn init() void {
-    serial.print("[KBD] Initializing PS/2 keyboard...\n", .{});
     // Drain any bytes the controller already has queued, so a stale scancode
     // doesn't fire IRQ1 immediately.
     while (serial.inb(STATUS) & 0x01 != 0) {

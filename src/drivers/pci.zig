@@ -264,7 +264,6 @@ fn checkSlot(bus: u8, slot: u5) void {
 // walk the bridge topology, and the absent-slot fast path keeps it cheap (most
 // (bus,slot) pairs read back 0xFFFF in a single config access).
 pub fn init() void {
-    serial.print("[PCI] Enumerating PCI bus (config mechanism #1, ports 0xCF8/0xCFC)...\n", .{});
     device_count = 0;
     var bus: u16 = 0; // u16 so the < 256 loop bound can't wrap
     while (bus < 256) : (bus += 1) {

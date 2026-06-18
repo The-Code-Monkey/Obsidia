@@ -203,10 +203,8 @@ fn verifyPlayback() void {
     delayTicks(8); // ~80 ms of playback
     const picb_now = io.inw(nabm + PO_PICB);
     const sr = io.inw(nabm + PO_SR);
-    const civ = io.inb(nabm + PO_CIV);
     // Progress = the position fell, or the engine already finished the buffer.
     const advanced = picb_now < picb_start or sr & (SR_DCH | SR_CELV) != 0;
-    serial.print("[AC97]   PICB {d} -> {d}, CIV={d}, SR=0x{x:0>4}, advanced={}\n", .{ picb_start, picb_now, civ, sr, advanced });
     if (advanced) {
         serial.print("[AC97] self-test OK: DMA playback advanced.\n", .{});
     } else {
@@ -332,18 +330,15 @@ pub fn play(rate: u32, ctx: *anyopaque, fill: FillFn) usize {
 }
 
 pub fn init() void {
-    serial.print("[AC97] Initializing AC'97 audio...\n", .{});
     const dev = pci.findByClass(CLASS_MULTIMEDIA, SUBCLASS_AUDIO) orelse {
         serial.print("[AC97] no AC'97 device found (skipping).\n", .{});
         return;
     };
-    serial.print("[AC97]   controller {x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4}\n", .{ dev.bus, dev.slot, dev.func, dev.vendor, dev.device });
 
     // BAR0 = NAM (mixer), BAR1 = NABM (bus master). Both are I/O BARs: bit 0 is the
     // I/O flag, so mask it off to get the port base.
     nam = @intCast(pci.readDword(dev.bus, dev.slot, dev.func, 0x10) & 0xFFFC);
     nabm = @intCast(pci.readDword(dev.bus, dev.slot, dev.func, 0x14) & 0xFFFC);
-    serial.print("[AC97]   NAM (mixer) @ I/O 0x{x}, NABM (bus master) @ I/O 0x{x}\n", .{ nam, nabm });
 
     // Let the device decode its I/O BARs and drive DMA.
     const cmd = pci.readDword(dev.bus, dev.slot, dev.func, PCI_COMMAND);
@@ -380,6 +375,4 @@ pub fn init() void {
     startPlayback();
     verifyPlayback();
     present = true;
-
-    serial.print("[AC97] AC'97 audio initialized.\n", .{});
 }
