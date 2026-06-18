@@ -180,7 +180,7 @@ pub fn init() void {
     load(&gdtr); // install the GDT and reload all segment registers
 
     loadTss(TSS_SELECTOR); // activate the TSS
-    serial.print("[GDT]   ltr done; TSS selector=0x{x}.\n", .{TSS_SELECTOR});
+    serial.log("[GDT]   ltr done; TSS selector=0x{x}.\n", .{TSS_SELECTOR});
 
-    serial.print("[GDT] GDT initialized.\n", .{});
+    serial.log("[GDT] GDT initialized.\n", .{});
 }

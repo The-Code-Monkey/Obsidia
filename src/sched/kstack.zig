@@ -49,7 +49,7 @@ pub const Stack = struct { top: usize, bottom: usize };
 // only the leaf, so the intermediate tables (and the PML4 entry) stay linked.
 pub fn init() void {
     const frame = pmm.allocZeroed() orelse {
-        serial.print("[KSTACK] WARN: could not pre-touch the stack region\n", .{});
+        serial.log("[KSTACK] WARN: could not pre-touch the stack region\n", .{});
         return;
     };
     vmm.map(REGION, frame, vmm.FLAG_WRITE | vmm.FLAG_NX); // builds PML4->PDPT->PD->PT
@@ -110,5 +110,5 @@ fn selfTest(i: usize, s: Stack) void {
     const p: *volatile u8 = @ptrFromInt(s.bottom); // lowest byte: safe to poke pre-use
     p.* = 0x5A;
     const rw = p.* == 0x5A;
-    serial.print("[KSTACK] guarded-stack self-test: guard-unmapped={} stack-mapped={} rw={} (slot {d}, guard@0x{x})\n", .{ guard_unmapped, stack_mapped, rw, i, guardAddr(i) });
+    serial.log("[KSTACK] guarded-stack self-test: guard-unmapped={} stack-mapped={} rw={} (slot {d}, guard@0x{x})\n", .{ guard_unmapped, stack_mapped, rw, i, guardAddr(i) });
 }

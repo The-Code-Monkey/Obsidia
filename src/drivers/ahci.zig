@@ -476,22 +476,22 @@ pub fn register() void {
 }
 
 pub fn init() void {
-    serial.print("[AHCI] Initializing AHCI...\n", .{});
+    serial.log("[AHCI] Initializing AHCI...\n", .{});
 
     // 1. Find the controller. No-op gracefully if the machine has no SATA HBA
     //    (e.g. a plain `-M pc` boot), so disk-less boots are unaffected.
     const dev = pci.findByClass(CLASS_STORAGE, SUBCLASS_SATA) orelse {
-        serial.print("[AHCI] no AHCI controller found (skipping).\n", .{});
+        serial.log("[AHCI] no AHCI controller found (skipping).\n", .{});
         return;
     };
-    serial.print("[AHCI]   controller {x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4}\n", .{ dev.bus, dev.slot, dev.func, dev.vendor, dev.device });
+    serial.log("[AHCI]   controller {x:0>2}:{x:0>2}.{d} {x:0>4}:{x:0>4}\n", .{ dev.bus, dev.slot, dev.func, dev.vendor, dev.device });
 
     // 2. Read BAR5 (the ABAR): a 64-bit memory BAR spanning config offsets 0x24/0x28.
     //    Mask the low 4 flag bits off the low half to get the physical base.
     const bar_lo = pci.readDword(dev.bus, dev.slot, dev.func, PCI_BAR5_LO);
     const bar_hi = pci.readDword(dev.bus, dev.slot, dev.func, PCI_BAR5_HI);
     const abar_phys = (@as(u64, bar_hi) << 32) | (bar_lo & 0xFFFF_FFF0);
-    serial.print("[AHCI]   ABAR (BAR5) @ phys 0x{x}\n", .{abar_phys});
+    serial.log("[AHCI]   ABAR (BAR5) @ phys 0x{x}\n", .{abar_phys});
 
     // 3. Map the ABAR uncacheable into the higher half. MMIO must be UC so register
     //    reads see live hardware state and writes reach the device in order (PCD/UC).
@@ -507,7 +507,7 @@ pub fn init() void {
         vmm.mapUncacheable(ABAR_VA + off, abar_page + off, vmm.FLAG_WRITE | vmm.FLAG_NX);
     }
     abar = ABAR_VA + abar_off; // the register base, honoring any sub-page offset
-    serial.print("[AHCI]   ABAR mapped UC at VA 0x{x}\n", .{abar});
+    serial.log("[AHCI]   ABAR mapped UC at VA 0x{x}\n", .{abar});
 
     // 4. Enable PCI memory-space decode + bus mastering so the HBA answers its BAR
     //    and can drive DMA.
@@ -521,7 +521,7 @@ pub fn init() void {
     while (mmioRead(HBA_GHC) & GHC_HR != 0) { // reset self-clears when complete
         spins += 1;
         if (spins > 100_000_000) {
-            serial.print("[AHCI] FAILED: HBA reset did not complete.\n", .{});
+            serial.log("[AHCI] FAILED: HBA reset did not complete.\n", .{});
             return;
         }
         asm volatile ("pause");
@@ -530,7 +530,7 @@ pub fn init() void {
     mmioWrite(HBA_GHC, mmioRead(HBA_GHC) | GHC_IE); // global interrupt enable
     const ver = mmioRead(HBA_VS);
     const pi = mmioRead(HBA_PI); // ports implemented (one bit per port)
-    serial.print("[AHCI]   AHCI enabled, version 0x{x:0>8}, ports-implemented 0x{x:0>8}\n", .{ ver, pi });
+    serial.log("[AHCI]   AHCI enabled, version 0x{x:0>8}, ports-implemented 0x{x:0>8}\n", .{ ver, pi });
 
     // 6. Find the first implemented port whose SATA link is up (DET==3, IPM==1). We
     //    can't trust PxSIG yet: after the HBA reset the device hasn't posted its
@@ -558,31 +558,31 @@ pub fn init() void {
         break;
     }
     const sel = found orelse {
-        serial.print("[AHCI] no device on any implemented port (skipping).\n", .{});
+        serial.log("[AHCI] no device on any implemented port (skipping).\n", .{});
         return;
     };
     port = sel;
-    serial.print("[AHCI]   device link up on port {d}\n", .{port});
+    serial.log("[AHCI]   device link up on port {d}\n", .{port});
 
     // 7. Allocate the per-port DMA regions: command list (1 KiB), received-FIS area
     //    (256 B), one command table, and the sector data buffer.
     clb_buf = dma.alloc(1024) orelse {
-        serial.print("[AHCI] FAILED: could not allocate the command list.\n", .{});
+        serial.log("[AHCI] FAILED: could not allocate the command list.\n", .{});
         return;
     };
     fb_buf = dma.alloc(256) orelse {
-        serial.print("[AHCI] FAILED: could not allocate the FIS area.\n", .{});
+        serial.log("[AHCI] FAILED: could not allocate the FIS area.\n", .{});
         dma.free(clb_buf);
         return;
     };
     ctbl_buf = dma.alloc(CTBL_PRDT_OFFSET + @sizeOf(PrdtEntry)) orelse {
-        serial.print("[AHCI] FAILED: could not allocate the command table.\n", .{});
+        serial.log("[AHCI] FAILED: could not allocate the command table.\n", .{});
         dma.free(clb_buf);
         dma.free(fb_buf);
         return;
     };
     data_buf = dma.alloc(SECTOR_SIZE) orelse {
-        serial.print("[AHCI] FAILED: could not allocate the data buffer.\n", .{});
+        serial.log("[AHCI] FAILED: could not allocate the data buffer.\n", .{});
         dma.free(clb_buf);
         dma.free(fb_buf);
         dma.free(ctbl_buf);
@@ -612,11 +612,11 @@ pub fn init() void {
     }
     const sig = portRead(port, PxSIG);
     if (sig != SIG_SATA) {
-        serial.print("[AHCI] port {d} signature 0x{x:0>8} is not a SATA disk (skipping).\n", .{ port, sig });
+        serial.log("[AHCI] port {d} signature 0x{x:0>8} is not a SATA disk (skipping).\n", .{ port, sig });
         freeBuffers();
         return;
     }
-    serial.print("[AHCI]   SATA disk confirmed on port {d} (sig 0x{x:0>8})\n", .{ port, sig });
+    serial.log("[AHCI]   SATA disk confirmed on port {d} (sig 0x{x:0>8})\n", .{ port, sig });
 
     // 9. Hook the controller's PCI interrupt line BEFORE we enable port interrupts,
     //    so a completion/spurious interrupt can never assert the (shared, level-
@@ -626,9 +626,9 @@ pub fn init() void {
     if (irq_line != 0 and irq_line != 0xFF and irq_line < 16) {
         pic.register(@intCast(irq_line), &irqHandler); // install + unmask
         apic.routeIrqPci(irq_line); // re-route with PCI (level/low) semantics
-        serial.print("[AHCI]   interrupt line IRQ{d} (PCI INTx)\n", .{irq_line});
+        serial.log("[AHCI]   interrupt line IRQ{d} (PCI INTx)\n", .{irq_line});
     } else {
-        serial.print("[AHCI]   no usable interrupt line ({d}); commands will poll\n", .{irq_line});
+        serial.log("[AHCI]   no usable interrupt line ({d}); commands will poll\n", .{irq_line});
         irq_line = 0xFF;
     }
 
@@ -641,7 +641,7 @@ pub fn init() void {
     // 11. IDENTIFY the device (model string), then read sector 0 to prove the DMA
     //     data path end-to-end during init.
     if (!identify(port)) {
-        serial.print("[AHCI] FAILED: IDENTIFY DEVICE did not complete.\n", .{});
+        serial.log("[AHCI] FAILED: IDENTIFY DEVICE did not complete.\n", .{});
         freeBuffers();
         return;
     }
@@ -651,10 +651,10 @@ pub fn init() void {
     present = true;
     var probe: [SECTOR_SIZE]u8 = undefined;
     if (!read(0, 1, &probe)) {
-        serial.print("[AHCI] WARN: sector-0 read did not complete during init.\n", .{});
+        serial.log("[AHCI] WARN: sector-0 read did not complete during init.\n", .{});
     }
 
-    serial.print("[AHCI] AHCI initialized (port {d}, model '{s}').\n", .{ port, @as([*:0]const u8, @ptrCast(&model)) });
+    serial.log("[AHCI] AHCI initialized (port {d}, model '{s}').\n", .{ port, @as([*:0]const u8, @ptrCast(&model)) });
 }
 
 // Release every DMA region this driver allocated (failure cleanup).
@@ -670,7 +670,7 @@ fn freeBuffers() void {
 // without a disk, so a disk-less boot prints nothing alarming and continues.
 pub fn selfTest() void {
     if (!present) {
-        serial.print("[AHCI] self-test skipped: no AHCI disk.\n", .{});
+        serial.log("[AHCI] self-test skipped: no AHCI disk.\n", .{});
         return;
     }
 
@@ -682,23 +682,23 @@ pub fn selfTest() void {
     var buf: [SECTOR_SIZE]u8 = undefined;
     const read_ok = read(0, 1, &buf);
 
-    serial.print("[AHCI]   self-test: model='{s}' (non-empty={})\n", .{ @as([*:0]const u8, @ptrCast(&model)), model_ok });
-    serial.print("[AHCI]   self-test: LBA0[0..16]='", .{});
+    serial.log("[AHCI]   self-test: model='{s}' (non-empty={})\n", .{ @as([*:0]const u8, @ptrCast(&model)), model_ok });
+    serial.log("[AHCI]   self-test: LBA0[0..16]='", .{});
     for (buf[0..16]) |b| {
         const c: u8 = if (b >= 0x20 and b < 0x7f) b else '.'; // printable, dot the rest
-        serial.print("{c}", .{c});
+        serial.log("{c}", .{c});
     }
-    serial.print("'\n", .{});
+    serial.log("'\n", .{});
 
     // The MBR/boot-signature byte pair (0x55 0xAA at offset 510) is a cheap "did we
     // read a real, structured sector?" check for a formatted disk.
     const boot_sig = read_ok and buf[510] == 0x55 and buf[511] == 0xAA;
-    serial.print("[AHCI]   self-test: read-ok={}, boot-signature={}, completion IRQ(s)={d}\n", .{ read_ok, boot_sig, irq_count });
+    serial.log("[AHCI]   self-test: read-ok={}, boot-signature={}, completion IRQ(s)={d}\n", .{ read_ok, boot_sig, irq_count });
 
     if (model_ok and read_ok) {
-        serial.print("[AHCI] self-test OK: IDENTIFY model present + sector-0 DMA read succeeded.\n", .{});
+        serial.log("[AHCI] self-test OK: IDENTIFY model present + sector-0 DMA read succeeded.\n", .{});
     } else {
-        serial.print("[AHCI] self-test FAILED (model_ok={}, read_ok={}).\n", .{ model_ok, read_ok });
+        serial.log("[AHCI] self-test FAILED (model_ok={}, read_ok={}).\n", .{ model_ok, read_ok });
     }
 
     // --- WRITE-path self-test (non-destructive) ------------------------------
@@ -738,10 +738,10 @@ pub fn selfTest() void {
     //    write can't strand the scratch sector with the test pattern.
     const restore_ok = save_ok and write(SCRATCH_LBA, 1, &saved);
 
-    serial.print("[AHCI]   self-test: write save-ok={}, write-ok={}, verify-ok={}, restore-ok={}\n", .{ save_ok, write_ok, verify_ok, restore_ok });
+    serial.log("[AHCI]   self-test: write save-ok={}, write-ok={}, verify-ok={}, restore-ok={}\n", .{ save_ok, write_ok, verify_ok, restore_ok });
     if (write_ok and verify_ok and restore_ok) {
-        serial.print("[AHCI] write self-test OK: WRITE DMA EXT round-trip verified + original restored.\n", .{});
+        serial.log("[AHCI] write self-test OK: WRITE DMA EXT round-trip verified + original restored.\n", .{});
     } else {
-        serial.print("[AHCI] write self-test FAILED (save={}, write={}, verify={}, restore={}).\n", .{ save_ok, write_ok, verify_ok, restore_ok });
+        serial.log("[AHCI] write self-test FAILED (save={}, write={}, verify={}, restore={}).\n", .{ save_ok, write_ok, verify_ok, restore_ok });
     }
 }

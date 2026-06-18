@@ -150,7 +150,7 @@ fn setupCodec() void {
         delayTicks(1); // up to ~0.5 s for the primary codec to come ready
     }
     const ready = io.inl(nabm + GLOB_STA) & GS_PCR != 0;
-    serial.print("[AC97]   codec ready={} (waited {d} tick(s))\n", .{ ready, waited });
+    serial.log("[AC97]   codec ready={} (waited {d} tick(s))\n", .{ ready, waited });
 
     io.outw(nam + NAM_RESET, 1); // reset the mixer to a known state
     delayTicks(1);
@@ -166,7 +166,7 @@ fn setupCodec() void {
         io.outw(nam + NAM_DAC_RATE, @intCast(SAMPLE_RATE)); // request our rate
     }
     const rate = io.inw(nam + NAM_DAC_RATE); // read back what the codec accepted
-    serial.print("[AC97]   mixer: volume max, VRA={}, DAC rate={d} Hz\n", .{ vra_ok, rate });
+    serial.log("[AC97]   mixer: volume max, VRA={}, DAC rate={d} Hz\n", .{ vra_ok, rate });
 }
 
 // Set the PCM-out DAC sample rate (Hz) via variable-rate audio. A no-op without
@@ -193,7 +193,7 @@ fn startPlayback() void {
     io.outl(nabm + PO_BDBAR, @intCast(bdl_buf.phys)); // point the engine at the BDL
     io.outb(nabm + PO_LVI, 0); // last valid index = 0 (we wrote one descriptor)
     io.outb(nabm + PO_CR, CR_RPBM); // run: the engine starts streaming the buffer
-    serial.print("[AC97]   playback started: {d} frames @ {d} Hz, BDL@0x{x}, PCM@0x{x}\n", .{ TONE_FRAMES, SAMPLE_RATE, bdl_buf.phys, pcm_buf.phys });
+    serial.log("[AC97]   playback started: {d} frames @ {d} Hz, BDL@0x{x}, PCM@0x{x}\n", .{ TONE_FRAMES, SAMPLE_RATE, bdl_buf.phys, pcm_buf.phys });
 }
 
 // Confirm the DMA engine actually consumed samples: PICB (samples left in the
@@ -206,9 +206,9 @@ fn verifyPlayback() void {
     // Progress = the position fell, or the engine already finished the buffer.
     const advanced = picb_now < picb_start or sr & (SR_DCH | SR_CELV) != 0;
     if (advanced) {
-        serial.print("[AC97] self-test OK: DMA playback advanced.\n", .{});
+        serial.log("[AC97] self-test OK: DMA playback advanced.\n", .{});
     } else {
-        serial.print("[AC97] self-test: DMA did not advance (no audio backend?).\n", .{});
+        serial.log("[AC97] self-test: DMA did not advance (no audio backend?).\n", .{});
     }
 }
 
@@ -339,7 +339,7 @@ pub fn register() void {
 
 pub fn init() void {
     const dev = pci.findByClass(CLASS_MULTIMEDIA, SUBCLASS_AUDIO) orelse {
-        serial.print("[AC97] no AC'97 device found (skipping).\n", .{});
+        serial.log("[AC97] no AC'97 device found (skipping).\n", .{});
         return;
     };
 
@@ -360,9 +360,9 @@ pub fn init() void {
     if (irq_line != 0 and irq_line != 0xFF and irq_line < 16) {
         pic.register(@intCast(irq_line), &irqHandler); // install + unmask
         apic.routeIrqPci(irq_line); // re-route with PCI (level/low) semantics
-        serial.print("[AC97]   interrupt line IRQ{d} (PCI INTx)\n", .{irq_line});
+        serial.log("[AC97]   interrupt line IRQ{d} (PCI INTx)\n", .{irq_line});
     } else {
-        serial.print("[AC97]   no usable interrupt line ({d}); play() will poll\n", .{irq_line});
+        serial.log("[AC97]   no usable interrupt line ({d}); play() will poll\n", .{irq_line});
         irq_line = 0xFF;
     }
 
@@ -370,11 +370,11 @@ pub fn init() void {
 
     // Allocate the DMA regions: the descriptor list and the tone sample buffer.
     bdl_buf = dma.alloc(@sizeOf(Descriptor) * 32) orelse {
-        serial.print("[AC97] FAILED: could not allocate the buffer descriptor list.\n", .{});
+        serial.log("[AC97] FAILED: could not allocate the buffer descriptor list.\n", .{});
         return;
     };
     pcm_buf = dma.alloc(TONE_FRAMES * 4) orelse { // 4 bytes/frame (16-bit stereo)
-        serial.print("[AC97] FAILED: could not allocate the PCM buffer.\n", .{});
+        serial.log("[AC97] FAILED: could not allocate the PCM buffer.\n", .{});
         dma.free(bdl_buf);
         return;
     };

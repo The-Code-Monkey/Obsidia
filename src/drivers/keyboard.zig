@@ -163,7 +163,7 @@ pub fn init() void {
         _ = serial.inb(DATA);
     }
     pic.register(1, &onIrq); // route IRQ1 to us and unmask it
-    serial.print("[KBD] Keyboard ready (IRQ1).\n", .{});
+    serial.log("[KBD] Keyboard ready (IRQ1).\n", .{});
 }
 
 // --- Unit tests (run with `zig build test`) ---------------------------------

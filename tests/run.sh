@@ -58,7 +58,9 @@ QEMU="qemu-system-x86_64 -cpu $QEMU_CPU"
 
 # --- Build -------------------------------------------------------------------
 echo "== Build + unit tests =="
-zig build              || { echo "kernel build failed"; exit 1; }
+# Build WITH -Ddebug-log=true so the kernel emits the verbose boot/self-test
+# markers this harness asserts. A normal `zig build` boot is quiet by design.
+zig build -Ddebug-log=true || { echo "kernel build failed"; exit 1; }
 if zig build test 2>"$TMP/ut.log"; then ok "host unit tests"; else bad "host unit tests"; cat "$TMP/ut.log"; fi
 
 # --- Assemble the bootable ISO -----------------------------------------------

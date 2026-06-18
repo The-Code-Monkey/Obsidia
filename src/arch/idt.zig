@@ -14,13 +14,16 @@
 
 const std = @import("std"); // for comptimePrint when generating stubs
 const serial = @import("../drivers/serial.zig"); // logging
+const config = @import("config"); // build-time flags (debug_log)
 const gdt = @import("gdt.zig"); // for the KERNEL_CODE selector used in gates
 const pic = @import("pic.zig"); // hardware IRQs (vectors 32-47) dispatch here
 
-// Set to false once you've seen the self-test dump and trust the path. When
-// true, init() deliberately executes `int3` to exercise the full dump+recover
-// path on every boot.
-const selftest_breakpoint = true;
+// When true, init() deliberately executes `int3` to exercise the full
+// dump+recover path. Tied to debug_log: only do this noisy self-test (it prints
+// a full CPU-exception dump on purpose) when built with -Ddebug-log=true, so a
+// normal boot stays quiet. Real exceptions still dump always — that path is
+// unconditional; this only controls the deliberate test trigger.
+const selftest_breakpoint = config.debug_log;
 
 // --- Saved CPU state ---------------------------------------------------------
 // Layout matches exactly what the stubs + isrCommon + CPU leave on the stack,
@@ -310,8 +313,8 @@ pub fn init() void {
 
     if (selftest_breakpoint) { // exercise the whole dump+recover path once
         asm volatile ("int3"); // triggers #BP -> isrHandler dumps and returns
-        serial.print("[IDT]   Self-test: recovered from #BP cleanly. Dump path works.\n", .{});
+        serial.log("[IDT]   Self-test: recovered from #BP cleanly. Dump path works.\n", .{});
     }
 
-    serial.print("[IDT] IDT initialized.\n", .{});
+    serial.log("[IDT] IDT initialized.\n", .{});
 }

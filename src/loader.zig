@@ -270,7 +270,7 @@ fn execUserCtx(path: []const u8, standalone: bool) bool {
         target_space = 0;
         return false;
     }
-    serial.print("[LOADER]   user image ready: entry 0x{x}, stack top 0x{x}.\n", .{ entry, USER_STACK_TOP });
+    serial.log("[LOADER]   user image ready: entry 0x{x}, stack top 0x{x}.\n", .{ entry, USER_STACK_TOP });
 
     // Schedule it in ring 3 and block until it exits. From the shell (a real
     // thread) the live scheduler hosts it; at boot we adopt a standalone context.
@@ -278,7 +278,7 @@ fn execUserCtx(path: []const u8, standalone: bool) bool {
         scheduler.runUserStandalone("uinit", entry, USER_STACK_TOP, space)
     else
         scheduler.runUser("uinit", entry, USER_STACK_TOP, space);
-    serial.print("[LOADER]   user process exited with code {d}.\n", .{code});
+    serial.log("[LOADER]   user process exited with code {d}.\n", .{code});
 
     // Tear the process down: unmap + free every image/stack page, then free the
     // page tables and the PML4. (Leaves the kernel half, which is shared, alone.)
@@ -310,7 +310,7 @@ fn loadFlat(file: []const u8, base: u64) ?u64 {
     if (pages > MAX_PAGES) {
         return null;
     }
-    serial.print("[LOADER]   flat binary -> {d} page(s) at 0x{x}.\n", .{ pages, base });
+    serial.log("[LOADER]   flat binary -> {d} page(s) at 0x{x}.\n", .{ pages, base });
 
     // Stage 1: back the image with fresh zeroed frames, mapped WRITABLE + NX —
     // we're about to write file bytes into them, and W^X forbids a writable page
@@ -424,7 +424,7 @@ fn loadElf(file: []const u8) ?u64 {
     if (phtab_end < e_phoff or phtab_end > file.len) { // wrapped, or runs past EOF
         return null;
     }
-    serial.print("[LOADER]   ELF64 {s}, entry 0x{x}, {d} program header(s).\n", .{ if (e_type == ET_EXEC) "ET_EXEC" else "ET_DYN", e_entry, e_phnum });
+    serial.log("[LOADER]   ELF64 {s}, entry 0x{x}, {d} program header(s).\n", .{ if (e_type == ET_EXEC) "ET_EXEC" else "ET_DYN", e_entry, e_phnum });
 
     // Load bias. An ET_EXEC names absolute virtual addresses and must load
     // exactly where it says (bias 0). An ET_DYN (a PIE) is linked relative to 0
@@ -472,7 +472,7 @@ fn loadElf(file: []const u8) ?u64 {
             // p_vaddr below the limit and the exclusive end at-or-below it keeps
             // the entire range in user space (slot 0..255).
             if (!(p_vaddr < USER_LIMIT and seg_end_check <= USER_LIMIT)) {
-                serial.print("[LOADER]   ELF rejected: segment {d} vaddr 0x{x} outside user space.\n", .{ ph, p_vaddr });
+                serial.log("[LOADER]   ELF rejected: segment {d} vaddr 0x{x} outside user space.\n", .{ ph, p_vaddr });
                 teardown();
                 return null;
             }
@@ -558,7 +558,7 @@ fn loadElf(file: []const u8) ?u64 {
         }
 
         const perm = if (want_x and !want_w) "R-X" else if (want_w) "RW-" else "R--";
-        serial.print("[LOADER]   PT_LOAD seg {d}: vaddr 0x{x} filesz {d} memsz {d} -> {d} page(s) {s}.\n", .{ ph, p_vaddr, p_filesz, p_memsz, npages, perm });
+        serial.log("[LOADER]   PT_LOAD seg {d}: vaddr 0x{x} filesz {d} memsz {d} -> {d} page(s) {s}.\n", .{ ph, p_vaddr, p_filesz, p_memsz, npages, perm });
         loaded += 1;
     }
 
@@ -586,18 +586,18 @@ fn findFrame(virt: u64) ?u64 {
 // the whole image and free its frames so repeated execs don't leak. Returns
 // whether the program came back with INIT_MAGIC.
 fn runAndTeardown(entry_addr: u64) bool {
-    serial.print("[LOADER]   calling entry point 0x{x}...\n", .{entry_addr});
+    serial.log("[LOADER]   calling entry point 0x{x}...\n", .{entry_addr});
     const entry: *const fn () callconv(.C) u64 = @ptrFromInt(entry_addr);
     const ret = entry(); // the init program runs here, then rets back to us
 
     const ok = ret == INIT_MAGIC;
     if (ok) {
-        serial.print("[LOADER]   init returned 0x{x} (magic OK).\n", .{ret});
+        serial.log("[LOADER]   init returned 0x{x} (magic OK).\n", .{ret});
     }
 
     const freed = mapped_count;
     teardown(); // unmap every page + free every frame, reset bookkeeping
-    serial.print("[LOADER]   image unmapped, {d} frame(s) freed.\n", .{freed});
+    serial.log("[LOADER]   image unmapped, {d} frame(s) freed.\n", .{freed});
     return ok;
 }
 
@@ -614,7 +614,7 @@ fn runAndTeardown(entry_addr: u64) bool {
 // thread context just long enough to run the one process.
 pub fn selfTest() void {
     if (!fat32.isMounted()) {
-        serial.print("[LOADER] self-test skipped (no filesystem mounted).\n", .{});
+        serial.log("[LOADER] self-test skipped (no filesystem mounted).\n", .{});
         return;
     }
     // Prefer the ELF init if it exists; otherwise the legacy /INIT.
@@ -623,10 +623,10 @@ pub fn selfTest() void {
     else if (fat32.resolve("/INIT") != null)
         "/INIT"
     else {
-        serial.print("[LOADER] self-test skipped (no /INIT.ELF or /INIT on the disk).\n", .{});
+        serial.log("[LOADER] self-test skipped (no /INIT.ELF or /INIT on the disk).\n", .{});
         return;
     };
     if (execUserCtx(path, true)) {
-        serial.print("[LOADER] init ran and exited cleanly.\n", .{});
+        serial.log("[LOADER] init ran and exited cleanly.\n", .{});
     }
 }

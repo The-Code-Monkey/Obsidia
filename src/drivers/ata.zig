@@ -123,7 +123,7 @@ pub fn init() void {
     // "Floating bus": with nothing attached the data lines float high, so the
     // status register reads 0xFF. That's the cheap no-disk check.
     if (inb(STATUS) == 0xFF) {
-        serial.print("[ATA]   no device (floating bus 0xFF) — no disk on this machine.\n", .{});
+        serial.log("[ATA]   no device (floating bus 0xFF) — no disk on this machine.\n", .{});
         return;
     }
 
@@ -136,21 +136,21 @@ pub fn init() void {
 
     // Status 0 immediately after the command also means "no device here".
     if (inb(STATUS) == 0) {
-        serial.print("[ATA]   no device (status 0).\n", .{});
+        serial.log("[ATA]   no device (status 0).\n", .{});
         return;
     }
     if (!waitNotBusy()) {
-        serial.print("[ATA]   timeout waiting for BSY to clear.\n", .{});
+        serial.log("[ATA]   timeout waiting for BSY to clear.\n", .{});
         return;
     }
     // A non-ATA device (ATAPI/SATA) signals itself by putting magic bytes in the
     // LBA mid/high registers — for a plain ATA disk these stay zero.
     if (inb(LBA_MID) != 0 or inb(LBA_HIGH) != 0) {
-        serial.print("[ATA]   device is not plain ATA (ATAPI/SATA?) — skipping.\n", .{});
+        serial.log("[ATA]   device is not plain ATA (ATAPI/SATA?) — skipping.\n", .{});
         return;
     }
     if (!waitDataRequest()) {
-        serial.print("[ATA]   IDENTIFY failed (error or timeout).\n", .{});
+        serial.log("[ATA]   IDENTIFY failed (error or timeout).\n", .{});
         return;
     }
 
@@ -160,7 +160,7 @@ pub fn init() void {
     total_sectors = @as(u32, id[60]) | (@as(u32, id[61]) << 16);
     present = true;
     const mib = total_sectors / 2048; // 2048 sectors of 512 bytes = 1 MiB
-    serial.print("[ATA]   primary master present: {d} sectors (~{d} MiB), 28-bit LBA PIO.\n", .{ total_sectors, mib });
+    serial.log("[ATA]   primary master present: {d} sectors (~{d} MiB), 28-bit LBA PIO.\n", .{ total_sectors, mib });
 }
 
 // Read `count` sectors (1..256) starting at `lba` into `dst`. `dst` must be at
@@ -227,21 +227,21 @@ pub fn write(lba: u32, count: u16, src: []const u8) bool {
 // proving the PIO path works against the attached disk. No-op without a disk.
 pub fn selfTest() void {
     if (!present) {
-        serial.print("[ATA] self-test skipped: no disk attached.\n", .{});
+        serial.log("[ATA] self-test skipped: no disk attached.\n", .{});
         return;
     }
     var buf: [SECTOR_SIZE]u8 = undefined;
     if (!read(0, 1, &buf)) {
-        serial.print("[ATA] self-test: read of LBA 0 FAILED.\n", .{});
+        serial.log("[ATA] self-test: read of LBA 0 FAILED.\n", .{});
         return;
     }
-    serial.print("[ATA]   self-test: LBA0[0..16]='", .{});
+    serial.log("[ATA]   self-test: LBA0[0..16]='", .{});
     for (buf[0..16]) |b| {
         const c: u8 = if (b >= 0x20 and b < 0x7f) b else '.'; // show printable, dot the rest
-        serial.print("{c}", .{c});
+        serial.log("{c}", .{c});
     }
-    serial.print("'\n", .{});
-    serial.print("[ATA] self-test: read LBA 0 OK.\n", .{});
+    serial.log("'\n", .{});
+    serial.log("[ATA] self-test: read LBA 0 OK.\n", .{});
 
     // Non-destructive write test: save the last sector, write a known pattern,
     // read it back, verify, then restore the original bytes — so the write path
@@ -255,6 +255,6 @@ pub fn selfTest() void {
         var rb: [SECTOR_SIZE]u8 = undefined;
         const ok = write(last, 1, &pat) and read(last, 1, &rb) and std.mem.eql(u8, &pat, &rb);
         _ = write(last, 1, &orig); // restore the original contents either way
-        serial.print("[ATA] self-test: write/read-back last sector {s}.\n", .{if (ok) "OK (restored)" else "MISMATCH"});
+        serial.log("[ATA] self-test: write/read-back last sector {s}.\n", .{if (ok) "OK (restored)" else "MISMATCH"});
     }
 }

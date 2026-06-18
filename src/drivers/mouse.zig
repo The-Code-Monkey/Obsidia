@@ -140,7 +140,7 @@ pub fn init() void {
     // the controller completely untouched rather than risk the keyboard.
     ctrlCmd(0x20); // request the command byte
     var cb = readByte() orelse {
-        serial.print("[MOUSE] could not read 8042 config byte; mouse disabled (keyboard untouched).\n", .{});
+        serial.log("[MOUSE] could not read 8042 config byte; mouse disabled (keyboard untouched).\n", .{});
         return;
     };
     // FORCE the keyboard-critical bits to known-good values so even a wrong read
@@ -174,5 +174,5 @@ pub fn init() void {
     index = 0;
     pic.register(12, &onIrq); // route IRQ12 to us and unmask it
     ready = true;
-    serial.print("[MOUSE] Mouse ready (IRQ12), wheel {s} (device id {d}).\n", .{ if (has_wheel) "enabled" else "absent", id });
+    serial.log("[MOUSE] Mouse ready (IRQ12), wheel {s} (device id {d}).\n", .{ if (has_wheel) "enabled" else "absent", id });
 }

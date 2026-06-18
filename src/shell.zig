@@ -504,10 +504,10 @@ fn execute(raw: []const u8) void {
 
 // --- Public entry points -----------------------------------------------------
 pub fn init() void {
-    serial.print("[SHELL] Starting interactive serial shell...\n", .{});
+    serial.log("[SHELL] Starting interactive serial shell...\n", .{});
     serial.enableRxInterrupt(); // make the UART raise IRQ4 on input
     pic.register(4, &onSerialIrq); // route IRQ4 to our handler and unmask it
-    serial.print("[SHELL] Type 'help' for commands.\n", .{});
+    serial.log("[SHELL] Type 'help' for commands.\n", .{});
 }
 
 // --- Login -------------------------------------------------------------------
@@ -583,7 +583,7 @@ fn readLine(buf: []u8, echo: bool) usize {
 // credential exists, so disk-less boots are unaffected.
 fn login() void {
     if (!loadCredential()) {
-        serial.print("[LOGIN] no credential configured (/OBSIDIA/AUTH absent); open shell.\n", .{});
+        serial.log("[LOGIN] no credential configured (/OBSIDIA/AUTH absent); open shell.\n", .{});
         return;
     }
     while (true) {

@@ -236,5 +236,5 @@ pub fn init() void {
 
     asm volatile ("sti"); // set IF: from here, maskable interrupts can fire
 
-    serial.print("[PIC] PIC + PIT initialized.\n", .{});
+    serial.log("[PIC] PIC + PIT initialized.\n", .{});
 }

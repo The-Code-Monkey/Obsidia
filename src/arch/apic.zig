@@ -131,7 +131,7 @@ pub fn routeIrq(irq: u8) void {
 
     ioWrite(io, 0x10 + idx * 2 + 1, high); // high half first (dest)
     ioWrite(io, 0x10 + idx * 2, low); // low half (unmasks the line)
-    serial.print("[APIC]   IRQ{d} -> GSI{d} -> vector {d} (IOAPIC {d}, entry {d})\n", .{ irq, gsi, vector, io.id, idx });
+    serial.log("[APIC]   IRQ{d} -> GSI{d} -> vector {d} (IOAPIC {d}, entry {d})\n", .{ irq, gsi, vector, io.id, idx });
 }
 
 // Route a PCI INTx line to its vector via the I/O APIC. PCI interrupts differ
@@ -162,7 +162,7 @@ pub fn init() void {
 
     // 1. Disable the legacy 8259 PIC so it can't deliver anything.
     pic.disable();
-    serial.print("[APIC]   8259 PIC disabled.\n", .{});
+    serial.log("[APIC]   8259 PIC disabled.\n", .{});
 
     // 2. Enable the Local APIC.
     lapic = @ptrFromInt(pmm.physToVirt(acpi.lapicAddress()));
@@ -180,7 +180,7 @@ pub fn init() void {
     pic.rerouteRegistered();
 
     asm volatile ("sti"); // interrupts back on, now via the APIC
-    serial.print("[APIC] APIC initialized.\n", .{});
+    serial.log("[APIC] APIC initialized.\n", .{});
 }
 
 // Mask an IRQ at the I/O APIC (used to silence the PIT once the LAPIC timer
@@ -241,7 +241,7 @@ pub fn initTimer(hz: u32) void {
     lapicWrite(TIMER_DIV, 0x3);
     lapicWrite(LVT_TIMER, TIMER_PERIODIC | @as(u32, TIMER_VECTOR));
     lapicWrite(TIMER_INIT, count);
-    serial.print("[APIC]   PIT retired; LAPIC timer periodic @ {d} Hz (vector {d}).\n", .{ hz, TIMER_VECTOR });
+    serial.log("[APIC]   PIT retired; LAPIC timer periodic @ {d} Hz (vector {d}).\n", .{ hz, TIMER_VECTOR });
 }
 
 // Pause the LAPIC timer by masking its LVT entry. This stops the periodic timer

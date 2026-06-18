@@ -244,10 +244,10 @@ pub fn selfTest() void {
     const wrote = marker_alias.* == RING3_MAGIC;
     const cpl3 = (fault_cs & 3) == 3;
     if (wrote and cpl3) {
-        serial.print("[USER] Ring-3 self-test OK: ran user code at CPL3 and recovered from its #GP.\n", .{});
+        serial.log("[USER] Ring-3 self-test OK: ran user code at CPL3 and recovered from its #GP.\n", .{});
     }
     if (cpl3) { // write() returned to ring 3, then the cli faulted from CPL 3
-        serial.print("[SYS] Syscall round-trip OK: ring 3 -> kernel -> ring 3 via syscall/sysret.\n", .{});
+        serial.log("[SYS] Syscall round-trip OK: ring 3 -> kernel -> ring 3 via syscall/sysret.\n", .{});
     }
 
     // --- Entry 2: exit -------------------------------------------------------
@@ -258,7 +258,7 @@ pub fn selfTest() void {
     usermodeEnter(U_CODE + 0x80, U_STACK_TOP);
     syscall.exit_handler = null; // back in ring 0; disarm
     if (last_exit_code == 0) {
-        serial.print("[SYS] exit syscall returned to the kernel (code {d}).\n", .{last_exit_code});
+        serial.log("[SYS] exit syscall returned to the kernel (code {d}).\n", .{last_exit_code});
     }
 
     // Tear the mappings down and return the frames.

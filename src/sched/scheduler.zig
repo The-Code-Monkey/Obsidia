@@ -93,7 +93,7 @@ fn setupMain() void {
 pub fn spawn(name: []const u8, func: *const fn () void) void {
     if (thread_count >= MAX_THREADS) return;
     const gs = kstack.alloc(thread_count) orelse { // guarded stack for this thread slot
-        serial.print("[SCHED]   failed to allocate a thread stack\n", .{});
+        serial.log("[SCHED]   failed to allocate a thread stack\n", .{});
         return;
     };
     const stack = @as([*]u8, @ptrFromInt(gs.bottom))[0 .. gs.top - gs.bottom]; // record of the mapped region
@@ -254,7 +254,7 @@ fn threadExit() noreturn {
 pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) bool {
     if (thread_count >= MAX_THREADS) return false;
     const gs = kstack.alloc(thread_count) orelse { // guarded kernel stack for this slot
-        serial.print("[SCHED]   failed to allocate a user kernel stack\n", .{});
+        serial.log("[SCHED]   failed to allocate a user kernel stack\n", .{});
         return false;
     };
     const stack = @as([*]u8, @ptrFromInt(gs.bottom))[0 .. gs.top - gs.bottom]; // record of the mapped region
@@ -344,7 +344,7 @@ pub fn runUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) u6
         // `user_done` — waiting below would hang the launcher forever. Restore the
         // previous handler and report the failure instead.
         syscall.exit_handler = prev;
-        serial.print("[SCHED]   could not spawn user process '{s}'.\n", .{name});
+        serial.log("[SCHED]   could not spawn user process '{s}'.\n", .{name});
         return SPAWN_FAILED;
     }
     while (!@atomicLoad(bool, &user_done, .acquire)) yield();
@@ -368,7 +368,7 @@ fn worker() void {
     const name = threads[current].name; // "A" or "B"
     var k: usize = 0;
     while (k < 4) : (k += 1) {
-        serial.print("[SCHED]   {s}: iteration {d}\n", .{ name, k });
+        serial.log("[SCHED]   {s}: iteration {d}\n", .{ name, k });
         yield(); // hand off to the other worker
     }
     // falls through to threadExit
@@ -379,8 +379,8 @@ pub fn selfTest() void {
     spawn("A", &worker);
     spawn("B", &worker);
     while (aliveCount() > 0) yield(); // run the workers to completion
-    serial.print("[SCHED]   back in main; all threads finished.\n", .{});
-    serial.print("[SCHED] Scheduler self-test complete.\n", .{});
+    serial.log("[SCHED]   back in main; all threads finished.\n", .{});
+    serial.log("[SCHED] Scheduler self-test complete.\n", .{});
 }
 
 // --- Preemptive demo: workers that NEVER yield, switched only by the timer ----
@@ -392,7 +392,7 @@ fn pworker() void {
         while (pic.ticks() < target) {} // the timer preempts us out of this loop
     }
     asm volatile ("cli");
-    serial.print("[SCHED]   preempt {s}: finished (never called yield)\n", .{name});
+    serial.log("[SCHED]   preempt {s}: finished (never called yield)\n", .{name});
     asm volatile ("sti");
 }
 
@@ -405,7 +405,7 @@ pub fn preemptDemo() void {
     while (aliveCount() > 0) {} // main busy-waits; the timer schedules the workers
     pic.on_tick = null; // stop preempting
     preempting = false;
-    serial.print("[SCHED] Preemptive demo complete.\n", .{});
+    serial.log("[SCHED] Preemptive demo complete.\n", .{});
 }
 
 // --- Permanent multitasking --------------------------------------------------
@@ -445,7 +445,7 @@ pub fn dump() void {
 // --- One-shot blocking-sleep self-test ---------------------------------------
 fn sleepWorker() void {
     sleep(20); // block for ~200 ms (the timer wakes us; we don't busy-wait)
-    serial.print("[SCHED]   blocking-sleep self-test: slept, woke OK (no busy-wait).\n", .{});
+    serial.log("[SCHED]   blocking-sleep self-test: slept, woke OK (no busy-wait).\n", .{});
     // returns -> threadExit
 }
 
@@ -531,9 +531,9 @@ pub fn mutexDemo() void {
     const expected = MTX_ITERS * MTX_WORKERS; // the exact total if no update was lost
     if (mtx_counter == expected and !mtx_violation) {
         // Unique success marker the integration harness greps for.
-        serial.print("[MUTEX] blocking mutex self-test: mutual exclusion held, {d} handoffs OK\n", .{mtx_handoffs});
+        serial.log("[MUTEX] blocking mutex self-test: mutual exclusion held, {d} handoffs OK\n", .{mtx_handoffs});
     } else {
-        serial.print("[MUTEX] FAIL: counter={d} (expected {d}), violation={}\n", .{ mtx_counter, expected, mtx_violation });
+        serial.log("[MUTEX] FAIL: counter={d} (expected {d}), violation={}\n", .{ mtx_counter, expected, mtx_violation });
     }
 }
 
@@ -570,7 +570,7 @@ pub fn userProcessDemo() void {
     demo_kcounter = 0;
 
     const as = vmm.createAddressSpace() orelse {
-        serial.print("[SCHED]   FAILED: no memory for a user address space\n", .{});
+        serial.log("[SCHED]   FAILED: no memory for a user address space\n", .{});
         return;
     };
     const code_frame = pmm.allocZeroed() orelse return;
@@ -617,15 +617,15 @@ pub fn userProcessDemo() void {
         pic.on_tick = null;
         preempting = false;
     } else {
-        serial.print("[SCHED]   could not spawn the user process\n", .{});
+        serial.log("[SCHED]   could not spawn the user process\n", .{});
     }
     syscall.exit_handler = null;
 
     const user_iters = counter.*;
     if (user_iters == DEMO_ITERS and demo_kcounter == DEMO_ITERS) {
-        serial.print("[SCHED] User-process self-test OK: ring-3 process + kernel thread co-scheduled across address spaces.\n", .{});
+        serial.log("[SCHED] User-process self-test OK: ring-3 process + kernel thread co-scheduled across address spaces.\n", .{});
     } else {
-        serial.print("[SCHED] User-process self-test FAILED (user={d}, kernel={d}).\n", .{ user_iters, demo_kcounter });
+        serial.log("[SCHED] User-process self-test FAILED (user={d}, kernel={d}).\n", .{ user_iters, demo_kcounter });
     }
 
     // Tear down the process's address space + frames (its kernel stack, like the

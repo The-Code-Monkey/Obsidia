@@ -201,7 +201,7 @@ pub fn mountAt(start: u32) bool {
     fat_cache_dirty = false; // nothing pending on a fresh mount
     next_free_cluster = 2; // restart the allocation hint for the new volume
     mounted = true;
-    serial.print("[FAT32] mounted: {d}-byte sectors, {d} sec/cluster, {d} FAT(s), root cluster {d}, data @ sector {d}.\n", .{ bi.bytes_per_sector, bi.sectors_per_cluster, bi.num_fats, bi.root_cluster, bi.first_data_sector });
+    serial.log("[FAT32] mounted: {d}-byte sectors, {d} sec/cluster, {d} FAT(s), root cluster {d}, data @ sector {d}.\n", .{ bi.bytes_per_sector, bi.sectors_per_cluster, bi.num_fats, bi.root_cluster, bi.first_data_sector });
     return true;
 }
 

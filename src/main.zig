@@ -6,6 +6,7 @@ const builtin = @import("builtin"); // compile-time target info (CPU arch, etc.)
 const std = @import("std"); // for the panic-handler wiring
 const limine = @import("limine"); // Limine boot-protocol bindings (48cf/limine-zig)
 const serial = @import("drivers/serial.zig"); // COM1 logging
+const config = @import("config"); // build-time flags (debug_log)
 const cpu = @import("arch/cpu.zig"); // CPUID, CR4 (SMEP/SMAP), RDRAND
 const gdt = @import("arch/gdt.zig"); // segment descriptors + TSS
 const idt = @import("arch/idt.zig"); // interrupt/exception handlers
@@ -208,7 +209,7 @@ fn registerBuiltinDrivers() void {
 export fn _start() noreturn {
     // Serial first, so we can see everything that follows — including failures.
     serial.init(); // bring up COM1
-    serial.print("[OBSIDIA] Kernel entered _start.\n", .{});
+    serial.log("[OBSIDIA] Kernel entered _start.\n", .{});
 
     // Verify the bootloader supports the boot-protocol revision we asked for.
     if (!base_revision.isSupported()) {
@@ -351,7 +352,7 @@ export fn _start() noreturn {
     // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
     fat32.selfTest();
 
-    serial.print("BOOT_OK\n", .{}); // the marker our test harness greps for
+    serial.log("BOOT_OK\n", .{}); // the marker our test harness greps for (debug-log only)
 
     // Switch off Limine's boot stack (which lives in bootloader-reclaimable
     // memory) onto our own kernel stack, then reclaim that memory and start the
@@ -375,14 +376,22 @@ export fn _start() noreturn {
 fn runAfterReclaim() callconv(.C) noreturn {
     pmm.reclaimBootloader(); // safe now: we're off Limine's boot stack
 
-    scheduler.selfTest(); // demo cooperative kernel-thread context switching
-    scheduler.preemptDemo(); // demo timer-driven preemption (threads that never yield)
-    scheduler.blockSleepDemo(); // demo blocking sleep (a thread sleeps, the timer wakes it)
-    scheduler.mutexDemo(); // demo the blocking Mutex (two threads contend; mutual exclusion)
-    usermode.selfTest(); // demo ring 3: run user code at CPL3 and recover from its #GP
-    vmm.selfTestAddressSpace(); // demo a per-process address space (create/switch/destroy)
-    vmm.selfTestUncacheable(); // demo an uncacheable (PCD/UC) MMIO-style mapping
-    scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
+    // Boot self-test demos. These prove subsystems work but produce on-screen
+    // noise (including a deliberate ring-3 run that prints userspace output), so
+    // they only run when built with -Ddebug-log=true — keeping a normal boot quiet.
+    // The test harness builds with that flag, so it still exercises + asserts them.
+    // (The init-loader below stays unconditional — it's the real userland-at-boot
+    // path, not a demo.)
+    if (config.debug_log) {
+        scheduler.selfTest(); // demo cooperative kernel-thread context switching
+        scheduler.preemptDemo(); // demo timer-driven preemption (threads that never yield)
+        scheduler.blockSleepDemo(); // demo blocking sleep (a thread sleeps, the timer wakes it)
+        scheduler.mutexDemo(); // demo the blocking Mutex (two threads contend; mutual exclusion)
+        usermode.selfTest(); // demo ring 3: run user code at CPL3 and recover from its #GP
+        vmm.selfTestAddressSpace(); // demo a per-process address space (create/switch/destroy)
+        vmm.selfTestUncacheable(); // demo an uncacheable (PCD/UC) MMIO-style mapping
+        scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
+    }
 
     // Load and run the init binary off the disk (if present) as a RING-3 PROCESS
     // — an ELF64 at /INIT.ELF, else a flat /INIT. The first code this kernel runs

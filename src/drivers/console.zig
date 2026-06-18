@@ -481,13 +481,13 @@ pub fn scrollUpBy(lines: usize) void {
             view_top = oldest;
             renderWindow(view_top);
         }
-        serial.note("[CON] scrollback: at oldest line\n", .{});
+        serial.logNote("[CON] scrollback: at oldest line\n", .{});
         return;
     }
     view_top = if (cur_view >= oldest + lines) cur_view - lines else oldest;
     scrolled = true;
     renderWindow(view_top);
-    serial.note("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
+    serial.logNote("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
 }
 
 // Scroll the view DOWN toward the live bottom by `lines`. Reaching the bottom
@@ -499,11 +499,11 @@ pub fn scrollDownBy(lines: usize) void {
     if (view_top + lines >= top_abs) { // would reach (or pass) the live bottom
         scrolled = false;
         renderWindow(top_abs); // restore the live screen from the grid
-        serial.note("[CON] scrollback: live (bottom)\n", .{});
+        serial.logNote("[CON] scrollback: live (bottom)\n", .{});
     } else {
         view_top += lines;
         renderWindow(view_top);
-        serial.note("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
+        serial.logNote("[CON] scrollback up: {d} line(s) back\n", .{top_abs - view_top});
     }
 }
 
@@ -550,13 +550,13 @@ pub fn init(info: FramebufferInfo) void {
     blankScreen(); // blank the pixels (state is already homed)
     ready = true; // now usable
 
-    serial.print("[CON]   scrollback: {d} lines retained (PageUp/PageDown to scroll)\n", .{SB_LINES});
+    serial.log("[CON]   scrollback: {d} lines retained (PageUp/PageDown to scroll)\n", .{SB_LINES});
 
     // Draw a banner straight to the framebuffer so there's something to see.
     print("Obsidia framebuffer console ({d}x{d}, {d}x{d} font)\n", .{ fb.width, fb.height, font.width, font.height });
     print("--------------------------------------------------\n", .{});
 
-    serial.print("[CON] Framebuffer console initialized.\n", .{});
+    serial.log("[CON] Framebuffer console initialized.\n", .{});
 }
 
 // --- Unit tests (run with `zig build test`) ---------------------------------

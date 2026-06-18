@@ -107,11 +107,11 @@ pub fn enableSmepSmap() void {
     var cr4 = readCr4();
     if (has_smep) {
         cr4 |= CR4_SMEP;
-        serial.print("[CPU] SMEP enabled\n", .{});
+        serial.log("[CPU] SMEP enabled\n", .{});
     }
     if (has_smap) {
         cr4 |= CR4_SMAP;
-        serial.print("[CPU] SMAP enabled\n", .{});
+        serial.log("[CPU] SMAP enabled\n", .{});
     }
     writeCr4(cr4);
 }
