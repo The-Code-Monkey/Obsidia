@@ -42,7 +42,7 @@ jobs:
       # below), so after the first run warms the cache, later runs restore them in
       # seconds. Bump `version` to invalidate the cache (e.g. on a package change).
       - name: Install tooling (apt, cached)
-        uses: awalsh128/cache-apt-pkgs-action@v1
+        uses: awalsh128/cache-apt-pkgs-action@681749ae568c81c2037cb9185e38b709b261bd2f # v1.6.1
         with:
           packages: xorriso mtools qemu-system-x86 ovmf socat imagemagick
           version: 1
