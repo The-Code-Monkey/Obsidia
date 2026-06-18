@@ -219,7 +219,7 @@ instead of failing.
 -----------------------------
 
 Obsidia can require a password and can install itself onto a disk. See the
-"Installing Obsidia" section of ``README.md`` for the full walkthrough; the quick
+"Installing Obsidia" section of ``README.rst`` for the full walkthrough; the quick
 check is:
 
 - ``./install.sh`` — boots an installer; type ``install``, then ``shutdown``.
