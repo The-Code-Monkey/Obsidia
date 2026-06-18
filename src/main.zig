@@ -23,6 +23,7 @@ const ac97 = @import("drivers/ac97.zig"); // AC'97 audio (PCM playback over DMA)
 const ata = @import("drivers/ata.zig"); // ATA PIO disk (block device)
 const ahci = @import("drivers/ahci.zig"); // AHCI/SATA disk (DMA block device, read-only)
 const rtc = @import("drivers/rtc.zig"); // RTC / CMOS wall-clock (date + time)
+const tsc = @import("drivers/tsc.zig"); // TSC monotonic clock (high-res ns since boot)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
@@ -296,6 +297,14 @@ export fn _start() noreturn {
         // Calibrate + start the LAPIC timer (retires the PIT as the timer source).
         apic.initTimer(100); // 100 Hz, matching the old PIT rate
     }
+
+    // Calibrate the TSC monotonic clock against the now-running periodic timer.
+    // This is placed right after the APIC timer is brought up, but it works on
+    // either timer source: if APIC was unavailable we're still on the PIT, which
+    // also ticks at 100 Hz, so the calibration window is valid either way. On a
+    // machine with no usable timer at all, tsc.init() skips cleanly (it never
+    // hangs or panics) and still logs a marker.
+    tsc.init();
 
     // DMA buffer allocator: physically-contiguous, <4 GiB, zeroed buffers for
     // the bus-master devices the PCI drivers below will drive (audio/AHCI/NIC).
