@@ -36,11 +36,16 @@ jobs:
 
       # Everything the test harness needs: ISO assembly (xorriso/mtools),
       # emulation (qemu + ovmf), and the framebuffer screenshot check
-      # (socat + imagemagick).
-      - name: Install tooling
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xorriso mtools qemu-system-x86 ovmf socat imagemagick
+      # (socat + imagemagick). These were re-downloaded from the apt mirrors on
+      # every run, which took ~18 min when a mirror was slow. This action caches
+      # the resolved .deb packages (keyed by the package list + the `version`
+      # below), so after the first run warms the cache, later runs restore them in
+      # seconds. Bump `version` to invalidate the cache (e.g. on a package change).
+      - name: Install tooling (apt, cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: xorriso mtools qemu-system-x86 ovmf socat imagemagick
+          version: 1
 
       # Limine binaries + the host installer utility.
       - name: Fetch Limine binaries
