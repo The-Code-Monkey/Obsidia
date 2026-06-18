@@ -120,7 +120,6 @@ fn teardown() void {
 // first switch to the process flushes everything).
 fn mapWritable(virt: u64) bool {
     const frame = pmm.allocZeroed() orelse { // a zeroed frame guarantees a zeroed .bss tail
-        serial.print("[LOADER] out of physical memory mapping 0x{x}.\n", .{virt});
         teardown(); // unwind the whole partially-built image
         return false;
     };
@@ -176,23 +175,18 @@ fn copyInto(virt: u64, src: []const u8) void {
 // there is never anything to unwind on its failure paths.
 fn readImage(path: []const u8) ?[]const u8 {
     if (!fat32.isMounted()) {
-        serial.print("[LOADER] no filesystem mounted.\n", .{});
         return null;
     }
     const node = fat32.resolve(path) orelse { // does the file exist?
-        serial.print("[LOADER] no such file: {s}\n", .{path});
         return null;
     };
     if (node.is_dir) {
-        serial.print("[LOADER] {s} is a directory.\n", .{path});
         return null;
     }
     if (node.size == 0) { // nothing to run
-        serial.print("[LOADER] {s} is empty.\n", .{path});
         return null;
     }
     if (node.size > file_buf.len) {
-        serial.print("[LOADER] {s} is too big ({d} bytes; cap is {d}).\n", .{ path, node.size, file_buf.len });
         return null;
     }
 
@@ -200,7 +194,6 @@ fn readImage(path: []const u8) ?[]const u8 {
     // copy: the flat loader copies it straight to the load base; the ELF loader
     // parses it and scatters its segments to their linked addresses.
     const got = fat32.readFile(path, file_buf[0..node.size]) orelse {
-        serial.print("[LOADER] disk read failed for {s}.\n", .{path});
         return null;
     };
     // A short read means the cluster chain ended before the file's declared
@@ -209,10 +202,8 @@ fn readImage(path: []const u8) ?[]const u8 {
     // garbage, so refuse here — nothing is mapped yet (we've only slurped the
     // file into the scratch buffer), so there is nothing to unwind.
     if (got != node.size) {
-        serial.print("[LOADER] short read for {s}: got {d} of {d} bytes.\n", .{ path, got, node.size });
         return null;
     }
-    serial.print("[LOADER] Loading {s}: {d} bytes read from disk.\n", .{ path, got });
     return file_buf[0..got];
 }
 
@@ -262,7 +253,6 @@ fn execUserCtx(path: []const u8, standalone: bool) bool {
     // A fresh address space for the process: the kernel half is shared in, the low
     // half (where the image and stack go) starts empty.
     const space = vmm.createAddressSpace() orelse {
-        serial.print("[LOADER] no memory for a user address space.\n", .{});
         return false;
     };
     target_space = space; // route every mapping/copy/teardown into this space
@@ -318,7 +308,6 @@ fn mapUserStack() bool {
 fn loadFlat(file: []const u8, base: u64) ?u64 {
     const pages: usize = (file.len + @as(usize, PAGE_SIZE) - 1) / @as(usize, PAGE_SIZE); // round up
     if (pages > MAX_PAGES) {
-        serial.print("[LOADER] flat image too big ({d} pages; cap is {d}).\n", .{ pages, MAX_PAGES });
         return null;
     }
     serial.print("[LOADER]   flat binary -> {d} page(s) at 0x{x}.\n", .{ pages, base });
@@ -334,7 +323,6 @@ fn loadFlat(file: []const u8, base: u64) ?u64 {
     // Stage 2: copy the file bytes into the mapped pages (the tail of the last
     // page stays zero, which is harmless for flat code).
     copyInto(base, file);
-    serial.print("[LOADER]   copied {d} bytes (pages RW+NX while writing).\n", .{file.len});
 
     // Stage 3: flip every page to READ-ONLY + EXECUTABLE. flags=0 means present,
     // not writable, and (no NX bit) executable — i.e. RX (the user path also ORs
@@ -343,7 +331,6 @@ fn loadFlat(file: []const u8, base: u64) ?u64 {
     while (i < pages) : (i += 1) {
         remap(base + i * PAGE_SIZE, mapped_frame[i], 0); // RX read-only
     }
-    serial.print("[LOADER]   remapped RX read-only (W^X held at every step).\n", .{});
 
     return base; // flat entry is always byte 0 == base
 }
@@ -397,17 +384,14 @@ fn loadElf(file: []const u8) ?u64 {
     // --- Validate the ELF header -------------------------------------------
     // 64 bytes minimum just to read the header fields safely.
     if (file.len < 64) {
-        serial.print("[LOADER]   ELF rejected: file shorter than its 64-byte header.\n", .{});
         return null;
     }
     // e_ident[4]=class, [5]=data, [6]=version. (The 4-byte magic was checked by
     // the caller.) We only run little-endian 64-bit objects.
     if (file[4] != ELFCLASS64) {
-        serial.print("[LOADER]   ELF rejected: not ELFCLASS64 (e_ident[4]={d}).\n", .{file[4]});
         return null;
     }
     if (file[5] != ELFDATA2LSB) {
-        serial.print("[LOADER]   ELF rejected: not little-endian (e_ident[5]={d}).\n", .{file[5]});
         return null;
     }
     const e_type = rd16(file, 16); // ET_EXEC or ET_DYN
@@ -418,15 +402,12 @@ fn loadElf(file: []const u8) ?u64 {
     const e_phnum = rd16(file, 56); // number of program header entries
 
     if (e_machine != EM_X86_64) {
-        serial.print("[LOADER]   ELF rejected: machine {d} is not x86-64 (62).\n", .{e_machine});
         return null;
     }
     if (e_type != ET_EXEC and e_type != ET_DYN) {
-        serial.print("[LOADER]   ELF rejected: type {d} is not ET_EXEC/ET_DYN.\n", .{e_type});
         return null;
     }
     if (e_phnum == 0 or e_phentsize < 56) { // a 64-bit program header is 56 bytes
-        serial.print("[LOADER]   ELF rejected: bad program header table ({d} x {d} bytes).\n", .{ e_phnum, e_phentsize });
         return null;
     }
     // The whole program header table must lie within the file we read. Compute
@@ -437,12 +418,10 @@ fn loadElf(file: []const u8) ?u64 {
     if (phtab_size / @as(u64, e_phnum) != @as(u64, e_phentsize)) {
         // size * count overflowed u64 — impossible for a real table, so reject.
         // (e_phnum != 0 was already established above, so the divide is safe.)
-        serial.print("[LOADER]   ELF rejected: program header table size overflows.\n", .{});
         return null;
     }
     const phtab_end = e_phoff +% phtab_size; // first byte past the table
     if (phtab_end < e_phoff or phtab_end > file.len) { // wrapped, or runs past EOF
-        serial.print("[LOADER]   ELF rejected: program headers run past end of file.\n", .{});
         return null;
     }
     serial.print("[LOADER]   ELF64 {s}, entry 0x{x}, {d} program header(s).\n", .{ if (e_type == ET_EXEC) "ET_EXEC" else "ET_DYN", e_entry, e_phnum });
@@ -485,7 +464,6 @@ fn loadElf(file: []const u8) ?u64 {
         // segment whose [p_vaddr, p_vaddr+p_memsz) range escapes user space.
         const seg_end_check = p_vaddr +% p_memsz; // exclusive end (overflow-safe add)
         if (seg_end_check < p_vaddr) { // the add wrapped: p_memsz pushed past u64 max
-            serial.print("[LOADER]   ELF rejected: segment {d} address range overflows.\n", .{ph});
             teardown();
             return null;
         }
@@ -503,7 +481,6 @@ fn loadElf(file: []const u8) ?u64 {
             // vaddr falls in the user range is a user binary mislabeled for kernel
             // execution — reject it rather than run user code at ring 0.
             if (p_vaddr < USER_LIMIT) {
-                serial.print("[LOADER]   ELF rejected: segment {d} vaddr 0x{x} is in the user half (ring-0 load).\n", .{ ph, p_vaddr });
                 teardown();
                 return null;
             }
@@ -511,13 +488,11 @@ fn loadElf(file: []const u8) ?u64 {
 
         if (p_memsz == 0) continue; // an empty segment maps nothing
         if (p_memsz < p_filesz) { // a malformed header — bss can't be negative
-            serial.print("[LOADER]   ELF rejected: segment {d} has memsz < filesz.\n", .{ph});
             teardown();
             return null;
         }
         const file_end = p_offset +% p_filesz; // overflow-safe end of the file region
         if (file_end < p_offset or file_end > file.len) { // wrapped, or past EOF
-            serial.print("[LOADER]   ELF rejected: segment {d} file bytes past end of file.\n", .{ph});
             teardown();
             return null;
         }
@@ -529,13 +504,11 @@ fn loadElf(file: []const u8) ?u64 {
         const seg_start = pageDown(p_vaddr);
         const seg_end = p_vaddr + p_memsz; // exclusive (overflow already ruled out above)
         if (seg_end < seg_start) { // belt-and-braces: never compute a wrapped page count
-            serial.print("[LOADER]   ELF rejected: segment {d} page range overflows.\n", .{ph});
             teardown();
             return null;
         }
         const npages = (seg_end - seg_start + PAGE_SIZE - 1) / PAGE_SIZE;
         if (mapped_count + npages > MAX_PAGES) {
-            serial.print("[LOADER]   ELF rejected: segment {d} exceeds the {d}-page cap.\n", .{ ph, MAX_PAGES });
             teardown();
             return null;
         }
@@ -590,11 +563,9 @@ fn loadElf(file: []const u8) ?u64 {
     }
 
     if (loaded == 0) { // an ELF with no loadable content can't be run
-        serial.print("[LOADER]   ELF rejected: no PT_LOAD segments.\n", .{});
         teardown();
         return null;
     }
-    serial.print("[LOADER]   {d} segment(s) mapped (per-segment W^X held).\n", .{loaded});
 
     // The entry point is e_entry slid by the same bias; the caller runs it.
     return e_entry + bias;
@@ -622,8 +593,6 @@ fn runAndTeardown(entry_addr: u64) bool {
     const ok = ret == INIT_MAGIC;
     if (ok) {
         serial.print("[LOADER]   init returned 0x{x} (magic OK).\n", .{ret});
-    } else {
-        serial.print("[LOADER]   init returned 0x{x} (expected magic 0x{x}).\n", .{ ret, INIT_MAGIC });
     }
 
     const freed = mapped_count;
@@ -644,7 +613,6 @@ fn runAndTeardown(entry_addr: u64) bool {
 // scheduler is brought up: it uses the standalone runner, which adopts a throwaway
 // thread context just long enough to run the one process.
 pub fn selfTest() void {
-    serial.print("[LOADER] Init-loader self-test...\n", .{});
     if (!fat32.isMounted()) {
         serial.print("[LOADER] self-test skipped (no filesystem mounted).\n", .{});
         return;
@@ -658,10 +626,7 @@ pub fn selfTest() void {
         serial.print("[LOADER] self-test skipped (no /INIT.ELF or /INIT on the disk).\n", .{});
         return;
     };
-    serial.print("[LOADER] self-test exec {s} (ring 3)...\n", .{path});
     if (execUserCtx(path, true)) {
         serial.print("[LOADER] init ran and exited cleanly.\n", .{});
-    } else {
-        serial.print("[LOADER] init FAILED.\n", .{});
     }
 }

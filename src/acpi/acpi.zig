@@ -118,16 +118,12 @@ fn parseMadt(madt: [*]const u8, len: u32) void {
 // --- Init --------------------------------------------------------------------
 // rsdp_phys is the physical address of the RSDP (from Limine's RSDP response).
 pub fn init(rsdp_phys: u64) void {
-    serial.print("[ACPI] Parsing ACPI tables...\n", .{});
     const r = at(rsdp_phys); // RSDP through the HHDM
 
     if (!std.mem.eql(u8, r[0..8], "RSD PTR ")) { // the RSDP signature
-        serial.print("[ACPI]   ERROR: bad RSDP signature\n", .{});
         return;
     }
     const revision = r[15]; // 0 = ACPI 1.0, >= 2 = ACPI 2.0+
-    serial.print("[ACPI]   RSDP @ 0x{x}, revision {d}, OEM '{s}'\n", .{ rsdp_phys, revision, r[9..15] });
-    if (checksum(r, 20) != 0) serial.print("[ACPI]   WARN: RSDP checksum invalid\n", .{});
 
     // Prefer the XSDT (64-bit pointers) on ACPI 2.0+, else the RSDT.
     const xsdt_addr = read(u64, r, 24);
@@ -138,7 +134,6 @@ pub fn init(rsdp_phys: u64) void {
     const root_len = read(u32, root, 4); // SDT header length field
     const entry_size: usize = if (use_xsdt) 8 else 4;
     const count = (root_len - 36) / entry_size; // pointers after the 36-byte header
-    serial.print("[ACPI]   {s} @ 0x{x}, {d} tables:\n", .{ if (use_xsdt) "XSDT" else "RSDT", root_phys, count });
 
     for (0..count) |i| { // enumerate every table
         const table_phys = if (use_xsdt)
@@ -148,11 +143,9 @@ pub fn init(rsdp_phys: u64) void {
         const h = at(table_phys);
         const sig = h[0..4]; // 4-character signature
         const len = read(u32, h, 4);
-        serial.print("[ACPI]     {s} @ 0x{x} (len {d})\n", .{ sig, table_phys, len });
         if (std.mem.eql(u8, sig, "APIC")) parseMadt(h, len); // the MADT
     }
 
     ready = true;
-    serial.print("[ACPI]   {d} CPU(s), {d} IO APIC(s), {d} override(s), LAPIC @ 0x{x}\n", .{ cpu_count, ioapic_count, iso_count, lapic_addr });
     serial.print("[ACPI] ACPI parsed.\n", .{});
 }
