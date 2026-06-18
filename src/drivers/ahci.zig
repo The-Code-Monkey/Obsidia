@@ -466,6 +466,15 @@ pub fn isPresent() bool {
     return present;
 }
 
+// Register this driver with the PCI registry so pci.probeAll() will bring the
+// HBA up. We claim the SATA mass-storage class/subclass and hand over init()
+// (whose body is unchanged — it still findByClass()es its own controller and
+// no-ops when none is present). Called once at boot from
+// main.registerBuiltinDrivers().
+pub fn register() void {
+    pci.registerDriver(CLASS_STORAGE, SUBCLASS_SATA, &init);
+}
+
 pub fn init() void {
     serial.print("[AHCI] Initializing AHCI...\n", .{});
 

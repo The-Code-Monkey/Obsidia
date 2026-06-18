@@ -98,6 +98,53 @@ pub fn findByClass(class: u8, subclass: u8) ?*const Device {
     return null;
 }
 
+// --- Driver registry ---------------------------------------------------------
+// Rather than main.zig hard-wiring each driver's init call (and repeating the
+// "find my device, then bring it up" dance), drivers REGISTER a (class, subclass,
+// init_fn) entry and pci.probeAll() drives them. This keeps the boot path
+// declarative — adding a driver no longer means editing main.zig's init sequence
+// — and puts the "what device does this driver claim?" knowledge next to the bus
+// that owns the device list. The init routine itself is UNCHANGED: it still uses
+// findByClass()/list() to locate its hardware (and no-ops cleanly when absent),
+// so behavior is identical to the old direct calls — this is purely the plumbing.
+
+// One registered driver: the PCI class/subclass it claims plus the init routine
+// to run for it. `class`/`subclass` are advisory metadata for the probe log — the
+// init routine still locates its own device — so probing a driver whose device is
+// absent is harmless (the init no-ops), and registration order == probe order.
+const Driver = struct {
+    class: u8, // PCI base class the driver claims (e.g. 0x04 multimedia)
+    subclass: u8, // finer subclass within it (e.g. 0x01 audio)
+    init_fn: *const fn () void, // bring the device up (the driver's existing init)
+};
+
+const MAX_DRIVERS: usize = 8; // small static table; no allocator needed at probe time
+var drivers: [MAX_DRIVERS]Driver = undefined;
+var driver_count: usize = 0;
+
+// Register a driver so probeAll() will invoke it. Called once per driver during
+// boot (see main.registerBuiltinDrivers); registration order IS the probe order,
+// so callers register in the sequence they want their boot markers to appear in.
+pub fn registerDriver(class: u8, subclass: u8, init_fn: *const fn () void) void {
+    if (driver_count >= MAX_DRIVERS) {
+        serial.print("[PCI] driver registry full ({d}); ignoring registration\n", .{MAX_DRIVERS});
+        return; // never overflow the static table; an extra driver simply won't run
+    }
+    drivers[driver_count] = .{ .class = class, .subclass = subclass, .init_fn = init_fn };
+    driver_count += 1;
+}
+
+// Walk the registered drivers in registration order and invoke each one's init.
+// Each init locates its own device (via findByClass) and no-ops when it's absent,
+// so this is safe on any machine: a driver whose hardware isn't present just logs
+// "skipping" and returns. Must run AFTER init() has populated the device list.
+pub fn probeAll() void {
+    serial.print("[PCI] probing {d} registered driver(s)\n", .{driver_count});
+    for (drivers[0..driver_count]) |d| {
+        d.init_fn(); // bring this driver's device up (a no-op when it isn't present)
+    }
+}
+
 // Human-readable name for a PCI base class code — makes the boot log legible.
 fn className(class: u8) []const u8 {
     return switch (class) {
