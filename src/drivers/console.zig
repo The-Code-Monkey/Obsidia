@@ -90,7 +90,10 @@ var fg: u32 = 0; // foreground pixel value
 var bg: u32 = 0; // background pixel value
 var ready: bool = false; // true once init() has run
 var esc_state: u8 = 0; // ANSI escape parser: 0=normal, 1=saw ESC, 2=in CSI
-var csi_param: usize = 0; // numeric parameter accumulated in a CSI sequence
+// CSI numeric parameters. We track the first two (e.g. ESC[row;colH needs both),
+// accumulating digits into csi_p[csi_idx]; a ';' advances csi_idx to the second.
+var csi_p: [2]usize = .{ 0, 0 };
+var csi_idx: usize = 0; // which parameter the digits are currently filling (0 or 1)
 
 // --- Scrollback --------------------------------------------------------------
 // Everything written is recorded in an in-memory character grid much taller than
@@ -323,20 +326,25 @@ fn eraseToEol() void {
 // Act on a CSI escape sequence's final byte. We implement just enough of an
 // ANSI terminal for the shell's line editing: cursor movement, erase-to-EOL,
 // and clear-screen. Unknown sequences (e.g. colors) are ignored.
-fn handleCsi(final: u8, n: usize) void {
+fn handleCsi(final: u8, p0: usize, p1: usize) void {
     switch (final) {
-        'J' => if (n == 2) clear(), // ESC[2J : clear the whole screen
-        'H' => { // ESC[H : cursor home
-            cur_x = 0;
-            cur_y = 0;
+        'J' => if (p0 == 2) clear(), // ESC[2J : clear the whole screen
+        'H' => { // ESC[row;colH : position the cursor (1-based); ESC[H = home
+            // Both default to 1 when omitted, so ESC[H -> (1,1) -> screen (0,0).
+            // This is what the editor uses to put the cursor where you're typing;
+            // it previously ignored the parameters and always homed to the top.
+            const row = if (p0 == 0) 1 else p0;
+            const col = if (p1 == 0) 1 else p1;
+            cur_y = @min(row - 1, rows - 1); // 1-based -> 0-based, clamped on screen
+            cur_x = @min(col - 1, cols - 1);
         },
         'K' => eraseToEol(), // ESC[K : erase to end of line
         'C' => { // ESC[nC : cursor right by n
-            const d = if (n == 0) 1 else n;
+            const d = if (p0 == 0) 1 else p0;
             cur_x = @min(cur_x + d, cols - 1);
         },
         'D' => { // ESC[nD : cursor left by n
-            const d = if (n == 0) 1 else n;
+            const d = if (p0 == 0) 1 else p0;
             cur_x = if (cur_x >= d) cur_x - d else 0;
         },
         else => {}, // ignore anything we don't implement
@@ -350,21 +358,22 @@ fn putcharRaw(c: u8) void {
         1 => { // we just saw ESC
             if (c == '[') {
                 esc_state = 2; // ESC [ starts a CSI sequence
-                csi_param = 0; // reset the numeric parameter
+                csi_p = .{ 0, 0 }; // reset both numeric parameters
+                csi_idx = 0; // start filling the first parameter
             } else esc_state = 0;
             return;
         },
         2 => { // inside a CSI sequence
-            if (c >= '0' and c <= '9') { // accumulate the numeric parameter
-                csi_param = csi_param * 10 + (c - '0');
+            if (c >= '0' and c <= '9') { // accumulate the current numeric parameter
+                csi_p[csi_idx] = csi_p[csi_idx] * 10 + (c - '0');
                 return;
             }
-            if (c == ';') { // multiple params: we only use the last
-                csi_param = 0;
+            if (c == ';') { // parameter separator: move on to the second parameter
+                if (csi_idx < 1) csi_idx += 1;
                 return;
             }
             esc_state = 0; // any other byte is the final byte
-            handleCsi(c, csi_param);
+            handleCsi(c, csi_p[0], csi_p[1]);
             return;
         },
         else => {},
