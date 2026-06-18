@@ -82,9 +82,14 @@ echo "== Assembling ISO =="
 build_iso || { echo "ISO assembly failed (need xorriso + limine/)"; exit 1; }
 
 # --- Boot helpers ------------------------------------------------------------
-# How long to let the kernel boot before feeding shell input (TCG in CI is
-# slower than KVM, so allow a margin).
-BOOT_WAIT="${BOOT_WAIT:-3}"
+# How long to let the kernel boot before feeding shell input. The sessions below
+# that send timed input do so this many seconds after QEMU starts; if the kernel
+# isn't at the shell prompt yet, that input is lost and the session fails. CI
+# runners under load run TCG several times slower than a quiet machine (builds
+# have been seen taking 2x+ longer), so this margin is generous on purpose — a
+# few wasted seconds per session is a fair price for not flaking. Override with
+# BOOT_WAIT=<n> on a fast box to speed the suite up.
+BOOT_WAIT="${BOOT_WAIT:-20}"
 
 # Capture a plain boot (no input) to a log file.
 boot_capture() { # boot_capture <log> <mem> [extra qemu args...]
@@ -95,7 +100,7 @@ boot_capture() { # boot_capture <log> <mem> [extra qemu args...]
 # Boot and feed the shell some input over serial, capturing output.
 boot_shell() { # boot_shell <log> <mem> <input> [extra qemu args...]
     local log="$1" mem="$2" input="$3"; shift 3
-    ( sleep "$BOOT_WAIT"; printf '%b' "$input"; sleep 2 ) | timeout 15 $QEMU \
+    ( sleep "$BOOT_WAIT"; printf '%b' "$input"; sleep 2 ) | timeout 45 $QEMU \
         -M q35 -m "$mem" "$@" -cdrom "$ISO" \
         -chardev stdio,id=c0,logfile="$log",signal=off -serial chardev:c0 \
         -display none -no-reboot >/dev/null 2>&1 || true
@@ -595,7 +600,7 @@ mmd -i "$WRDISK" ::/docs 2>/dev/null
   printf 'edit note.txt\r'; sleep 0.8; printf 'harness editor write\r'; sleep 0.4; \
   printf '\x13'; sleep 0.8; printf '\x18'; sleep 0.5; \
   printf 'cat note.txt\r'; sleep 0.8 ) \
-    | timeout 20 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
+    | timeout 45 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$WRDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/wr.log",signal=off -serial chardev:c0 \
       -display none -no-reboot >/dev/null 2>&1 || true
@@ -705,13 +710,13 @@ assert_in "$TMP/sleep.log" "awake."       "sleep: a keypress wakes it"
 echo "== Power commands =="
 
 # shutdown: QEMU should power off (qemu exits cleanly, not killed by timeout=124).
-( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 15 $QEMU \
+( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 45 $QEMU \
     -M q35 -m 512M -cdrom "$ISO" -chardev stdio,id=c0,signal=off -serial chardev:c0 \
     -display none -no-reboot >/dev/null 2>&1
 if [ "$?" -ne 124 ]; then ok "shutdown: machine powered off"; else bad "shutdown: qemu did not exit"; fi
 
 # restart: WITHOUT -no-reboot, the reset reboots and the kernel runs a 2nd time.
-( sleep "$BOOT_WAIT"; printf 'restart\r'; sleep 4 ) | timeout 15 $QEMU \
+( sleep "$BOOT_WAIT"; printf 'restart\r'; sleep 4 ) | timeout 45 $QEMU \
     -M q35 -m 512M -cdrom "$ISO" -chardev stdio,id=c0,logfile="$TMP/restart.log",signal=off \
     -serial chardev:c0 -display none >/dev/null 2>&1 || true
 boots=$(grep -ac "Kernel entered _start" "$TMP/restart.log")
