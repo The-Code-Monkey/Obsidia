@@ -291,8 +291,6 @@ fn setEntry(vector: u8, handler: u64, ist: u8) void {
 }
 
 pub fn init() void {
-    serial.print("[IDT] Initializing IDT...\n", .{});
-
     for (0..256) |i| { // install a gate for every vector
         // Route the double fault (#DF, vector 8) to IST1 so it has a known-good
         // stack even if the kernel stack is corrupt.
@@ -310,11 +308,7 @@ pub fn init() void {
         : "memory"
     );
 
-    serial.print("[IDT]   IDT base=0x{x} limit=0x{x}\n", .{ idtr.base, idtr.limit });
-    serial.print("[IDT]   256 vectors installed; #DF (vec 8) on IST1.\n", .{});
-
     if (selftest_breakpoint) { // exercise the whole dump+recover path once
-        serial.print("[IDT]   Self-test: executing int3 to exercise the dump path...\n", .{});
         asm volatile ("int3"); // triggers #BP -> isrHandler dumps and returns
         serial.print("[IDT]   Self-test: recovered from #BP cleanly. Dump path works.\n", .{});
     }

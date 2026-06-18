@@ -55,14 +55,10 @@ pub fn free(buf: Buffer) void {
 // Prove the three guarantees a DMA driver depends on: contiguous frames, a base
 // below the 32-bit ceiling, and a CPU pointer that is the HHDM alias of `phys`.
 fn selfTest() void {
-    serial.print("[DMA]   Self-test: contiguous alloc + HHDM round-trip...\n", .{});
     const free_before = pmm.freeFrames(); // baseline for the leak check
 
     // Ask for 3 pages + a tail, so the buffer spans frame boundaries.
-    const buf = alloc(3 * PAGE_SIZE + 100) orelse {
-        serial.print("[DMA]     FAILED: alloc returned null\n", .{});
-        return;
-    };
+    const buf = alloc(3 * PAGE_SIZE + 100) orelse return;
 
     const aligned = (buf.phys % PAGE_SIZE) == 0; // frame-granular base
     const nonzero = buf.phys != 0; // never the reserved frame 0
@@ -92,8 +88,6 @@ fn selfTest() void {
 }
 
 pub fn init() void {
-    serial.print("[DMA] Initializing DMA buffer allocator...\n", .{});
-    serial.print("[DMA]   contiguous, <4 GiB, zeroed buffers over the PMM\n", .{});
     selfTest(); // prove the guarantees before any driver relies on them
     serial.print("[DMA] DMA buffer allocator initialized.\n", .{});
 }

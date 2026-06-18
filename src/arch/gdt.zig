@@ -155,8 +155,6 @@ fn loadTss(selector: u16) void {
 
 // --- Public init ------------------------------------------------------------
 pub fn init() void {
-    serial.print("[GDT] Initializing GDT...\n", .{});
-
     gdt[0] = 0; // null descriptor (required to be entry 0)
     gdt[1] = makeEntry(0, 0xFFFFF, 0x9A, 0xA); // kernel code (ring 0, 64-bit: L bit set)
     gdt[2] = makeEntry(0, 0xFFFFF, 0x92, 0xC); // kernel data (ring 0)
@@ -179,12 +177,7 @@ pub fn init() void {
         .base = @intFromPtr(&gdt), // address of the table
     };
 
-    serial.print("[GDT]   GDT base=0x{x} limit=0x{x}\n", .{ gdtr.base, gdtr.limit });
-    serial.print("[GDT]   TSS base=0x{x} limit=0x{x}\n", .{ tss_base, tss_limit });
-    serial.print("[GDT]   rsp0=0x{x} ist1=0x{x}\n", .{ tss.rsp0, tss.ist1 });
-
     load(&gdtr); // install the GDT and reload all segment registers
-    serial.print("[GDT]   lgdt done; CS=0x{x}, data segs=0x{x}.\n", .{ KERNEL_CODE, KERNEL_DATA });
 
     loadTss(TSS_SELECTOR); // activate the TSS
     serial.print("[GDT]   ltr done; TSS selector=0x{x}.\n", .{TSS_SELECTOR});

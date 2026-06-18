@@ -182,7 +182,6 @@ var handlers: [16]IrqLine = [_]IrqLine{.{}} ** 16; // one chain per IRQ line
 pub fn register(irq: u4, handler: IrqHandler) void {
     const line = &handlers[irq];
     if (line.count >= MAX_SHARERS) { // chain full: refuse rather than clobber a sharer
-        serial.print("[PIC] IRQ{d} sharer chain full ({d}); handler dropped.\n", .{ irq, MAX_SHARERS });
         return;
     }
     line.chain[line.count] = handler; // append at the end of the packed chain
@@ -219,7 +218,6 @@ pub fn handleIrq(vector: u8) void {
     const line = &handlers[irq];
     const n = line.count;
     if (n == 0) {
-        serial.print("[PIC] Unhandled IRQ{d} (vector {d}).\n", .{ irq, vector });
         return;
     }
     var i: usize = 0;
@@ -230,19 +228,13 @@ pub fn handleIrq(vector: u8) void {
 
 // --- Init --------------------------------------------------------------------
 pub fn init() void {
-    serial.print("[PIC] Initializing PIC + PIT...\n", .{});
-
     remap(); // move IRQs off the exception vectors
-    serial.print("[PIC]   Remapped: master IRQ0-7 -> vec 32-39, slave IRQ8-15 -> vec 40-47.\n", .{});
 
     pitInit(TIMER_HZ); // start the 100 Hz timer
-    serial.print("[PIC]   PIT channel 0 @ {d} Hz (divisor {d}).\n", .{ TIMER_HZ, PIT_BASE_FREQ / TIMER_HZ });
 
     register(0, &timerTick); // install + unmask the timer on IRQ0
-    serial.print("[PIC]   Registered timer on IRQ0; unmasked.\n", .{});
 
     asm volatile ("sti"); // set IF: from here, maskable interrupts can fire
-    serial.print("[PIC]   Interrupts enabled (sti). master mask=0x{x}, slave mask=0x{x}.\n", .{ serial.inb(MASTER_DATA), serial.inb(SLAVE_DATA) });
 
     serial.print("[PIC] PIC + PIT initialized.\n", .{});
 }

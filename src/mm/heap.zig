@@ -195,20 +195,13 @@ pub fn allocator() std.mem.Allocator {
 // ArrayList (which drives alloc -> resize/remap -> free).
 fn selfTest() void {
     const a = allocator(); // our allocator
-    serial.print("[HEAP]   Self-test: create/destroy, slice, ArrayList(1000)...\n", .{});
 
-    const node = a.create(u64) catch { // single-object allocation
-        serial.print("[HEAP]     FAILED: create\n", .{});
-        return;
-    };
+    const node = a.create(u64) catch return; // single-object allocation
     node.* = 0xDEADBEEFCAFEBABE; // write through it
     const c1 = node.* == 0xDEADBEEFCAFEBABE; // read it back
     a.destroy(node); // free it
 
-    const buf = a.alloc(u8, 4096) catch { // a 4 KiB slice
-        serial.print("[HEAP]     FAILED: alloc slice\n", .{});
-        return;
-    };
+    const buf = a.alloc(u8, 4096) catch return; // a 4 KiB slice
     @memset(buf, 0xAB); // fill it
     const c2 = buf[0] == 0xAB and buf[4095] == 0xAB; // check both ends
     a.free(buf); // free it
@@ -217,10 +210,7 @@ fn selfTest() void {
     defer list.deinit(); // free it when we return
     var sum: u64 = 0; // expected sum 0+1+...+999
     for (0..1000) |i| {
-        list.append(@intCast(i)) catch { // grows the backing buffer as needed
-            serial.print("[HEAP]     FAILED: ArrayList append\n", .{});
-            return;
-        };
+        list.append(@intCast(i)) catch return; // grows the backing buffer as needed
         sum += i;
     }
     var got: u64 = 0; // actual sum of stored items
@@ -231,19 +221,15 @@ fn selfTest() void {
 }
 
 pub fn init() void {
-    serial.print("[HEAP] Initializing kernel heap...\n", .{});
     head.next = null; // empty free list
     heap_end = HEAP_BASE; // nothing mapped yet
     total_mapped = 0;
 
     if (!grow(INITIAL_HEAP)) { // map the initial 64 KiB
-        serial.print("[HEAP]   FATAL: could not map initial heap\n", .{});
         while (true) asm volatile ("cli; hlt");
     }
-    serial.print("[HEAP]   base=0x{x}, mapped {d} KiB ({d} GiB cap)\n", .{ HEAP_BASE, total_mapped / 1024, (HEAP_MAX - HEAP_BASE) / (1024 * 1024 * 1024) });
 
     selfTest(); // prove the allocator works with real std containers
 
-    serial.print("[HEAP]   mapped {d} KiB after self-test\n", .{total_mapped / 1024});
     serial.print("[HEAP] Kernel heap initialized.\n", .{});
 }

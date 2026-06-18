@@ -119,10 +119,7 @@ pub fn routeIrq(irq: u8) void {
         }
     }
     const vector: u32 = VECTOR_OFFSET + irq;
-    const io = ioApicForGsi(gsi) orelse {
-        serial.print("[APIC]   no I/O APIC handles GSI {d}\n", .{gsi});
-        return;
-    };
+    const io = ioApicForGsi(gsi) orelse return;
     const idx = gsi - io.gsi_base; // redirection entry index
 
     // Build the 64-bit redirection entry: fixed delivery, physical destination,
@@ -149,24 +146,18 @@ pub fn routeIrqPci(irq: u8) void {
         if (iso.source == irq) gsi = iso.gsi;
     }
     const vector: u32 = VECTOR_OFFSET + irq;
-    const io = ioApicForGsi(gsi) orelse {
-        serial.print("[APIC]   no I/O APIC handles GSI {d} (PCI IRQ{d})\n", .{ gsi, irq });
-        return;
-    };
+    const io = ioApicForGsi(gsi) orelse return;
     const idx = gsi - io.gsi_base;
     const low: u32 = vector | (1 << 13) | (1 << 15); // active-low (13) + level-triggered (15)
     const high: u32 = bsp_id << 24; // destination APIC ID
     ioWrite(io, 0x10 + idx * 2 + 1, high); // high half (dest) first
     ioWrite(io, 0x10 + idx * 2, low); // low half unmasks the line
-    serial.print("[APIC]   PCI IRQ{d} -> GSI{d} -> vector {d} (level/low, IOAPIC {d}, entry {d})\n", .{ irq, gsi, vector, io.id, idx });
 }
 
 pub fn init() void {
     if (!acpi.isReady()) { // need the MADT data
-        serial.print("[APIC] ACPI not available; staying on the PIC.\n", .{});
         return;
     }
-    serial.print("[APIC] Initializing APIC...\n", .{});
     asm volatile ("cli"); // configure with interrupts masked
 
     // 1. Disable the legacy 8259 PIC so it can't deliver anything.
@@ -179,7 +170,6 @@ pub fn init() void {
     bsp_id = lapicRead(LAPIC_ID) >> 24; // boot CPU's APIC ID
     lapicWrite(LAPIC_TPR, 0); // accept all interrupt priorities
     lapicWrite(LAPIC_SVR, 0x100 | @as(u32, SPURIOUS_VECTOR)); // bit 8 = enable, + spurious vector
-    serial.print("[APIC]   LAPIC @ 0x{x} enabled (BSP id {d}).\n", .{ acpi.lapicAddress(), bsp_id });
 
     active = true;
 
@@ -222,13 +212,11 @@ fn waitForTick() bool {
 // used, so the existing handler (timerTick) and the uptime counter are reused.
 pub fn initTimer(hz: u32) void {
     if (!active) return;
-    serial.print("[APIC] Calibrating LAPIC timer against the PIT...\n", .{});
     lapicWrite(TIMER_DIV, 0x3); // divide bus clock by 16
     lapicWrite(LVT_TIMER, TIMER_MASKED); // masked while we measure
 
     // Count how far the LAPIC timer falls over 10 PIT ticks (= 100 ms @ 100 Hz).
     if (!waitForTick()) { // align to a PIT tick edge first
-        serial.print("[APIC]   PIT not ticking; keeping the PIT as the timer.\n", .{});
         return;
     }
     lapicWrite(TIMER_INIT, 0xFFFFFFFF); // start the LAPIC timer at max
@@ -241,14 +229,12 @@ pub fn initTimer(hz: u32) void {
     lapicWrite(TIMER_INIT, 0); // stop
 
     if (elapsed < 1000) { // implausibly small -> calibration failed
-        serial.print("[APIC]   calibration failed (elapsed {d}); keeping the PIT.\n", .{elapsed});
         return;
     }
     // elapsed counts in 100 ms -> counts/sec = elapsed*10. The periodic initial
     // count for the requested frequency:
     const counts_per_sec = @as(u64, elapsed) * 10;
     const count: u32 = @intCast(counts_per_sec / hz);
-    serial.print("[APIC]   LAPIC timer ~{d} MHz; count {d}/period for {d} Hz.\n", .{ counts_per_sec / 1_000_000, count, hz });
 
     // Silence the PIT and run the LAPIC timer periodically on the timer vector.
     maskIrq(0);

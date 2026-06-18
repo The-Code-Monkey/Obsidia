@@ -63,10 +63,7 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
         SYS_write => sysWrite(a1, a2, a3),
         SYS_yield => sysYield(),
         SYS_exit => sysExit(a1),
-        else => blk: {
-            serial.print("[SYS]   unknown syscall num={d}.\n", .{num});
-            break :blk ENOSYS;
-        },
+        else => ENOSYS,
     };
 }
 
@@ -105,11 +102,9 @@ fn sysYield() u64 {
 // exit(code): terminate the caller. Routes to the installed handler (which longjmps
 // back to whoever launched the user code); becomes real process teardown later.
 fn sysExit(code: u64) u64 {
-    serial.print("[SYS]   exit({d}).\n", .{code});
     if (exit_handler) |h| h(code); // noreturn
     // No handler installed: this is a kernel bug (one is always set before user
-    // code runs), so say so loudly rather than silently letting the user resume.
-    serial.print("[SYS]   WARNING: exit() with no handler installed — cannot terminate caller.\n", .{});
+    // code runs). Nothing we can do but refuse to terminate the caller.
     return ENOSYS;
 }
 
@@ -156,8 +151,6 @@ comptime {
 // in STAR, the entry point in LSTAR, and the RFLAGS mask in SFMASK. Must run after
 // gdt.init() (uses the GDT selectors) and before any user code executes.
 pub fn init() void {
-    serial.print("[SYS] Initializing syscall path...\n", .{});
-
     // EFER.SCE turns on the syscall/sysret instructions (preserving NXE etc.).
     cpu.wrmsr(cpu.IA32_EFER, cpu.rdmsr(cpu.IA32_EFER) | cpu.EFER_SCE);
 
@@ -179,6 +172,4 @@ pub fn init() void {
     cpu.wrmsr(cpu.IA32_FMASK, 0x700);
 
     syscall_kernel_rsp = @intFromPtr(&syscall_stack) + syscall_stack.len;
-    serial.print("[SYS]   EFER.SCE on; STAR=0x{x}; entry=0x{x}.\n", .{ star, @intFromPtr(&syscallEntry) });
-    serial.print("[SYS] Syscall path initialized.\n", .{});
 }
