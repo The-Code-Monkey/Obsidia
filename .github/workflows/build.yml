@@ -1,10 +1,19 @@
 name: Build & Test Obsidia
 
-# Trigger on every push to any branch, and on pull requests.
+# Trigger on pushes to main (post-merge) and on pull requests. Feature
+# branches are covered by the pull_request event, so scoping push to main
+# avoids the duplicate run a push-to-any-branch + pull_request pair produced
+# on every PR commit.
 on:
   push:
-    branches: [ "**" ]
+    branches: [ main ]
   pull_request:
+
+# Cancel an in-flight run when a newer commit lands on the same ref, so a
+# rebase/force-push doesn't leave a stale build burning a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
