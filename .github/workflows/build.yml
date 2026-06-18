@@ -34,13 +34,31 @@ jobs:
         with:
           version: 0.14.0
 
-      # Everything the test harness needs: ISO assembly (xorriso/mtools),
-      # emulation (qemu + ovmf), and the framebuffer screenshot check
-      # (socat + imagemagick).
+      # Cache the downloaded .deb packages so we don't re-fetch them from the apt
+      # mirrors every run (that download was the slowest step, ~18 min on a slow
+      # mirror). On a cache hit the .debs are already in /var/cache/apt/archives
+      # and the install step below uses them without hitting the network. Bump the
+      # "-v1" key suffix to invalidate the cache when the package set changes.
+      - name: Cache apt packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-tooling-v1
+
+      # Everything the test harness needs: ISO assembly (xorriso/mtools), emulation
+      # (qemu + ovmf), and the framebuffer screenshot check (socat + imagemagick).
+      # --no-install-recommends skips qemu-system-x86's large recommended GUI stack
+      # (GTK/SDL/...) that we never use — CI runs headless (-display none); the BIOS
+      # firmware comes from qemu-system-data (a hard dependency) and UEFI from the
+      # ovmf we install explicitly, so both boot paths still work.
+      # GitHub runners ship a hook that deletes the .debs right after install; we
+      # remove it and tell apt to keep them, so the cache step above can save them.
       - name: Install tooling
         run: |
+          sudo rm -f /etc/apt/apt.conf.d/docker-clean
+          echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/99keep-debs
           sudo apt-get update
-          sudo apt-get install -y xorriso mtools qemu-system-x86 ovmf socat imagemagick
+          sudo apt-get install -y --no-install-recommends xorriso mtools qemu-system-x86 ovmf socat imagemagick
 
       # Limine binaries + the host installer utility.
       - name: Fetch Limine binaries
