@@ -147,5 +147,9 @@ pub fn init(rsdp_phys: u64) void {
     }
 
     ready = true;
+    // Asserted boot marker — the test harness greps "APIC @ 0x" to confirm the
+    // MADT was parsed (matches the "LAPIC @ 0x" substring). This summary line is
+    // test logging, so it survives the "strip non-test logging" cleanup.
+    serial.print("[ACPI]   {d} CPU(s), {d} IO APIC(s), {d} override(s), LAPIC @ 0x{x}\n", .{ cpu_count, ioapic_count, iso_count, lapic_addr });
     serial.print("[ACPI] ACPI parsed.\n", .{});
 }
