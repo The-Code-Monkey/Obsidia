@@ -160,16 +160,13 @@ pub fn mount() bool {
 // call with no disk or an unformatted volume: it reports why and returns false.
 pub fn mountAt(start: u32) bool {
     if (!ata.isPresent()) {
-        serial.print("[FAT32] no disk present — nothing to mount.\n", .{});
         return false;
     }
     var bs: [SECTOR]u8 = undefined;
     if (!ata.read(start, 1, &bs)) {
-        serial.print("[FAT32] failed to read the boot sector.\n", .{});
         return false;
     }
     if (rd16(&bs, 510) != 0xAA55) { // the boot-sector signature every FAT volume has
-        serial.print("[FAT32] no boot signature (disk not formatted FAT?).\n", .{});
         return false;
     }
     bi.bytes_per_sector = rd16(&bs, 11);
@@ -181,11 +178,9 @@ pub fn mountAt(start: u32) bool {
     bi.total_sectors = rd32(&bs, 32); // BPB_TotSec32
 
     if (bi.bytes_per_sector != SECTOR) {
-        serial.print("[FAT32] unsupported sector size {d} (need 512).\n", .{bi.bytes_per_sector});
         return false;
     }
     if (bi.sectors_per_cluster == 0 or bi.fat_size == 0) {
-        serial.print("[FAT32] not a FAT32 volume (cluster/FAT size zero).\n", .{});
         return false;
     }
     // Data region begins after the reserved sectors and all FAT copies (relative
@@ -281,7 +276,6 @@ fn scanDir(start_cluster: u32, ctx: anytype, comptime onEntry: fn (@TypeOf(ctx),
     const cap = maxChainLen();
     while (isDataCluster(cluster)) { // each cluster in the directory's chain
         if (hops >= cap) { // followed more links than the volume has clusters -> cycle
-            serial.print("[FAT32] cluster chain too long / cycle detected (scanDir)\n", .{});
             return;
         }
         hops += 1;
@@ -405,7 +399,6 @@ pub fn cat(path: []const u8) void {
     const cap = maxChainLen();
     while (remaining > 0 and isDataCluster(cluster)) {
         if (hops >= cap) {
-            serial.print("[FAT32] cluster chain too long / cycle detected (cat)\n", .{});
             return;
         }
         hops += 1;
@@ -436,7 +429,6 @@ pub fn readFile(path: []const u8, dst: []u8) ?usize {
     const cap = maxChainLen();
     while (remaining > 0 and isDataCluster(cluster)) {
         if (hops >= cap) { // corrupt chain: fail the read rather than spinning forever
-            serial.print("[FAT32] cluster chain too long / cycle detected (readFile)\n", .{});
             return null;
         }
         hops += 1;
@@ -479,7 +471,6 @@ pub const FileReader = struct {
                     self.sec = 0;
                     self.hops += 1; // count each chain link we follow
                     if (self.hops >= maxChainLen()) { // cyclic/corrupt FAT -> stop the stream
-                        serial.print("[FAT32] cluster chain too long / cycle detected (FileReader)\n", .{});
                         break;
                     }
                 }
@@ -610,7 +601,6 @@ fn freeChain(start: u32) void {
     const cap = maxChainLen();
     while (isDataCluster(c)) {
         if (hops >= cap) {
-            serial.print("[FAT32] cluster chain too long / cycle detected (freeChain)\n", .{});
             return;
         }
         hops += 1;
@@ -635,7 +625,6 @@ fn findDirLoc(parent_cluster: u32, name: []const u8) ?DirLoc {
     const cap = maxChainLen();
     while (isDataCluster(cluster)) {
         if (hops >= cap) {
-            serial.print("[FAT32] cluster chain too long / cycle detected (findDirLoc)\n", .{});
             return null;
         }
         hops += 1;
@@ -708,7 +697,6 @@ fn placeEntry(parent_cluster: u32, slot_index: usize, ent: *const [32]u8) bool {
     const cap = maxChainLen();
     while (sec_index >= bi.sectors_per_cluster) : (sec_index -= bi.sectors_per_cluster) {
         if (hops >= cap) {
-            serial.print("[FAT32] cluster chain too long / cycle detected (placeEntry)\n", .{});
             return false;
         }
         hops += 1;
@@ -737,7 +725,6 @@ fn reserveDirSlots(parent_cluster: u32, need: usize) ?usize {
     const cap = maxChainLen();
     while (isDataCluster(cluster)) {
         if (hops >= cap) {
-            serial.print("[FAT32] cluster chain too long / cycle detected (reserveDirSlots)\n", .{});
             return null;
         }
         hops += 1;
@@ -796,7 +783,6 @@ fn aliasExists(parent_cluster: u32, sfn: *const [11]u8) bool {
     const cap = maxChainLen();
     while (isDataCluster(cluster)) {
         if (hops >= cap) {
-            serial.print("[FAT32] cluster chain too long / cycle detected (aliasExists)\n", .{});
             return false;
         }
         hops += 1;
@@ -1011,14 +997,9 @@ pub fn writeFile(path: []const u8, data: []const u8) bool {
 // whole read path end to end. No-op (with a clear log line) if there's no disk
 // or it isn't FAT32, so disk-less boots are unaffected.
 pub fn selfTest() void {
-    serial.print("[FAT32] Filesystem self-test...\n", .{});
     if (!mount()) {
-        serial.print("[FAT32] self-test skipped (nothing to mount).\n", .{});
         return;
     }
-    serial.print("[FAT32]   root directory:\n", .{});
     ls("/");
-    serial.print("[FAT32]   contents of /HELLO.TXT:\n", .{});
     cat("/HELLO.TXT");
-    serial.print("[FAT32] self-test complete.\n", .{});
 }
