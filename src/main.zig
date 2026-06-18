@@ -193,6 +193,16 @@ fn hcf() noreturn {
     }
 }
 
+// Register the built-in PCI bus drivers with the registry, in the order their
+// boot markers should appear (which pci.probeAll() then preserves). Each driver
+// exposes a register() that hands the registry its own class/subclass + init, so
+// the "what device do I claim?" knowledge stays inside the driver. AC'97 first,
+// then AHCI — matching the order the old hard-wired init calls ran in.
+fn registerBuiltinDrivers() void {
+    ac97.register(); // multimedia/audio (class 0x04, subclass 0x01)
+    ahci.register(); // mass storage / SATA (class 0x01, subclass 0x06)
+}
+
 // The kernel's entry point. `export` gives it the symbol name `_start` that the
 // linker script names as ENTRY. It never returns.
 export fn _start() noreturn {
@@ -314,9 +324,13 @@ export fn _start() noreturn {
     // later drivers (audio, AHCI, NIC) use to find and configure their hardware.
     pci.init();
 
-    // AC'97 audio: find the codec (if any), bring it up, and play a short test
-    // tone over bus-master DMA. No-ops when the machine has no AC'97 device.
-    ac97.init();
+    // Register the PCI bus drivers, then probe them: probeAll() walks the registry
+    // in registration order and invokes each driver's init, which locates its own
+    // device (findByClass) and no-ops cleanly when that device is absent. This
+    // replaces the old hard-wired ac97.init()/ahci.init() calls — same drivers,
+    // same init bodies, same boot markers, just driven through the registry.
+    registerBuiltinDrivers();
+    pci.probeAll();
 
     // Bring up the ATA PIO disk (block device). Probes the primary master; on a
     // machine without a legacy IDE disk (e.g. q35, or a disk-less boot) it simply
@@ -324,11 +338,9 @@ export fn _start() noreturn {
     ata.init();
     ata.selfTest();
 
-    // Bring up the AHCI/SATA disk (DMA block device, read-only: IDENTIFY + sector
-    // read). Finds the SATA HBA on q35's ich9-ahci; on a machine without one
-    // (e.g. i440fx / -M pc, or a disk-less boot) it reports "no controller" and
-    // the kernel carries on.
-    ahci.init();
+    // Run the AHCI self-test (IDENTIFY + sector-0/scratch-sector DMA round-trips).
+    // The AHCI driver itself was brought up by pci.probeAll() above; this just
+    // exercises the read/write data path now that the disk (if any) is up.
     ahci.selfTest();
 
     // Read the battery-backed RTC and log the current wall-clock time. No hardware

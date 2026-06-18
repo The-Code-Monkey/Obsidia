@@ -329,6 +329,14 @@ pub fn play(rate: u32, ctx: *anyopaque, fill: FillFn) usize {
     return total;
 }
 
+// Register this driver with the PCI registry so pci.probeAll() will bring the
+// codec up. We claim the AC'97 audio class/subclass and hand over init() (whose
+// body is unchanged — it still findByClass()es its own device and no-ops when the
+// device is absent). Called once at boot from main.registerBuiltinDrivers().
+pub fn register() void {
+    pci.registerDriver(CLASS_MULTIMEDIA, SUBCLASS_AUDIO, &init);
+}
+
 pub fn init() void {
     const dev = pci.findByClass(CLASS_MULTIMEDIA, SUBCLASS_AUDIO) orelse {
         serial.print("[AC97] no AC'97 device found (skipping).\n", .{});
