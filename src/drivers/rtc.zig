@@ -199,7 +199,10 @@ pub fn bootTime() DateTime {
 pub fn init() void {
     const dt = now();
     boot_time = dt; // record the moment of boot for later (e.g. `uptime`)
-    serial.print("[RTC] RTC initialized: ", .{});
-    printDateTime(dt);
-    serial.print("\n", .{});
+    // Boot diagnostic (debug-log only). Formatted inline rather than via
+    // printDateTime() so the whole marker is gated as one unit — printDateTime()
+    // itself stays always-on because the `date`/`uptime` commands use it.
+    serial.log("[RTC] RTC initialized: {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC\n", .{
+        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second,
+    });
 }

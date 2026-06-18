@@ -63,7 +63,7 @@ fn selfTest() void {
     const aligned = (buf.phys % PAGE_SIZE) == 0; // frame-granular base
     const nonzero = buf.phys != 0; // never the reserved frame 0
     const below = buf.phys + buf.frames * PAGE_SIZE <= pmm.DMA_MAX_ADDR; // 32-bit safe
-    serial.print("[DMA]     phys=0x{x} frames={d} aligned={} nonzero={} below-4G={}\n", .{ buf.phys, buf.frames, aligned, nonzero, below });
+    serial.log("[DMA]     phys=0x{x} frames={d} aligned={} nonzero={} below-4G={}\n", .{ buf.phys, buf.frames, aligned, nonzero, below });
 
     // Contiguity: each frame's own HHDM address must equal virt + k*PAGE_SIZE.
     // If the run weren't contiguous these addresses wouldn't line up.
@@ -80,14 +80,14 @@ fn selfTest() void {
     buf.virt[buf.len - 1] = 0x3C; // marker at the end
     const view: [*]u8 = @ptrFromInt(pmm.physToVirt(buf.phys)); // independent alias
     const rw_ok = view[0] == 0xC3 and view[buf.len - 1] == 0x3C; // both survive
-    serial.print("[DMA]     contiguous={} hhdm-round-trip={}\n", .{ contiguous, rw_ok });
+    serial.log("[DMA]     contiguous={} hhdm-round-trip={}\n", .{ contiguous, rw_ok });
 
     free(buf); // return the whole run
     const restored = pmm.freeFrames() == free_before; // no frames leaked
-    serial.print("[DMA]     freed; free-count restored: {} ({d} -> {d})\n", .{ restored, free_before, pmm.freeFrames() });
+    serial.log("[DMA]     freed; free-count restored: {} ({d} -> {d})\n", .{ restored, free_before, pmm.freeFrames() });
 }
 
 pub fn init() void {
     selfTest(); // prove the guarantees before any driver relies on them
-    serial.print("[DMA] DMA buffer allocator initialized.\n", .{});
+    serial.log("[DMA] DMA buffer allocator initialized.\n", .{});
 }

@@ -217,7 +217,7 @@ fn selfTest() void {
     for (list.items) |v| got += v;
     const c3 = list.items.len == 1000 and got == sum; // length + contents correct
 
-    serial.print("[HEAP]     create/destroy={}, slice={}, ArrayList={}\n", .{ c1, c2, c3 });
+    serial.log("[HEAP]     create/destroy={}, slice={}, ArrayList={}\n", .{ c1, c2, c3 });
 }
 
 pub fn init() void {
@@ -231,5 +231,5 @@ pub fn init() void {
 
     selfTest(); // prove the allocator works with real std containers
 
-    serial.print("[HEAP] Kernel heap initialized.\n", .{});
+    serial.log("[HEAP] Kernel heap initialized.\n", .{});
 }

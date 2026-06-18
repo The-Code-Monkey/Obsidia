@@ -220,12 +220,12 @@ pub fn init(rsdp_phys: u64) void {
     // Asserted boot marker — the test harness greps "APIC @ 0x" to confirm the
     // MADT was parsed (matches the "LAPIC @ 0x" substring). This summary line is
     // test logging, so it survives the "strip non-test logging" cleanup.
-    serial.print("[ACPI]   {d} CPU(s), {d} IO APIC(s), {d} override(s), LAPIC @ 0x{x}\n", .{ cpu_count, ioapic_count, iso_count, lapic_addr });
+    serial.log("[ACPI]   {d} CPU(s), {d} IO APIC(s), {d} override(s), LAPIC @ 0x{x}\n", .{ cpu_count, ioapic_count, iso_count, lapic_addr });
     // Additive FADT summary: report the PM1 control ports and reset capability so
     // the power code's behaviour is visible in the boot log (purely informational;
     // safe to add — it does not replace any harness-asserted marker).
     if (fadt_found) {
-        serial.print("[ACPI]   FADT: PM1a_CNT 0x{x}, PM1b_CNT 0x{x}, reset {s}\n", .{ fadt.pm1a_cnt, fadt.pm1b_cnt, if (fadt.reset_supported) "supported" else "n/a" });
+        serial.log("[ACPI]   FADT: PM1a_CNT 0x{x}, PM1b_CNT 0x{x}, reset {s}\n", .{ fadt.pm1a_cnt, fadt.pm1b_cnt, if (fadt.reset_supported) "supported" else "n/a" });
     }
-    serial.print("[ACPI] ACPI parsed.\n", .{});
+    serial.log("[ACPI] ACPI parsed.\n", .{});
 }

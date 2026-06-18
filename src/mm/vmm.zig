@@ -361,7 +361,7 @@ fn verifyWX(pml4: [*]u64) void {
 
     // Ideal: .text executable & not writable; everything else non-executable.
     const ok = text_x and !text_w and !rodata_x and !data_x and !hhdm_x;
-    serial.print("[VMM]   W^X enforced: {s}\n", .{if (ok) "OK" else "FAIL"});
+    serial.log("[VMM]   W^X enforced: {s}\n", .{if (ok) "OK" else "FAIL"});
 }
 
 // --- Self-test: prove our live tables translate correctly --------------------
@@ -379,7 +379,7 @@ fn selfTest(pml4: [*]u64) void {
     // - this proves our new virtual mapping really points where we think.
     const alias: [*]volatile u64 = @ptrFromInt(pmm.physToVirt(frame)); // HHDM alias of the frame
     const alias_ok = alias[0] == 0xCAFEBABEDEADBEEF; // same bytes?
-    serial.print("[VMM]     HHDM alias of that frame agrees: {s}\n", .{if (alias_ok) "OK" else "MISMATCH"});
+    serial.log("[VMM]     HHDM alias of that frame agrees: {s}\n", .{if (alias_ok) "OK" else "MISMATCH"});
 
     unmapPage(pml4, scratch); // tear down the scratch mapping
     flushTlb(scratch);
@@ -428,7 +428,7 @@ pub fn selfTestAddressSpace() void {
     const alias_ok = alias.* == MAGIC;
 
     if (in_new and !in_kernel and readback == MAGIC and alias_ok) {
-        serial.print("[VMM] Address-space self-test OK.\n", .{});
+        serial.log("[VMM] Address-space self-test OK.\n", .{});
     }
 
     pmm.free(frame); // the data frame is ours to free
@@ -461,7 +461,7 @@ pub fn selfTestUncacheable() void {
     const pcd_set = leaf & PCD != 0; // the cache-disable bit we OR'd in
 
     if (round_trip and pcd_set) {
-        serial.print("[VMM] uncacheable-MMIO self-test: round-trip OK, PCD set\n", .{});
+        serial.log("[VMM] uncacheable-MMIO self-test: round-trip OK, PCD set\n", .{});
     }
 
     unmap(va); // tear down the UC mapping
@@ -517,5 +517,5 @@ pub fn init(phys_base: u64, virt_base: u64, hhdm_offset: u64) void {
     selfTest(pml4); // verify translation + W^X on the live tables
     asm volatile ("sti"); // re-enable interrupts
 
-    serial.print("[VMM] Virtual memory manager initialized.\n", .{});
+    serial.log("[VMM] Virtual memory manager initialized.\n", .{});
 }

@@ -199,7 +199,7 @@ pub fn highestAddress() u64 {
 // off Limine's boot stack, which lives in this memory.
 pub fn reclaimBootloader() void {
     if (!ready) return;
-    serial.print("[PMM] Reclaiming bootloader-reclaimable memory...\n", .{});
+    serial.log("[PMM] Reclaiming bootloader-reclaimable memory...\n", .{});
     for (reclaim_regions[0..reclaim_count]) |r| { // free each recorded region
         const start = r.base / PAGE_SIZE;
         const count = r.length / PAGE_SIZE;
@@ -234,7 +234,7 @@ fn selfTest() void {
     free(b);
     free(c);
     const restored = freeFrames() == free_before; // free count should be back to start
-    serial.print("[PMM]     freed; free-count restored: {} ({d} -> {d})\n", .{ restored, free_before, freeFrames() });
+    serial.log("[PMM]     freed; free-count restored: {} ({d} -> {d})\n", .{ restored, free_before, freeFrames() });
 }
 
 pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
@@ -305,5 +305,5 @@ pub fn init(memmap: *limine.MemoryMapResponse, hhdm_offset: u64) void {
 
     selfTest(); // prove alloc/free + HHDM access work
 
-    serial.print("[PMM] Physical memory manager initialized.\n", .{});
+    serial.log("[PMM] Physical memory manager initialized.\n", .{});
 }

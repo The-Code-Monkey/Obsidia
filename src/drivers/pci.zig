@@ -127,7 +127,7 @@ var driver_count: usize = 0;
 // so callers register in the sequence they want their boot markers to appear in.
 pub fn registerDriver(class: u8, subclass: u8, init_fn: *const fn () void) void {
     if (driver_count >= MAX_DRIVERS) {
-        serial.print("[PCI] driver registry full ({d}); ignoring registration\n", .{MAX_DRIVERS});
+        serial.log("[PCI] driver registry full ({d}); ignoring registration\n", .{MAX_DRIVERS});
         return; // never overflow the static table; an extra driver simply won't run
     }
     drivers[driver_count] = .{ .class = class, .subclass = subclass, .init_fn = init_fn };
@@ -139,7 +139,7 @@ pub fn registerDriver(class: u8, subclass: u8, init_fn: *const fn () void) void 
 // so this is safe on any machine: a driver whose hardware isn't present just logs
 // "skipping" and returns. Must run AFTER init() has populated the device list.
 pub fn probeAll() void {
-    serial.print("[PCI] probing {d} registered driver(s)\n", .{driver_count});
+    serial.log("[PCI] probing {d} registered driver(s)\n", .{driver_count});
     for (drivers[0..driver_count]) |d| {
         d.init_fn(); // bring this driver's device up (a no-op when it isn't present)
     }
@@ -248,17 +248,17 @@ fn decodeBars(d: *const Device) void {
             continue;
         }
         if (bar & 1 != 0) { // bit 0 set => I/O space BAR
-            serial.print("[PCI]     BAR{d}: I/O    port 0x{x:0>4} size 0x{x}\n", .{ i, bar & 0xFFFF_FFFC, barSize(d, off, 0xFFFF_FFFC) });
+            serial.log("[PCI]     BAR{d}: I/O    port 0x{x:0>4} size 0x{x}\n", .{ i, bar & 0xFFFF_FFFC, barSize(d, off, 0xFFFF_FFFC) });
             i += 1;
         } else { // memory BAR: bits 2:1 = width, bit 3 = prefetchable
             const is64 = (bar >> 1) & 3 == 0x2;
             const pf: []const u8 = if ((bar >> 3) & 1 != 0) " prefetchable" else "";
             if (is64) { // 64-bit BAR: high half is in the next slot
                 const base = (@as(u64, readDword(d.bus, d.slot, d.func, off + 4)) << 32) | (bar & 0xFFFF_FFF0);
-                serial.print("[PCI]     BAR{d}: MMIO64 0x{x:0>8} size 0x{x}{s}\n", .{ i, base, barSize64(d, off), pf });
+                serial.log("[PCI]     BAR{d}: MMIO64 0x{x:0>8} size 0x{x}{s}\n", .{ i, base, barSize64(d, off), pf });
                 i += 2; // a 64-bit BAR occupies two slots
             } else {
-                serial.print("[PCI]     BAR{d}: MMIO32 0x{x:0>8} size 0x{x}{s}\n", .{ i, bar & 0xFFFF_FFF0, barSize(d, off, 0xFFFF_FFF0), pf });
+                serial.log("[PCI]     BAR{d}: MMIO32 0x{x:0>8} size 0x{x}{s}\n", .{ i, bar & 0xFFFF_FFF0, barSize(d, off, 0xFFFF_FFF0), pf });
                 i += 1;
             }
         }
@@ -288,10 +288,10 @@ fn checkFunction(bus: u8, slot: u5, func: u3) void {
         devices[device_count] = dev;
         device_count += 1;
     } else {
-        serial.print("[PCI]   (registry full at {d}; not recording further devices)\n", .{MAX_DEVICES});
+        serial.log("[PCI]   (registry full at {d}; not recording further devices)\n", .{MAX_DEVICES});
     }
 
-    serial.print("[PCI]   {x:0>2}:{x:0>2}.{d}  {x:0>4}:{x:0>4}  class {x:0>2}.{x:0>2} prog-if {x:0>2}  {s}\n", .{ dev.bus, dev.slot, dev.func, dev.vendor, dev.device, dev.class, dev.subclass, dev.prog_if, className(dev.class) });
+    serial.log("[PCI]   {x:0>2}:{x:0>2}.{d}  {x:0>4}:{x:0>4}  class {x:0>2}.{x:0>2} prog-if {x:0>2}  {s}\n", .{ dev.bus, dev.slot, dev.func, dev.vendor, dev.device, dev.class, dev.subclass, dev.prog_if, className(dev.class) });
     decodeBars(&dev); // log this device's I/O / MMIO regions
 }
 
@@ -317,5 +317,5 @@ pub fn init() void {
         var slot: u8 = 0;
         while (slot < 32) : (slot += 1) checkSlot(@intCast(bus), @intCast(slot));
     }
-    serial.print("[PCI] Enumeration complete: {d} device(s).\n", .{device_count});
+    serial.log("[PCI] Enumeration complete: {d} device(s).\n", .{device_count});
 }

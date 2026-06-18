@@ -84,7 +84,7 @@ pub fn init() void {
     if (!waitForTick()) {
         // The timer isn't advancing, so we have no time base to calibrate against.
         // Skip cleanly (tsc_hz stays 0, now() returns 0) and still print a marker.
-        serial.print("[TSC] calibration skipped: timer not ticking\n", .{});
+        serial.log("[TSC] calibration skipped: timer not ticking\n", .{});
         return;
     }
 
@@ -115,14 +115,14 @@ pub fn init() void {
     // If the timer stalled mid-window or didn't advance at all, the measurement
     // window is untrustworthy — bail without arming the clock.
     if (stalled or ticks_elapsed == 0) {
-        serial.print("[TSC] calibration skipped: timer stalled mid-window\n", .{});
+        serial.log("[TSC] calibration skipped: timer stalled mid-window\n", .{});
         return;
     }
 
     // Cycles the TSC advanced over the window. RDTSC counts up, so end >= start on
     // a sane CPU; guard against a wrap/non-monotonic reading just in case.
     if (tsc_end <= tsc_start) {
-        serial.print("[TSC] calibration skipped: TSC did not advance\n", .{});
+        serial.log("[TSC] calibration skipped: TSC did not advance\n", .{});
         return;
     }
     const cycles = tsc_end - tsc_start;
@@ -138,7 +138,7 @@ pub fn init() void {
     // of GHz. Anything outside a generous [1 MHz, 1 THz] band means the calibration
     // is bogus (e.g. a frozen or absurd timer), so we skip rather than trust it.
     if (hz < 1_000_000 or hz > 1_000_000_000_000) {
-        serial.print("[TSC] calibration implausible ({d} Hz); skipping\n", .{hz});
+        serial.log("[TSC] calibration implausible ({d} Hz); skipping\n", .{hz});
         return;
     }
 
@@ -148,7 +148,7 @@ pub fn init() void {
     base_tsc = rdtsc();
 
     // Report in MHz (integer divide) — the marker our test harness greps for.
-    serial.print("[TSC] calibrated: {d} MHz\n", .{hz / 1_000_000});
+    serial.log("[TSC] calibrated: {d} MHz\n", .{hz / 1_000_000});
 }
 
 // Was the TSC successfully calibrated? When false, now()/nanos() return 0.
