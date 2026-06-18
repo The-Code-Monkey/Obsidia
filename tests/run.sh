@@ -377,6 +377,9 @@ printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattm
 # path (see tests/make-init0.sh).
 tests/make-init.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/INIT
 tests/make-init0.sh "$fattmp";                       mcopy -i "$FATDISK" "$fattmp" ::/INIT0
+# /SPIN (flat, ring-3) prints a marker then loops forever — used to test Ctrl-C ->
+# SIGINT: exec it, then interrupt it (see tests/make-spin.sh).
+tests/make-spin.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/SPIN
 # Seed the real ELF init too (if the toolchain can build it). The boot self-test
 # prefers /INIT.ELF when present, so it exercises the ELF path automatically; we
 # also drive `exec /INIT.ELF` (ELF) and `exec /INIT` (flat) in ring 3 from the
@@ -417,7 +420,19 @@ printf 'exec0 /INIT0\r' >&7
 # command (the boot self-test never runs the ring-0 path), so waiting for it
 # guarantees every earlier command was processed too (the shell is sequential).
 waitfor "init returned 0xb017b007" "$TMP/fat.log" "$fpid"; sleep 0.5
+# Ctrl-C / SIGINT: run a program that loops forever, confirm it started, send
+# Ctrl-C (0x03), then confirm the shell regained control by running a command that
+# only prints if the spinning program was actually terminated. (Without the fix the
+# shell never comes back and this would hang until the timeout.)
+printf 'exec /SPIN\r' >&7
+waitfor "SPIN: running" "$TMP/fat.log" "$fpid"; sleep 0.3
+printf '\003' >&7                       # Ctrl-C -> interrupt the foreground program
+printf 'echo sigint-recovered\r' >&7    # only runs if Ctrl-C broke the infinite loop
+waitfor "sigint-recovered" "$TMP/fat.log" "$fpid"; sleep 0.3
 exec 7>&-; kill $fpid 2>/dev/null; wait $fpid 2>/dev/null
+assert_in "$TMP/fat.log" "SPIN: running"                   "TTY: a foreground user program started (/SPIN)"
+assert_in "$TMP/fat.log" "[TTY] SIGINT"                    "TTY: Ctrl-C delivered SIGINT to the foreground program"
+assert_in "$TMP/fat.log" "sigint-recovered"               "TTY: shell regained control after Ctrl-C (program was terminated)"
 assert_in "$TMP/fat.log" "[FAT32] mounted:"                "FAT32: mounts the volume (reads the BPB)"
 assert_in "$TMP/fat.log" "HELLO.TXT"                       "FAT32: lists root directory (8.3 name)"
 assert_in "$TMP/fat.log" "a-long-filename.txt"             "FAT32: assembles long file names (LFN)"

@@ -18,6 +18,7 @@ const gdt = @import("../arch/gdt.zig"); // TSS.rsp0 (kernel stack for user traps
 const syscall = @import("../arch/syscall.zig"); // per-process syscall kernel stack
 const usermode = @import("../arch/usermode.zig"); // enterRing3 (first user dispatch)
 const pmm = @import("../mm/pmm.zig"); // frames for the demo's user pages
+const tty = @import("../tty.zig"); // terminal foreground + Ctrl-C interrupt flag
 
 const MAX_THREADS = 16; // also the number of guarded stack slots (kstack.MAX_STACKS)
 
@@ -274,10 +275,16 @@ pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) 
         .user_entry = user_entry,
         .user_stack = user_stack,
     };
+    last_user_idx = thread_count; // remember which slot this process got (for Ctrl-C kill)
     thread_count += 1;
     _ = @atomicRmw(usize, &alive, .Add, 1, .monotonic);
     return true;
 }
+
+// Index of the most recently spawnUser()'d thread. runUser uses it to terminate
+// the foreground process if a Ctrl-C arrives. Valid only between a successful
+// spawnUser and that process finishing.
+var last_user_idx: usize = 0;
 
 // First thing a user thread runs (ring 0, in its own address space): drop to
 // ring 3. It returns to ring 0 only via a syscall or interrupt, never to here.
@@ -347,10 +354,42 @@ pub fn runUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) u6
         serial.log("[SCHED]   could not spawn user process '{s}'.\n", .{name});
         return SPAWN_FAILED;
     }
-    while (!@atomicLoad(bool, &user_done, .acquire)) yield();
+    const uidx = last_user_idx; // the slot this process occupies (set by spawnUser)
+
+    // While this program runs it owns the terminal: a Ctrl-C should interrupt IT,
+    // not cancel the shell's line. The TTY records such a Ctrl-C as a pending
+    // interrupt, which we check on each turn of the wait loop. We run on a separate
+    // thread from the program (single core, cooperative yield), so when we observe
+    // the flag the program is parked and we can end it cleanly with no frame surgery.
+    tty.setForeground(.process);
+    while (!@atomicLoad(bool, &user_done, .acquire)) {
+        if (tty.takeIntr()) { // Ctrl-C: terminate the foreground program (SIGINT default action)
+            killForeground(uidx);
+            break;
+        }
+        yield();
+    }
+    tty.setForeground(.shell); // the shell is reading commands again
 
     syscall.exit_handler = prev;
     return user_exit_code;
+}
+
+// Forcibly end the foreground user process at slot `uidx` because it was
+// interrupted (Ctrl-C / SIGINT, whose default action is to terminate). This mirrors
+// captureUserExit's teardown, but is driven from the launcher instead of the
+// program's own exit() call: mark the slot finished (so yield() never resumes it),
+// drop the alive count spawnUser bumped, and report exit code 130 (the conventional
+// "killed by SIGINT" = 128 + signal 2). The launcher's caller (loader.execUser) then
+// frees the address space as it does after any run. Always-on `^C` so the user sees it.
+fn killForeground(uidx: usize) void {
+    asm volatile ("cli"); // touch shared scheduler state with interrupts off
+    threads[uidx].state = .finished;
+    _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic);
+    user_exit_code = 130; // 128 + SIGINT(2)
+    asm volatile ("sti");
+    serial.print("^C\n", .{}); // user-facing feedback
+    serial.log("[TTY] SIGINT -> terminated foreground process (code 130)\n", .{});
 }
 
 // Like runUser, but for callers that are NOT yet part of the scheduler (the boot

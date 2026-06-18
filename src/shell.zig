@@ -23,6 +23,7 @@ const editor = @import("editor.zig"); // the `edit` command (text editor)
 const ac97 = @import("drivers/ac97.zig"); // the `play` command (AC'97 audio)
 const rtc = @import("drivers/rtc.zig"); // the `date` command (RTC wall-clock)
 const wav = @import("fs/wav.zig"); // WAV (RIFF) parsing for `play`
+const tty = @import("tty.zig"); // terminal line discipline (routes Ctrl-C)
 
 // --- Input ring buffer (single producer = IRQ, single consumer = run loop) ---
 const RING_SIZE: usize = 256; // capacity (power of two)
@@ -92,10 +93,12 @@ fn systemSleep() void {
     _ = ringPop(); // discard the key that woke us
 }
 
-// IRQ4 handler: drain everything the UART has buffered into the ring.
+// IRQ4 handler: drain everything the UART has buffered. Bytes go through the TTY
+// line discipline (like keyboard input does), so a Ctrl-C arriving over serial is
+// interpreted as an interrupt rather than enqueued as data.
 fn onSerialIrq() void {
     while (serial.dataAvailable()) { // while bytes are waiting
-        feed(serial.readByteRaw()); // enqueue (also clears the IRQ)
+        tty.feed(serial.readByteRaw()); // TTY -> ring (also clears the IRQ)
     }
 }
 
@@ -343,9 +346,22 @@ fn handleChar(c: u8) void {
     console.scrollToBottom(); // any real keystroke returns to the live bottom
     switch (c) {
         '\r', '\n' => submitLine(), // Enter: run the line
+        0x03 => cancelLine(), // Ctrl-C at the prompt: throw away the current line
         0x08, 0x7f => backspace(), // Backspace / DEL
         else => if (c >= 0x20 and c < 0x7f) insertChar(c), // printable character
     }
+}
+
+// Ctrl-C at the shell prompt: abandon whatever is half-typed and start a fresh
+// prompt — the familiar terminal behaviour. (The TTY only forwards Ctrl-C to us
+// when no program is running; while a program runs it interrupts that instead.)
+fn cancelLine() void {
+    serial.print("^C\n", .{}); // show that the line was cancelled
+    line_len = 0; // discard the edited line
+    line_pos = 0;
+    browse = 0; // leave history-browsing
+    in_esc = 0; // and any half-parsed escape sequence
+    prompt(); // fresh prompt
 }
 
 // Bridge a fat32.FileReader to ac97's FillFn: hand the player the next chunk of
