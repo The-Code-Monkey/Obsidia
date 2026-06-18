@@ -34,6 +34,7 @@ const usermode = @import("arch/usermode.zig"); // ring 3 (user mode) entry
 const syscall = @import("arch/syscall.zig"); // syscall/sysret ABI (STAR/LSTAR/SFMASK)
 const install = @import("install.zig"); // in-guest installer (clones the system image)
 const shell = @import("shell.zig"); // interactive serial command shell
+const tty = @import("tty.zig"); // terminal line discipline (Ctrl-C interrupt)
 
 // Limine scans the kernel for "requests": structs (tagged by magic IDs) that ask
 // the bootloader for information. They must live in the .limine_requests section.
@@ -405,7 +406,11 @@ fn runAfterReclaim() callconv(.C) noreturn {
     install.setImage(systemModule()); // Option A: system image to clone if `install` is run
     install.setPayload(kernelModule(), bootx64Module(), installedConfModule()); // Option B: build a disk
     keyboard.init(); // enable the PS/2 keyboard (IRQ1)
-    keyboard.setSink(&shell.feed); // route keystrokes into the shell
+    // Route keystrokes through the TTY line discipline, which forwards ordinary
+    // bytes to the shell's input ring but turns Ctrl-C into an interrupt. (Serial
+    // input is routed through the TTY too, inside shell.onSerialIrq.)
+    tty.setSink(&shell.feed); // ordinary bytes flow on to the shell
+    keyboard.setSink(&tty.feed); // keyboard -> TTY -> shell
     mouse.init(); // enable the PS/2 mouse (IRQ12); the wheel drives scrollback
 
     // Make the shell a real scheduled thread. From here the kernel multitasks:

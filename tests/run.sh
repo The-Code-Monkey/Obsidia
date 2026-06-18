@@ -82,9 +82,14 @@ echo "== Assembling ISO =="
 build_iso || { echo "ISO assembly failed (need xorriso + limine/)"; exit 1; }
 
 # --- Boot helpers ------------------------------------------------------------
-# How long to let the kernel boot before feeding shell input (TCG in CI is
-# slower than KVM, so allow a margin).
-BOOT_WAIT="${BOOT_WAIT:-3}"
+# How long to let the kernel boot before feeding shell input. The sessions below
+# that send timed input do so this many seconds after QEMU starts; if the kernel
+# isn't at the shell prompt yet, that input is lost and the session fails. CI
+# runners under load run TCG several times slower than a quiet machine (builds
+# have been seen taking 2x+ longer), so this margin is generous on purpose — a
+# few wasted seconds per session is a fair price for not flaking. Override with
+# BOOT_WAIT=<n> on a fast box to speed the suite up.
+BOOT_WAIT="${BOOT_WAIT:-20}"
 
 # Capture a plain boot (no input) to a log file.
 boot_capture() { # boot_capture <log> <mem> [extra qemu args...]
@@ -95,7 +100,7 @@ boot_capture() { # boot_capture <log> <mem> [extra qemu args...]
 # Boot and feed the shell some input over serial, capturing output.
 boot_shell() { # boot_shell <log> <mem> <input> [extra qemu args...]
     local log="$1" mem="$2" input="$3"; shift 3
-    ( sleep "$BOOT_WAIT"; printf '%b' "$input"; sleep 2 ) | timeout 15 $QEMU \
+    ( sleep "$BOOT_WAIT"; printf '%b' "$input"; sleep 2 ) | timeout 45 $QEMU \
         -M q35 -m "$mem" "$@" -cdrom "$ISO" \
         -chardev stdio,id=c0,logfile="$log",signal=off -serial chardev:c0 \
         -display none -no-reboot >/dev/null 2>&1 || true
@@ -377,6 +382,9 @@ printf 'long names work too\n'          > "$fattmp"; mcopy -i "$FATDISK" "$fattm
 # path (see tests/make-init0.sh).
 tests/make-init.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/INIT
 tests/make-init0.sh "$fattmp";                       mcopy -i "$FATDISK" "$fattmp" ::/INIT0
+# /SPIN (flat, ring-3) prints a marker then loops forever — used to test Ctrl-C ->
+# SIGINT: exec it, then interrupt it (see tests/make-spin.sh).
+tests/make-spin.sh "$fattmp";                        mcopy -i "$FATDISK" "$fattmp" ::/SPIN
 # Seed the real ELF init too (if the toolchain can build it). The boot self-test
 # prefers /INIT.ELF when present, so it exercises the ELF path automatically; we
 # also drive `exec /INIT.ELF` (ELF) and `exec /INIT` (flat) in ring 3 from the
@@ -417,7 +425,19 @@ printf 'exec0 /INIT0\r' >&7
 # command (the boot self-test never runs the ring-0 path), so waiting for it
 # guarantees every earlier command was processed too (the shell is sequential).
 waitfor "init returned 0xb017b007" "$TMP/fat.log" "$fpid"; sleep 0.5
+# Ctrl-C / SIGINT: run a program that loops forever, confirm it started, send
+# Ctrl-C (0x03), then confirm the shell regained control by running a command that
+# only prints if the spinning program was actually terminated. (Without the fix the
+# shell never comes back and this would hang until the timeout.)
+printf 'exec /SPIN\r' >&7
+waitfor "SPIN: running" "$TMP/fat.log" "$fpid"; sleep 0.3
+printf '\003' >&7                       # Ctrl-C -> interrupt the foreground program
+printf 'echo sigint-recovered\r' >&7    # only runs if Ctrl-C broke the infinite loop
+waitfor "sigint-recovered" "$TMP/fat.log" "$fpid"; sleep 0.3
 exec 7>&-; kill $fpid 2>/dev/null; wait $fpid 2>/dev/null
+assert_in "$TMP/fat.log" "SPIN: running"                   "TTY: a foreground user program started (/SPIN)"
+assert_in "$TMP/fat.log" "[TTY] SIGINT"                    "TTY: Ctrl-C delivered SIGINT to the foreground program"
+assert_in "$TMP/fat.log" "sigint-recovered"               "TTY: shell regained control after Ctrl-C (program was terminated)"
 assert_in "$TMP/fat.log" "[FAT32] mounted:"                "FAT32: mounts the volume (reads the BPB)"
 assert_in "$TMP/fat.log" "HELLO.TXT"                       "FAT32: lists root directory (8.3 name)"
 assert_in "$TMP/fat.log" "a-long-filename.txt"             "FAT32: assembles long file names (LFN)"
@@ -580,7 +600,7 @@ mmd -i "$WRDISK" ::/docs 2>/dev/null
   printf 'edit note.txt\r'; sleep 0.8; printf 'harness editor write\r'; sleep 0.4; \
   printf '\x13'; sleep 0.8; printf '\x18'; sleep 0.5; \
   printf 'cat note.txt\r'; sleep 0.8 ) \
-    | timeout 20 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
+    | timeout 45 $QEMU -M pc -m 512M -boot d -cdrom "$ISO" \
       -drive file="$WRDISK",format=raw,if=ide \
       -chardev stdio,id=c0,logfile="$TMP/wr.log",signal=off -serial chardev:c0 \
       -display none -no-reboot >/dev/null 2>&1 || true
@@ -690,13 +710,13 @@ assert_in "$TMP/sleep.log" "awake."       "sleep: a keypress wakes it"
 echo "== Power commands =="
 
 # shutdown: QEMU should power off (qemu exits cleanly, not killed by timeout=124).
-( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 15 $QEMU \
+( sleep "$BOOT_WAIT"; printf 'shutdown\r'; sleep 4 ) | timeout 45 $QEMU \
     -M q35 -m 512M -cdrom "$ISO" -chardev stdio,id=c0,signal=off -serial chardev:c0 \
     -display none -no-reboot >/dev/null 2>&1
 if [ "$?" -ne 124 ]; then ok "shutdown: machine powered off"; else bad "shutdown: qemu did not exit"; fi
 
 # restart: WITHOUT -no-reboot, the reset reboots and the kernel runs a 2nd time.
-( sleep "$BOOT_WAIT"; printf 'restart\r'; sleep 4 ) | timeout 15 $QEMU \
+( sleep "$BOOT_WAIT"; printf 'restart\r'; sleep 4 ) | timeout 45 $QEMU \
     -M q35 -m 512M -cdrom "$ISO" -chardev stdio,id=c0,logfile="$TMP/restart.log",signal=off \
     -serial chardev:c0 -display none >/dev/null 2>&1 || true
 boots=$(grep -ac "Kernel entered _start" "$TMP/restart.log")
