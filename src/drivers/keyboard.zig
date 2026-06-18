@@ -54,6 +54,7 @@ const map_shift = blk: {
 
 // Modifier / state tracking.
 var shift = false; // either Shift key currently held
+var ctrl = false; // either Ctrl key currently held
 var caps = false; // Caps Lock toggle
 var extended = false; // saw a 0xE0 prefix (next byte is an extended key)
 
@@ -108,8 +109,12 @@ fn handle(sc: u8) void {
     const released = (sc & 0x80) != 0; // high bit set = key release
     const code = sc & 0x7F; // strip the release bit to get the make code
 
-    if (extended) { // arrows / Home / End / Delete
+    if (extended) { // arrows / Home / End / Delete / right Ctrl
         extended = false;
+        if (code == 0x1D) { // right Ctrl (0xE0 0x1D): a modifier, not a character
+            ctrl = !released; // held while pressed
+            return;
+        }
         if (!released) emitExtended(code); // emit on press only
         return;
     }
@@ -117,6 +122,10 @@ fn handle(sc: u8) void {
     switch (code) {
         0x2A, 0x36 => { // left / right Shift
             shift = !released; // held while pressed
+            return;
+        },
+        0x1D => { // left Ctrl
+            ctrl = !released; // held while pressed
             return;
         },
         0x3A => { // Caps Lock
@@ -127,6 +136,19 @@ fn handle(sc: u8) void {
     }
 
     if (released) return; // we only emit characters on key press
+
+    // Ctrl+letter -> a control byte (Ctrl-A=0x01 .. Ctrl-Z=0x1A) — the same byte a
+    // serial terminal sends, so the shell and the editor handle keyboard and serial
+    // input identically. This is how the editor receives Ctrl-S (save, 0x13) and
+    // Ctrl-X (exit, 0x18). We key off the UNSHIFTED letter so Shift/Caps don't
+    // matter; Ctrl combined with a non-letter is ignored.
+    if (ctrl) {
+        const base = map[code]; // unshifted character for this key
+        if (base >= 'a' and base <= 'z') {
+            if (sink) |s| s(base & 0x1F); // mask to the control code
+        }
+        return;
+    }
 
     const c = translate(code); // map to ASCII
     if (c != 0) {
@@ -223,6 +245,37 @@ test "extended arrow keys emit escape sequences" {
     handle(0xE0); // extended prefix
     handle(0x48); // Up arrow (press)
     try t.expectEqualStrings("\x1b[A", Capture.buf[0..Capture.len]);
+}
+
+test "Ctrl+letter emits the control code (Ctrl-X, Ctrl-S)" {
+    const t = @import("std").testing;
+    const Capture = struct {
+        var buf: [8]u8 = undefined;
+        var len: usize = 0;
+        fn reset() void {
+            len = 0;
+        }
+        fn sinkFn(c: u8) void {
+            buf[len] = c;
+            len += 1;
+        }
+    };
+    setSink(&Capture.sinkFn);
+    shift = false;
+    caps = false;
+    ctrl = false;
+    Capture.reset();
+    handle(0x1D); // Left Ctrl press -> sets the modifier, emits nothing
+    try t.expectEqual(@as(usize, 0), Capture.len);
+    handle(0x2D); // 'x' make code, Ctrl held -> 0x18 (Ctrl-X, the editor's "exit")
+    handle(0x1F); // 's' make code, Ctrl held -> 0x13 (Ctrl-S, the editor's "save")
+    try t.expectEqual(@as(usize, 2), Capture.len);
+    try t.expectEqual(@as(u8, 0x18), Capture.buf[0]);
+    try t.expectEqual(@as(u8, 0x13), Capture.buf[1]);
+    handle(0x9D); // Left Ctrl release -> clears the modifier
+    Capture.reset();
+    handle(0x2D); // 'x' now produces a plain 'x' again
+    try t.expectEqual(@as(u8, 'x'), Capture.buf[0]);
 }
 
 test "Page Up / Page Down emit scrollback escape sequences" {
