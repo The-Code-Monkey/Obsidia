@@ -400,6 +400,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
         vmm.selfTestAddressSpace(); // demo a per-process address space (create/switch/destroy)
         vmm.selfTestUncacheable(); // demo an uncacheable (PCD/UC) MMIO-style mapping
         scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
+        syscall.selfTest(); // file syscalls: open/read/lseek/dup/close a FAT32 file via the fd table
     }
 
     // Load and run the init binary off the disk (if present) as a RING-3 PROCESS
