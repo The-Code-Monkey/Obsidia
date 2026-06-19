@@ -459,6 +459,41 @@ pub const FileReader = struct {
     buf_len: usize = 0, // valid bytes in `buf`
     buf_pos: usize = 0, // bytes of `buf` already returned
     hops: u32 = 0, // clusters followed so far; cap stops a cyclic FAT mid-stream
+    // `lseek` needs to name an absolute byte offset, but the streaming cursor
+    // above is forward-only and spread across cluster/sector/cache fields. We
+    // keep two extra numbers that don't change how read() works: `first` is the
+    // file's starting cluster (so a backward SEEK_SET can re-open from byte 0),
+    // and `total` is the file size. `offset()` then derives the current absolute
+    // position as `total - bytesLeft()`, and `seekTo()` moves to any offset.
+    first: u32 = 0, // the file's first cluster (kept so lseek can rewind to start)
+    total: u32 = 0, // the file's total size in bytes (set by open())
+
+    // The cursor's current absolute byte offset: total size minus everything
+    // still readable ahead of us. Used by lseek to report/compute positions.
+    pub fn offset(self: *const FileReader) u32 {
+        return self.total - self.bytesLeft();
+    }
+
+    // Move the cursor to absolute byte offset `pos` (clamped to the file size).
+    // Forward seeks reuse the streaming skip(); backward seeks reset the cursor
+    // to the file's first cluster (byte 0) and skip forward to `pos`, since the
+    // underlying chain walk is forward-only. This is what SEEK_SET/CUR/END map to.
+    pub fn seekTo(self: *FileReader, pos: u32) void {
+        const target = @min(pos, self.total); // can't seek past end of file
+        const here = self.offset();
+        if (target == here) return; // already where we want to be
+        if (target < here) { // rewind: re-open from the first cluster, then skip up
+            self.cluster = self.first;
+            self.sec = 0;
+            self.remaining = self.total;
+            self.buf_len = 0;
+            self.buf_pos = 0;
+            self.hops = 0;
+            self.skip(target); // walk forward from byte 0 to the requested offset
+        } else {
+            self.skip(target - here); // forward seek: just skip the delta
+        }
+    }
 
     // Copy up to dst.len bytes into dst, refilling the sector cache as needed.
     // Returns the number of bytes copied; 0 means end of file (or a read error).
@@ -517,7 +552,9 @@ pub fn open(path: []const u8) ?FileReader {
     if (!mounted) return null;
     const node = resolve(path) orelse return null;
     if (node.is_dir) return null;
-    return .{ .cluster = node.cluster, .remaining = node.size };
+    // `first`/`total` are recorded so lseek can report the absolute offset and
+    // rewind to byte 0 (they don't affect plain forward streaming reads).
+    return .{ .cluster = node.cluster, .remaining = node.size, .first = node.cluster, .total = node.size };
 }
 
 // === Write path ==============================================================

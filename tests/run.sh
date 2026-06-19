@@ -463,6 +463,14 @@ assert_in "$TMP/fat.log" "[VFS] self-test OK: opened + read /HELLO.TXT through t
 # (and the kernel must still reach BOOT_OK, which the marker checks above prove).
 assert_in "$TMP/bios.log" "[VFS] self-test skipped (no filesystem mounted)."    "VFS: disk-less boot skips the self-test gracefully"
 
+# --- Per-process file-descriptor table + file syscalls -----------------------
+# The boot self-test (debug-log-gated) opens /HELLO.TXT through the REAL syscall
+# dispatcher and the real user-pointer validation, then read()s, lseek()s (forward
+# + backward), dup()s, and close()s it via the new per-process fd table. It runs on
+# the FAT32-disk boot (where the file exists), so we assert its single success
+# marker here. A FAILED line (instead of OK) means a descriptor/seek/dup bug.
+assert_in "$TMP/fat.log" "[FD] file-syscall self-test OK"  "fd table: open/read/lseek/dup/close a FAT32 file via the syscall ABI"
+
 # --- AC'97 play (raw PCM + WAV) (FAT32 + AC97, -M pc) ------------------------
 # Stream audio from the FAT32 disk to the codec. Boot -M pc with both the IDE disk
 # and an AC'97 device, then drive `play` for three files exercising every path:
