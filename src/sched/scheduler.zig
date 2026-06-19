@@ -454,6 +454,37 @@ fn killForeground(uidx: usize) void {
     serial.log("[TTY] SIGINT -> terminated foreground process (code 130)\n", .{});
 }
 
+// --- Fault -> signal: terminate the *current* user process on a CPU fault ------
+// Called from the IDT handler when a ring-3 (CPL3) process triggers a fatal CPU
+// fault (e.g. a page fault on an unmapped address, or an illegal opcode). The
+// default action of the corresponding signal (SIGSEGV / SIGILL / SIGFPE) is to
+// kill the process, so we do exactly that here — the kernel must NOT halt just
+// because a *user* program misbehaved (only a *kernel* fault is fatal to the box).
+//
+// This is the fault analogue of captureUserExit(): the faulting thread IS the
+// current thread (the fault was taken on its kernel trap stack), so we mark that
+// thread finished, drop the alive count spawnUser() bumped, record the conventional
+// exit code (128 + signal number) so runUser() returns it, publish `user_done` so
+// the launcher's wait loop wakes, and yield() away for good. A finished thread is
+// never scheduled again, so this never returns — the next switch lands in the
+// launcher (the shell), which tears the process down and prints the next prompt.
+// Crucially we do NOT dump-and-halt: control returns to the shell instead.
+pub fn terminateUserProcess(exit_code: u64) noreturn {
+    asm volatile ("cli"); // touch shared scheduler state with interrupts off
+    // A ring-3 fault is always taken on a spawnUser()'d process thread, never on
+    // thread 0 (the idle/boot context, which never runs at CPL3). If `current` were
+    // 0 here something is deeply wrong (we'd mark the idle thread finished and
+    // underflow `alive`), so refuse rather than corrupt the scheduler — a readable
+    // panic beats silent damage. This never fires on any reachable path.
+    if (current == 0) @panic("terminateUserProcess: CPL3 fault on thread 0 (not a user process)");
+    user_exit_code = exit_code; // the code runUser() will hand back to the loader
+    @atomicStore(bool, &user_done, true, .release); // publish before we switch away
+    threads[current].state = .finished; // never reschedule the faulted process
+    _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic); // it no longer counts as alive
+    yield(); // hand the CPU back to the launcher (the shell); we never come back
+    unreachable; // a finished thread is never scheduled again
+}
+
 // Like runUser, but for callers that are NOT yet part of the scheduler (the boot
 // init-run, which happens before scheduler.init()). It adopts the current context
 // as a throwaway "main" thread first, so yield() has somewhere to return to. The
@@ -736,6 +767,66 @@ pub fn userProcessDemo() void {
     vmm.unmapInto(as, U_STACK_TOP - 0x1000);
     pmm.free(code_frame);
     pmm.free(data_frame);
+    pmm.free(stack_frame);
+    vmm.destroyAddressSpace(as);
+}
+
+// --- Fault -> signal self-test -----------------------------------------------
+// Spawn a real ring-3 process whose very first instruction dereferences an
+// UNMAPPED user address. That triggers a page fault (#PF) from CPL3, which the
+// IDT handler turns into "SIGSEGV, terminate the process" via terminateUserProcess
+// — NOT a dump-and-halt. We then check that runUser() returned the conventional
+// SIGSEGV exit code (139) AND that control came back here (proving the kernel did
+// NOT halt). This exercises the whole fault->terminate->return-to-launcher path
+// over the exact runUser() route the shell's `exec` uses.
+const FAULT_ADDR: u64 = 0x0000000000300000; // a low (user-half) address we never map -> #PF on touch
+
+pub fn userFaultDemo() void {
+    // (No setupMain() here: runUserStandalone() below adopts the boot context as
+    // thread 0 itself — the same disposable-main pattern the loader's boot path
+    // uses. The user process runs as thread 1, faults, and we resume back here.)
+    const as = vmm.createAddressSpace() orelse {
+        serial.log("[SCHED]   FAILED: no memory for a fault-test address space\n", .{});
+        return;
+    };
+    const code_frame = pmm.allocZeroed() orelse return;
+    const stack_frame = pmm.allocZeroed() orelse return;
+
+    const U_CODE: u64 = 0x400000; // ring-3 code page
+    const U_STACK_TOP: u64 = 0x403000; // top of a one-page user stack at 0x402000
+
+    // Hand-assemble a ring-3 stub that immediately faults by reading an unmapped
+    // address: mov rax, FAULT_ADDR ; mov rax, [rax] (deref -> #PF, no page there).
+    //   48 B8 <FAULT_ADDR>   mov rax, FAULT_ADDR
+    //   48 8B 00             mov rax, [rax]      ; dereference -> page fault at CPL3
+    //   EB FE                jmp $               ; safety (never reached)
+    const code: [*]u8 = @ptrFromInt(pmm.physToVirt(code_frame));
+    code[0] = 0x48; code[1] = 0xB8; wr64(code + 2, FAULT_ADDR); // mov rax, FAULT_ADDR
+    code[10] = 0x48; code[11] = 0x8B; code[12] = 0x00; // mov rax, [rax]
+    code[13] = 0xEB; code[14] = 0xFE; // jmp $
+
+    // Map ONLY the code (RX, user) and the stack (RW, user). FAULT_ADDR is left
+    // deliberately unmapped, so the deref is the fault we want to deliver.
+    vmm.mapInto(as, U_CODE, code_frame, vmm.FLAG_USER);
+    vmm.mapInto(as, U_STACK_TOP - 0x1000, stack_frame, vmm.FLAG_USER | vmm.FLAG_WRITE | vmm.FLAG_NX);
+
+    // Run it via the same path the shell's `exec` uses. The process faults on its
+    // first deref; the IDT handler delivers SIGSEGV (code 139) through
+    // terminateUserProcess, which ends the process and yields back into this loop.
+    const code_ret = runUserStandalone("ufault", U_CODE, U_STACK_TOP, as);
+
+    if (code_ret == 139) {
+        // We're back here (the kernel did NOT halt) AND the process was terminated
+        // with the SIGSEGV exit code — the fault->signal path works end to end.
+        serial.log("[SCHED] Fault->signal self-test OK: ring-3 page fault terminated the process (code {d}); returned to the kernel.\n", .{code_ret});
+    } else {
+        serial.log("[SCHED] Fault->signal self-test FAILED (exit code {d}, expected 139).\n", .{code_ret});
+    }
+
+    // Tear down: the faulting process never freed its pages, so we do it here.
+    vmm.unmapInto(as, U_CODE);
+    vmm.unmapInto(as, U_STACK_TOP - 0x1000);
+    pmm.free(code_frame);
     pmm.free(stack_frame);
     vmm.destroyAddressSpace(as);
 }
