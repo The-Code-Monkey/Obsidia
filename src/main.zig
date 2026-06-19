@@ -29,6 +29,7 @@ const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const vfs = @import("fs/vfs.zig"); // virtual filesystem layer (mount/vnode over FAT32)
 const tmpfs = @import("fs/tmpfs.zig"); // in-memory writable filesystem mounted at /tmp
 const devfs = @import("fs/devfs.zig"); // device filesystem: /dev/null, /dev/zero, /dev/console (2nd VFS backend)
+const pipefs = @import("fs/pipefs.zig"); // anonymous pipes: SYS_pipe's shared in-kernel ring (self-test)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
@@ -429,6 +430,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
         syscall.selfTest(); // file syscalls: open/read/lseek/dup/close a FAT32 file via the fd table
         scheduler.userFaultDemo(); // demo fault->signal: a ring-3 page fault terminates the process (SIGSEGV), kernel returns
         scheduler.waitReapDemo(); // demo wait/waitpid: a parent waits on a child, collects its exit code, and reaps the zombie slot
+        pipefs.selfTest(); // demo pipes: a producer kernel thread writes bytes a reader drains through a shared in-kernel ring (blocking + EOF + reclaim)
     }
 
     // Load and run the init binary off the disk (if present) as a RING-3 PROCESS

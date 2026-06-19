@@ -532,6 +532,16 @@ assert_in "$TMP/fat.log" "[FD] write path OK: tmpfs round-trip + devfs sink + FA
 # relative-path-resolution + chdir/getcwd path works end to end.
 assert_in "$TMP/fat.log" "[FD] cwd OK: chdir + relative open + getcwd via the syscall ABI" "fd table: chdir + relative open + getcwd via the syscall ABI (per-process cwd)"
 
+# --- Pipes (anonymous in-kernel ring shared by two fd ends) ------------------
+# The debug-log-gated pipe self-test spawns a PRODUCER kernel thread that writes
+# N bytes (more than the ring holds, so the writer must BLOCK and be woken) into a
+# pipe's write end, while the main thread READS them all from the read end (BLOCKing
+# on the empty pipe until the producer feeds it). After the producer closes its end,
+# the reader's next read sees end-of-file. Then both ends close and a fresh pipe
+# reuses the freed slot — proving the refcount reclaim. The success marker proves the
+# whole producer/consumer + blocking + EOF + reclaim path end to end.
+assert_in "$TMP/fat.log" "[PIPE] self-test OK: wrote + read" "pipes: producer/consumer through a shared in-kernel ring (blocking wakeups + EOF + slot reclaim)"
+
 # --- AC'97 play (raw PCM + WAV) (FAT32 + AC97, -M pc) ------------------------
 # Stream audio from the FAT32 disk to the codec. Boot -M pc with both the IDE disk
 # and an AC'97 device, then drive `play` for three files exercising every path:

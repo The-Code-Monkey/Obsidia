@@ -141,6 +141,14 @@ fn setupMain() void {
     alive = 0;
 }
 
+// Public hook so a debug-gated self-test in ANOTHER module (pipefs) can adopt the
+// boot context as thread 0 before it spawns a worker — exactly what every in-file
+// demo above does with the private setupMain(). Same disposable-main pattern: the
+// real scheduler.init() later calls setupMain() again, discarding this state.
+pub fn setupMainForTest() void {
+    setupMain();
+}
+
 // Find a thread-table slot for a new thread. Prefer reusing a slot that a finished
 // thread left behind (state .finished, already reaped — its exit code collected and
 // the slot relinquished), since that frees no kernel stack but lets the table not
