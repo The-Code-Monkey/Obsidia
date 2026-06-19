@@ -17,7 +17,8 @@ const gdt = @import("gdt.zig");
 const cpu = @import("cpu.zig");
 const scheduler = @import("../sched/scheduler.zig"); // SYS_yield hands off the CPU + per-process fd table
 const vmm = @import("../mm/vmm.zig"); // validate user pointers against the page tables
-const fat32 = @import("../fs/fat32.zig"); // resolve/open files behind the file syscalls
+const fat32 = @import("../fs/fat32.zig"); // self-test: gate on the FAT32 disk being mounted
+const vfs = @import("../fs/vfs.zig"); // file syscalls route through the VFS (any backend)
 
 // A dedicated ring-0 stack the entry stub switches to (`syscall` doesn't load one
 // for us). A single static stack is safe for now because the handler runs with
@@ -56,6 +57,7 @@ const EINVAL: u64 = @bitCast(@as(i64, -22)); // invalid argument (e.g. bad whenc
 const EMFILE: u64 = @bitCast(@as(i64, -24)); // too many open files (fd table full)
 const ENOENT: u64 = @bitCast(@as(i64, -2)); // no such file or directory
 const ECHILD: u64 = @bitCast(@as(i64, -10)); // wait() with no child to wait for
+const ESPIPE: u64 = @bitCast(@as(i64, -29)); // lseek on an unseekable fd (e.g. /dev/zero)
 
 // lseek `whence` values (POSIX): the offset is interpreted relative to the start
 // of the file, the current cursor, or the end of the file respectively.
@@ -180,12 +182,15 @@ fn sysOpen(path: u64, len: u64) u64 {
     }
     const name = kbuf[0..len];
 
-    // resolve() distinguishes "missing" (ENOENT) from "is a directory" (EINVAL);
-    // open() returns null for either, so we resolve first to give a precise errno.
-    const node = fat32.resolve(name) orelse return ENOENT;
-    if (node.is_dir) return EINVAL; // can't open a directory as a readable file
-    const reader = fat32.open(name) orelse return ENOENT; // (re-checks mount/path)
-    return scheduler.allocFd(.{ .reader = reader }) orelse EMFILE; // table full -> EMFILE
+    // Route through the VFS, so `name` can live on ANY mounted backend — the FAT32
+    // disk at "/", tmpfs at "/tmp", or devfs at "/dev" — not just the FAT32 disk.
+    // stat() distinguishes "missing" (ENOENT) from "is a directory" (EINVAL); open()
+    // returns false for either, so we stat first to give a precise errno.
+    const node = vfs.stat(name) orelse return ENOENT;
+    if (node.kind == .dir) return EINVAL; // can't open a directory as a readable file
+    var handle: vfs.OpenFile = undefined;
+    if (!vfs.open(name, &handle)) return ENOENT; // (re-checks mount/path)
+    return scheduler.allocFd(.{ .file = handle }) orelse EMFILE; // table full -> EMFILE
 }
 
 // close(fd): drop the descriptor, freeing its slot for a future open/dup. Reading
@@ -194,7 +199,7 @@ fn sysClose(fd: u64) u64 {
     if (fd >= scheduler.FD_MAX) return EBADF; // out of table range
     const table = scheduler.currentFdTable();
     if (table[fd] == null) return EBADF; // wasn't open
-    table[fd] = null; // free the slot (the FileReader holds no resources to release)
+    table[fd] = null; // free the slot (the VFS handle holds no resources to release)
     return 0;
 }
 
@@ -208,45 +213,36 @@ fn sysRead(fd: u64, ptr: u64, len: u64) u64 {
     const n = @min(len, 4096); // bound a single read like sysWrite bounds a write
     if (ptr >= USER_LIMIT or n > USER_LIMIT - ptr) return EFAULT; // escapes user space
     if (!vmm.userRangeAccessible(vmm.activeSpace(), ptr, n)) return EFAULT; // unmapped / kernel-only
-    // Drive the FAT32 streaming reader straight into the validated user buffer
-    // (under STAC/CLAC). FileReader.read() may itself do disk I/O while AC is set;
-    // that's fine — it only writes to `dst`, which is the user page we just OK'd.
+    // Drive the VFS reader straight into the validated user buffer (under STAC/CLAC).
+    // The backend's read may itself do disk I/O while AC is set; that's fine — it only
+    // writes to `dst`, which is the user page we just OK'd. vfs read also advances the
+    // handle's absolute offset, keeping lseek's SEEK_CUR correct.
     asm volatile ("stac");
     defer asm volatile ("clac");
     const dst = @as([*]u8, @ptrFromInt(ptr))[0..n];
-    return file.reader.read(dst); // bytes copied (0 = EOF)
+    return file.file.read(dst); // bytes copied (0 = EOF)
 }
 
 // lseek(fd, off, whence): move the open file's read cursor and return the new
 // absolute offset. SEEK_SET sets it to `off`, SEEK_CUR adds `off` to the current
 // position, SEEK_END sets it to (size + off). `off` is a SIGNED byte count (passed
 // as a u64 bit pattern), so a negative SEEK_CUR/SEEK_END rewinds. Out-of-range
-// results clamp to [0, size] (the FileReader can't address past EOF). Returns the
-// new offset, or a negative errno (EBADF / EINVAL for a bad whence).
+// results clamp to [0, size]. Returns the new offset, or a negative errno: EBADF for
+// a bad fd, EINVAL for an unknown whence, ESPIPE for an unseekable backend (a
+// character device like /dev/zero, whose VFS backend has no seek slot).
 fn sysLseek(fd: u64, off: u64, whence: u64) u64 {
     const file = openFileFor(fd) orelse return EBADF;
-    // Compute in i128 so the sum can't overflow: `base` is at most ~4 GiB (a u32
-    // file size), but `delta` is an arbitrary signed 64-bit value, and base+delta
-    // in i64 could trap (Debug builds check for overflow) on extreme inputs like
-    // lseek(fd, INT64_MAX, SEEK_END). The wide intermediate then clamps cleanly.
-    const total: i128 = file.reader.total; // file size as the SEEK_END base
-    const cur: i128 = file.reader.offset(); // current absolute position (SEEK_CUR base)
-    const delta: i128 = @as(i64, @bitCast(off)); // the signed offset argument
-    const base: i128 = switch (whence) {
-        SEEK_SET => 0,
-        SEEK_CUR => cur,
-        SEEK_END => total,
-        else => return EINVAL, // unknown whence
-    };
-    var target: i128 = base + delta; // can't overflow: both operands fit in i128
-    if (target < 0) target = 0; // can't seek before the start of the file
-    if (target > total) target = total; // FileReader caps at EOF anyway; be explicit
-    file.reader.seekTo(@intCast(target)); // forward = skip; backward = rewind + skip
-    return @intCast(file.reader.offset()); // report where we actually landed
+    // The VFS owns the offset math (i128, clamped to [0, size]) and the per-backend
+    // reposition. It returns null when the file can't seek (no seek slot). We can't
+    // tell "unseekable" from "bad whence" through one null, so reject the only bad
+    // whence up front (giving EINVAL) and treat any remaining null as ESPIPE.
+    if (whence != SEEK_SET and whence != SEEK_CUR and whence != SEEK_END) return EINVAL;
+    const landed = vfs.seek(&file.file, whence, @bitCast(off)) orelse return ESPIPE;
+    return @intCast(landed); // report where we actually landed
 }
 
 // dup(fd): allocate the lowest free descriptor referring to the same open file as
-// `fd`. We copy the FileReader, so the new descriptor starts at the SAME cursor
+// `fd`. We copy the VFS handle, so the new descriptor starts at the SAME cursor
 // position but then advances independently (a simple model; shared offsets are a
 // later refinement). Returns the new fd, or a negative errno.
 fn sysDup(fd: u64) u64 {
@@ -462,6 +458,37 @@ pub fn selfTest() void {
         if (syscallDispatch(SYS_close, fd, 0, 0) != 0) break :blk false;
         if (syscallDispatch(SYS_close, fd, 0, 0) != EBADF) break :blk false;
         _ = syscallDispatch(SYS_close, fd2, 0, 0);
+
+        // --- Prove a NON-FAT32 backend works through the SAME fd ABI -----------
+        // Now that the fd syscalls route through the VFS, opening "/dev/zero" must
+        // reach devfs, not the FAT32 disk. (devfs is mounted by devfs.selfTest(),
+        // which runs before us under -Ddebug-log, so /dev exists on this boot.)
+        const DEV = "/dev/zero";
+        @memcpy(path_kalias[0..DEV.len], DEV); // overwrite U_PATH via its HHDM alias
+        // Poison the read buffer with 0xFF so an all-zero result can only come from
+        // /dev/zero actually writing zeros (not a stale empty page).
+        const buf_kalias: [*]u8 = @ptrFromInt(pmm.physToVirt(buf_frame));
+        @memset(buf_kalias[0..16], 0xFF);
+        // open("/dev/zero") -> fd 3 again (the table is empty after the closes above).
+        const dfd = syscallDispatch(SYS_open, U_PATH, DEV.len, 0);
+        if (dfd != 3) {
+            serial.log("[FD] FAIL: open /dev/zero returned {d} (expected fd 3).\n", .{@as(i64, @bitCast(dfd))});
+            break :blk false;
+        }
+        // read 16 bytes: /dev/zero hands back 16 zero bytes through the VFS.
+        const dr = syscallDispatch(SYS_read, dfd, U_BUF, 16);
+        if (dr != 16 or !userBufAllZero(U_BUF, 16)) {
+            serial.log("[FD] FAIL: /dev/zero read got {d} bytes / not all zero.\n", .{dr});
+            break :blk false;
+        }
+        // lseek a character device is meaningless: devfs has no seek slot, so the
+        // VFS reports it unseekable and the syscall returns ESPIPE (like a pipe/tty).
+        const ds = syscallDispatch(SYS_lseek, dfd, 0, SEEK_SET);
+        if (ds != ESPIPE) {
+            serial.log("[FD] FAIL: lseek /dev/zero -> {d} (expected ESPIPE).\n", .{@as(i64, @bitCast(ds))});
+            break :blk false;
+        }
+        _ = syscallDispatch(SYS_close, dfd, 0, 0);
         break :blk true;
     };
 
@@ -474,6 +501,7 @@ pub fn selfTest() void {
 
     if (ok) {
         serial.log("[FD] file-syscall self-test OK: open/read/lseek/dup/close on {s} via the syscall ABI.\n", .{PATH});
+        serial.log("[FD] VFS-backed fd OK: a FAT32 file and /dev/zero opened+read through one fd ABI.\n", .{});
     } else {
         serial.log("[FD] file-syscall self-test FAILED.\n", .{});
     }
@@ -493,5 +521,15 @@ fn userBufEquals(va: u64, want: []const u8) bool {
 fn std_mem_eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
+// True if the first `n` bytes of the user buffer at `va` are all zero. Like
+// userBufEquals, it reads ring-3 memory under the SMAP guard.
+fn userBufAllZero(va: u64, n: usize) bool {
+    asm volatile ("stac");
+    defer asm volatile ("clac");
+    const got = @as([*]const u8, @ptrFromInt(va))[0..n];
+    for (got) |b| if (b != 0) return false;
     return true;
 }

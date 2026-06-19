@@ -19,7 +19,7 @@ const syscall = @import("../arch/syscall.zig"); // per-process syscall kernel st
 const usermode = @import("../arch/usermode.zig"); // enterRing3 (first user dispatch)
 const pmm = @import("../mm/pmm.zig"); // frames for the demo's user pages
 const tty = @import("../tty.zig"); // terminal foreground + Ctrl-C interrupt flag
-const fat32 = @import("../fs/fat32.zig"); // FileReader for open file descriptors
+const vfs = @import("../fs/vfs.zig"); // VFS open-file handle for open file descriptors
 
 const MAX_THREADS = 16; // also the number of guarded stack slots (kstack.MAX_STACKS)
 
@@ -34,13 +34,18 @@ const MAX_THREADS = 16; // also the number of guarded stack slots (kstack.MAX_ST
 pub const FD_MAX = 16; // descriptors 0..15 per process (0/1/2 reserved)
 pub const FD_FIRST_FREE: usize = 3; // open() allocates from here up (0/1/2 reserved)
 
-// One open file: the FAT32 streaming cursor that tracks where in the file we are.
-// `dup` makes a second descriptor refer to the same file; we model that by copying
-// the cursor (each fd then has its own independent position), which is enough for
-// the read/lseek/dup self-test. Reference-counted shared offsets are a later
-// refinement once real shared-fd semantics (e.g. dup2 onto a pipe) are needed.
+// One open file: a VFS handle that tracks where in the file we are. Routing this
+// through the VFS (rather than a raw FAT32 cursor) is what lets a descriptor name a
+// file on ANY mounted backend — the FAT32 disk, /tmp (tmpfs), or /dev (devfs) —
+// instead of only the FAT32 disk. `dup` makes a second descriptor refer to the same
+// file; we model that by copying the cursor (each fd then has its own independent
+// position). Reference-counted shared offsets are a later refinement once real
+// shared-fd semantics (e.g. dup2 onto a pipe) are needed.
+// NOTE: vfs.OpenFile carries a fixed inline reader buffer, so it is larger than the
+// old bare FAT32 cursor; with FD_MAX=16 and MAX_THREADS=16 the per-process fd tables
+// grow to ~a few hundred KiB of static .bss in total — fine for this kernel.
 pub const OpenFile = struct {
-    reader: fat32.FileReader, // the file's streaming read cursor
+    file: vfs.OpenFile, // the VFS streaming handle (backend + cursor + offset)
 };
 
 // The low-level context switch, written in assembly (a normal Zig function with

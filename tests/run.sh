@@ -514,6 +514,11 @@ assert_in "$TMP/fat.log" "[DEVFS] self-test OK: zero/null/console served through
 # the FAT32-disk boot (where the file exists), so we assert its single success
 # marker here. A FAILED line (instead of OK) means a descriptor/seek/dup bug.
 assert_in "$TMP/fat.log" "[FD] file-syscall self-test OK"  "fd table: open/read/lseek/dup/close a FAT32 file via the syscall ABI"
+# The fd syscalls now route through the VFS, so one fd ABI reaches ANY mounted backend.
+# The self-test proves it by ALSO opening /dev/zero (devfs, not the FAT32 disk) through
+# the same open/read syscalls, reading 16 zero bytes, and confirming lseek on the
+# unseekable device returns ESPIPE. This marker is that cross-backend proof.
+assert_in "$TMP/fat.log" "[FD] VFS-backed fd OK"           "fd table: a FAT32 file AND /dev/zero open+read through one VFS-backed fd ABI"
 
 # --- AC'97 play (raw PCM + WAV) (FAT32 + AC97, -M pc) ------------------------
 # Stream audio from the FAT32 disk to the codec. Boot -M pc with both the IDE disk

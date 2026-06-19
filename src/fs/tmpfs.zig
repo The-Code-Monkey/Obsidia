@@ -213,13 +213,24 @@ fn tmpfsRead(_: *anyopaque, file: *vfs.OpenFile, dst: []u8) usize {
     return n;
 }
 
-// The vtable wiring tmpfs's four operations into the shape the VFS expects.
-// resolve and stat are the same function (metadata lookup is identical for both).
+// Reposition the read cursor to an absolute byte offset. tmpfs files are just a
+// flat byte array, so seeking is a one-line assignment of `pos`. The VFS has
+// already clamped abs_pos into [0, size], so it always lands inside the file.
+fn tmpfsSeek(_: *anyopaque, file: *vfs.OpenFile, abs_pos: u64) bool {
+    const slot: *Reader = @ptrCast(@alignCast(&file.inner));
+    slot.pos = @intCast(abs_pos);
+    return true;
+}
+
+// The vtable wiring tmpfs's operations into the shape the VFS expects. resolve and
+// stat are the same function (metadata lookup is identical for both). tmpfs files
+// are seekable, so we provide the optional `seek` slot.
 const tmpfs_vtable = vfs.Backend.VTable{
     .resolve = tmpfsResolve,
     .open = tmpfsOpen,
     .read = tmpfsRead,
     .stat = tmpfsResolve,
+    .seek = tmpfsSeek,
 };
 
 var tmpfs_dummy_ctx: u8 = 0; // a real address to hand out as the opaque ctx
