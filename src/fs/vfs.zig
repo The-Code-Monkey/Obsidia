@@ -73,6 +73,14 @@ pub const Backend = struct {
         // unseekable (lseek -> ESPIPE), matching how POSIX treats a pipe/tty.
         // The default null means a backend opts in only if it implements it.
         seek: ?*const fn (ctx: *anyopaque, file: *OpenFile, abs_pos: u64) bool = null,
+        // OPTIONAL: copy up to src.len bytes from `src` INTO the open file at its
+        // current cursor and return how many were actually stored (it may store
+        // fewer than asked if the file's capacity is reached). Backends that are
+        // read-only (FAT32) leave this null — the VFS then reports the file as
+        // unwritable (write -> EROFS). The default null means a backend opts in
+        // only if it implements a streaming write. It is the WRITE mirror of
+        // `read`: same shape, advancing the same cursor.
+        write: ?*const fn (ctx: *anyopaque, file: *OpenFile, src: []const u8) usize = null,
     };
 };
 
@@ -97,6 +105,23 @@ pub const OpenFile = struct {
     pub fn read(self: *OpenFile, dst: []u8) usize {
         const n = self.backend.vtable.read(self.backend.ctx, self, dst);
         self.offset += n;
+        return n;
+    }
+
+    // Forward a write to the owning backend, the mirror of `read`. Returns null if
+    // the backend is read-only (no write slot — e.g. FAT32), so callers can map
+    // that to EROFS. Otherwise stores up to src.len bytes at the current cursor and
+    // advances our absolute offset by the count actually stored, keeping `offset`
+    // in lock-step with the data the backend accepted (just like read does).
+    pub fn write(self: *OpenFile, src: []const u8) ?usize {
+        const write_fn = self.backend.vtable.write orelse return null; // read-only backend
+        const n = write_fn(self.backend.ctx, self, src);
+        self.offset += n;
+        // A write that ran past the old end GREW the file. `size` was captured at
+        // open time and is used by seek (the SEEK_END base and the [0, size] clamp),
+        // so we must grow it here too — otherwise a later lseek into bytes we just
+        // wrote would clamp to the stale, smaller size and never reach them.
+        if (self.offset > self.size) self.size = self.offset;
         return n;
     }
 };
@@ -209,6 +234,13 @@ pub fn read(file: *OpenFile, dst: []u8) usize {
     return file.read(dst);
 }
 
+// Write to an already-opened file. Thin pass-through to OpenFile.write (which also
+// advances `file.offset`). Returns null if the file's backend is read-only (no
+// write slot), so a caller can report EROFS; otherwise the count of bytes stored.
+pub fn write(file: *OpenFile, src: []const u8) ?usize {
+    return file.write(src);
+}
+
 // How lseek interprets its offset argument: from the start, the current position,
 // or the end of the file. Same numeric values as POSIX SEEK_SET/CUR/END.
 pub const SEEK_SET: u64 = 0;
@@ -290,6 +322,14 @@ const fat32_vtable = Backend.VTable{
     .read = fat32Read,
     .stat = fat32Resolve, // stat is identical to resolve here
     .seek = fat32Seek, // FAT32 files are seekable
+    // NO .write slot: FAT32 is read-only through this fd path. The FAT32 driver's
+    // writeFile() is a WHOLE-FILE replace (it rewrites the entire file at once),
+    // which can't be mapped onto a streaming, cursor-advancing fd write — there is
+    // no "store these few bytes at the current offset" operation to call. So we
+    // leave write null; the VFS then reports a FAT32 fd as unwritable (EROFS),
+    // exactly as if you opened a file on a read-only mount. (Whole-file writes stay
+    // available via the fat32 driver's own API; only the streaming fd path is off.)
+    .write = null,
 };
 
 // Build a Backend value bound to the FAT32 driver. Callers do
@@ -507,4 +547,91 @@ test "an unseekable backend (no seek slot) reports null from seek" {
     var f: OpenFile = undefined;
     try testing.expect(open("/x", &f));
     try testing.expect(seek(&f, SEEK_SET, 0) == null); // unseekable -> null (ESPIPE)
+}
+
+// A WRITABLE fake backend: its `write` stores bytes into a static buffer at the
+// handle's current absolute offset (read straight off file.offset, since this
+// fake tracks no separate cursor of its own). Used to test that the VFS write
+// path forwards bytes to the backend AND advances the absolute offset, all
+// independent of any real filesystem.
+const WRITE_FAKE_CAP: usize = 32;
+var write_fake_buf: [WRITE_FAKE_CAP]u8 = undefined; // where the fake "stores" writes
+fn writeFakeOpen(_: *anyopaque, _: []const u8, _: *OpenFile) bool {
+    return true; // a fresh handle starts at offset 0 (set by open())
+}
+fn writeFakeWrite(_: *anyopaque, file: *OpenFile, src: []const u8) usize {
+    const pos: usize = @intCast(file.offset); // store at the handle's current cursor
+    if (pos >= WRITE_FAKE_CAP) return 0; // buffer full -> nothing stored
+    const n = @min(src.len, WRITE_FAKE_CAP - pos); // don't overrun the static buffer
+    @memcpy(write_fake_buf[pos .. pos + n], src[0..n]); // land the bytes
+    return n; // may be fewer than asked (capacity reached)
+}
+// A no-op seek (the cursor lives in file.offset, which the VFS sets) so this fake
+// is also seekable — needed to test that a write grows `size` enough for a later
+// SEEK_END/SEEK_SET to reach the freshly-written end.
+fn writeFakeSeek(_: *anyopaque, _: *OpenFile, _: u64) bool {
+    return true;
+}
+const write_fake_vtable = Backend.VTable{
+    .resolve = fakeResolve,
+    .open = writeFakeOpen,
+    .read = fakeRead, // reads not used here
+    .stat = fakeResolve,
+    .seek = writeFakeSeek, // seekable, so we can test seek-after-write
+    .write = writeFakeWrite, // the slot under test
+};
+
+test "vfs write forwards bytes to the backend and advances the offset" {
+    init();
+    var state = FakeState{};
+    try testing.expect(mount("/", .{ .ctx = &state, .vtable = &write_fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/w", &f));
+    try testing.expectEqual(@as(u64, 0), f.offset); // fresh handle at the start
+    // First write lands at offset 0 and moves the cursor by its length.
+    const n1 = write(&f, "hello");
+    try testing.expectEqual(@as(?usize, 5), n1);
+    try testing.expectEqual(@as(u64, 5), f.offset); // offset advanced by 5
+    try testing.expectEqualStrings("hello", write_fake_buf[0..5]); // bytes landed
+    // A second write continues from the advanced cursor (not back at 0).
+    const n2 = write(&f, "!!");
+    try testing.expectEqual(@as(?usize, 2), n2);
+    try testing.expectEqual(@as(u64, 7), f.offset);
+    try testing.expectEqualStrings("hello!!", write_fake_buf[0..7]);
+    // A file-extending write must also grow `size` (the fake opened at size 7 via
+    // fakeResolve, then we wrote 7 bytes, exactly the old end — no growth yet).
+    try testing.expectEqual(@as(u64, 7), f.size);
+    // Now write PAST the old end: size must grow so seek can reach the new bytes.
+    const n3 = write(&f, "xyz"); // offset 7 -> 10, extending past the old size 7
+    try testing.expectEqual(@as(?usize, 3), n3);
+    try testing.expectEqual(@as(u64, 10), f.size); // size grew to the new end
+    // SEEK_END now bases on 10 (the grown size), and SEEK_SET to 10 is reachable —
+    // the bug this guards against would clamp these to the stale size 7.
+    try testing.expectEqual(@as(?u64, 10), seek(&f, SEEK_END, 0));
+    try testing.expectEqual(@as(?u64, 10), seek(&f, SEEK_SET, 10));
+}
+
+test "vfs write on a read-only backend (no write slot) returns null" {
+    init();
+    var state = FakeState{}; // fake_vtable has no .write -> defaults to null
+    try testing.expect(mount("/", .{ .ctx = &state, .vtable = &fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/ro", &f));
+    try testing.expect(write(&f, "x") == null); // unwritable -> null (EROFS)
+    try testing.expectEqual(@as(u64, 0), f.offset); // a refused write never moves the cursor
+}
+
+test "vfs write stores fewer bytes when the backend's capacity is reached" {
+    init();
+    var state = FakeState{};
+    try testing.expect(mount("/", .{ .ctx = &state, .vtable = &write_fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/cap", &f));
+    // Seek the handle to one byte before the fake's capacity, then ask to write
+    // more than fits: the backend stores only the byte that fits and reports 1, and
+    // the VFS advances the offset by exactly that count.
+    f.offset = WRITE_FAKE_CAP - 1;
+    const n = write(&f, "ABCD");
+    try testing.expectEqual(@as(?usize, 1), n); // only one byte fit
+    try testing.expectEqual(@as(u64, WRITE_FAKE_CAP), f.offset); // advanced by 1
 }

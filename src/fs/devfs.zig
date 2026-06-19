@@ -108,13 +108,31 @@ fn read(_: *anyopaque, file: *vfs.OpenFile, dst: []u8) usize {
     };
 }
 
-// The vtable bound to devfs's four operations. stat == resolve (both just look up
-// metadata), mirroring how the FAT32 backend wires them.
+// Write to an open device node from `dst`, returning how many bytes were accepted.
+// This is the PER-HANDLE write the VFS vtable calls (the module-level write() helper
+// below is the by-path equivalent the self-test used before the slot existed). It
+// switches on the open handle's stored device kind, reusing the same routing:
+//   null/zero -> discard the bytes but report them all "written" (a sink).
+//   console   -> forward them to the serial console so they reach the terminal.
+// Every device here accepts the whole buffer, so the return is always src.len.
+fn writeHandle(_: *anyopaque, file: *vfs.OpenFile, dst: []const u8) usize {
+    const slot: *DevReader = @ptrCast(@alignCast(&file.inner));
+    switch (slot.kind) {
+        .null_dev, .zero_dev => {}, // sink: silently discard, but count as written
+        .console_dev => serial.print("{s}", .{dst}), // route to the terminal
+    }
+    return dst.len; // the whole buffer is accepted
+}
+
+// The vtable bound to devfs's operations. stat == resolve (both just look up
+// metadata), mirroring how the FAT32 backend wires them. devfs is WRITABLE, so it
+// provides the optional write slot (all its nodes accept writes — sink or console).
 const vtable = vfs.Backend.VTable{
     .resolve = resolve,
     .open = open,
     .read = read,
     .stat = resolve,
+    .write = writeHandle,
 };
 
 // Build a Backend value for devfs. Callers do `vfs.mount("/dev", devfs.backend())`.
@@ -122,12 +140,14 @@ pub fn backend() vfs.Backend {
     return .{ .ctx = &dummy_ctx, .vtable = &vtable };
 }
 
-// --- Write path ---------------------------------------------------------------
-// The VFS backend vtable has NO write slot today (it is a read-only abstraction),
-// and the task says not to widen VFS just for devfs. So device WRITES go through
-// this small helper instead, addressed by FULL VFS path (e.g. "/dev/console").
-// It is the natural place writes will live once the VFS grows a write op; for now
-// only the boot self-test uses it, to demonstrate the console-write behaviour.
+// --- Write path (by FULL path) ------------------------------------------------
+// A by-PATH device write (e.g. write("/dev/console", bytes)), addressed by the full
+// VFS path rather than an open handle. The VFS now has a per-handle write slot
+// (writeHandle above, the streaming-fd path), so the kernel's fd write syscall goes
+// through THAT; this by-path helper remains for callers that have a path but no open
+// handle — currently just the boot self-test, which uses it to demonstrate the
+// console-write behaviour without first opening the node. The two share the same
+// null/zero/console routing; keeping both is deliberate (handle vs path callers).
 //
 //   /dev/null    -> discard the bytes, report them all "written".
 //   /dev/zero    -> same (writing to zero is a no-op sink, like null).
@@ -259,4 +279,20 @@ test "open and write reject unknown device names" {
 test "writes to null and zero are silently discarded but counted" {
     try testing.expectEqual(@as(?usize, 3), write("/dev/null", "abc"));
     try testing.expectEqual(@as(?usize, 4), write("/dev/zero", "abcd"));
+}
+
+test "the per-handle write slot sinks null/zero and counts every byte" {
+    const b = backend();
+    var f: vfs.OpenFile = undefined;
+    f.backend = &b;
+    // /dev/null: a handle write must accept (discard) the whole buffer.
+    try testing.expect(b.vtable.open(b.ctx, "/null", &f));
+    try testing.expect(b.vtable.write != null); // devfs opts into the write slot
+    try testing.expectEqual(@as(usize, 5), b.vtable.write.?(b.ctx, &f, "hello"));
+    // /dev/zero: same sink behaviour through the per-handle write.
+    try testing.expect(b.vtable.open(b.ctx, "/zero", &f));
+    try testing.expectEqual(@as(usize, 2), b.vtable.write.?(b.ctx, &f, "hi"));
+    // NB: /dev/console's handle write is NOT exercised on the host because it calls
+    // serial.print (real x86 port I/O via outb), which would fault off-target. It is
+    // proven instead by the debug-gated boot self-test under QEMU.
 }
