@@ -14,4 +14,5 @@ test {
     _ = @import("fs/tmpfs.zig"); // tmpfs: in-memory create/write/read + VFS-backed reads
     _ = @import("fs/devfs.zig"); // devfs device nodes: /dev/null (EOF), /dev/zero (zeros), /dev/console (writes)
     _ = @import("arch/idt.zig"); // fault->signal vector mapping (pure default-action table)
+    _ = @import("sched/scheduler.zig"); // wait/reap lifecycle: slot selection, zombie retention, reaping
 }

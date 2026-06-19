@@ -162,6 +162,11 @@ check_markers() { # check_markers <log> <prefix-label>
     # — the latter only logs if control came back (proving the box did not halt).
     assert_in "$log" "user fault -> SIGSEGV, process terminated (code 139)" "$p fault->signal: ring-3 page fault delivered SIGSEGV (terminate, code 139)"
     assert_in "$log" "Fault->signal self-test OK"                "$p fault->signal: faulting process terminated + kernel returned (no halt)"
+    # wait/waitpid: a parent waits on a ring-3 child, collects its exit code, and
+    # REAPS the now-zombie slot. The success marker proves the collected codes match
+    # (a non-zero and a zero exit) AND that the reaped slot was reused by the next
+    # spawn (so a finished child no longer leaks a stale thread-table slot).
+    assert_in "$log" "[WAIT] wait/reap self-test OK"             "$p wait/waitpid: parent collected a child's exit code + reaped the zombie slot"
     assert_in "$log" "[PCI] Enumeration complete:"               "$p PCI: bus enumeration completed (config mechanism #1)"
     assert_in "$log" "[PCI] probing"                             "$p PCI: driver registry probed registered drivers"
     assert_in "$log" "class 01.06 prog-if 01"                    "$p PCI: decoded the AHCI controller (class/subclass/prog-if)"

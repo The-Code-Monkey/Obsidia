@@ -72,7 +72,19 @@ comptime {
     );
 }
 
-const State = enum { ready, running, finished, blocked };
+// A thread's life-cycle state.
+//   .ready    - runnable, waiting its turn on the CPU
+//   .running  - currently on the CPU
+//   .blocked  - asleep / waiting on an event (sleep, mutex, wait queue)
+//   .finished - done, and nobody is interested in its exit code: the slot can be
+//               reused on the next spawn (the historical "dead, forget it" state).
+//   .zombie   - done, BUT it left an exit code a waiter still wants to collect.
+//               The slot is NOT reused until someone wait()s on it and reaps it
+//               (which flips it back to a free .finished slot). This is the Unix
+//               "zombie process" idea: a finished child lingers just long enough
+//               for its parent to read how it ended, then disappears. Without this
+//               the exit code would be lost the instant the child stopped running.
+const State = enum { ready, running, finished, blocked, zombie };
 
 const Thread = struct {
     rsp: u64, // saved stack pointer (points at the saved context)
@@ -81,6 +93,9 @@ const Thread = struct {
     name: []const u8,
     entry: *const fn () void = undefined, // the function the thread runs
     wake_tick: u64 = 0, // if sleeping, the tick at which to wake (0 = not sleeping)
+    // Exit code a finished/zombie thread left behind. Only meaningful once the
+    // thread reaches .zombie (a waiter reads it, then reaps the slot). 0 otherwise.
+    exit_code: u64 = 0,
     // Process fields (0/unused for plain kernel threads):
     pml4: u64 = 0, // address space to run in (0 = the shared kernel space)
     kstack_top: u64 = 0, // ring-0 stack top for this thread's traps/syscalls
@@ -113,12 +128,36 @@ fn setupMain() void {
     alive = 0;
 }
 
+// Find a thread-table slot for a new thread. Prefer reusing a slot that a finished
+// thread left behind (state .finished, already reaped — its exit code collected and
+// the slot relinquished), since that frees no kernel stack but lets the table not
+// grow without bound; otherwise append a fresh slot. Returns the slot index, or
+// null if the table is full of live/zombie threads. Reusing a reaped slot is what
+// makes "reaping" observable: a slot a wait()ed-on child vacated gets handed to the
+// next spawn. We never reuse a .zombie slot — its exit code is still owed to a waiter.
+//
+// IMPORTANT: a reused slot keeps the kernel stack it was first given (kstack slots
+// are indexed by thread-table position and are never freed). kstack.alloc() is
+// idempotent — asked for an already-mapped slot it hands back the SAME stack — so
+// spawn/spawnUser can call it unconditionally whether the slot is fresh or reused.
+fn findFreeSlot() ?usize {
+    var i: usize = 1; // never reuse slot 0 (the idle/main thread)
+    while (i < thread_count) : (i += 1) {
+        if (threads[i].state == .finished) return i; // a reaped slot — reuse it
+    }
+    if (thread_count < MAX_THREADS) return thread_count; // else append a fresh one
+    return null; // table full of live/zombie threads
+}
+
 // Create a thread that will start executing `func`. We hand-build its stack so
 // the first switchContext "returns" into func, and so that if func ever returns
 // it lands in threadExit.
 pub fn spawn(name: []const u8, func: *const fn () void) void {
-    if (thread_count >= MAX_THREADS) return;
-    const gs = kstack.alloc(thread_count) orelse { // guarded stack for this thread slot
+    const idx = findFreeSlot() orelse return; // reuse a reaped slot, or append
+    const appending = idx == thread_count; // a brand-new slot grows the table
+    // Guarded kernel stack keyed to this slot index. alloc() is idempotent, so a
+    // reused (reaped) slot gets back its original stack rather than fresh frames.
+    const gs = kstack.alloc(idx) orelse {
         serial.log("[SCHED]   failed to allocate a thread stack\n", .{});
         return;
     };
@@ -132,8 +171,8 @@ pub fn spawn(name: []const u8, func: *const fn () void) void {
     push(&sp, @intFromPtr(&threadStart)); // switchContext's `ret` enters the trampoline
     for (0..6) |_| push(&sp, 0); // saved rbp, rbx, r12, r13, r14, r15
 
-    threads[thread_count] = .{ .rsp = sp, .stack = stack, .state = .ready, .name = name, .entry = func, .kstack_top = top };
-    thread_count += 1;
+    threads[idx] = .{ .rsp = sp, .stack = stack, .state = .ready, .name = name, .entry = func, .kstack_top = top };
+    if (appending) thread_count += 1;
     _ = @atomicRmw(usize, &alive, .Add, 1, .monotonic);
 }
 
@@ -315,8 +354,9 @@ fn threadExit() noreturn {
 // table is full or the kernel stack allocation failed) — the caller must check
 // this and NOT wait on a process that was never created (see runUser).
 pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) bool {
-    if (thread_count >= MAX_THREADS) return false;
-    const gs = kstack.alloc(thread_count) orelse { // guarded kernel stack for this slot
+    const idx = findFreeSlot() orelse return false; // reuse a reaped slot, or append
+    const appending = idx == thread_count; // a brand-new slot grows the table
+    const gs = kstack.alloc(idx) orelse { // guarded kernel stack (idempotent for a reused slot)
         serial.log("[SCHED]   failed to allocate a user kernel stack\n", .{});
         return false;
     };
@@ -327,7 +367,7 @@ pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) 
     push(&sp, @intFromPtr(&userStart)); // switchContext's `ret` enters this trampoline
     for (0..6) |_| push(&sp, 0); // saved rbp, rbx, r12-r15
 
-    threads[thread_count] = .{
+    threads[idx] = .{
         .rsp = sp,
         .stack = stack,
         .state = .ready,
@@ -337,8 +377,8 @@ pub fn spawnUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) 
         .user_entry = user_entry,
         .user_stack = user_stack,
     };
-    last_user_idx = thread_count; // remember which slot this process got (for Ctrl-C kill)
-    thread_count += 1;
+    last_user_idx = idx; // remember which slot this process got (for Ctrl-C kill / wait)
+    if (appending) thread_count += 1;
     _ = @atomicRmw(usize, &alive, .Add, 1, .monotonic);
     return true;
 }
@@ -447,6 +487,7 @@ pub fn runUser(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) u6
 fn killForeground(uidx: usize) void {
     asm volatile ("cli"); // touch shared scheduler state with interrupts off
     threads[uidx].state = .finished;
+    threads[uidx].exit_code = 130; // also retain it in the TCB so a wait()er can collect it
     _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic);
     user_exit_code = 130; // 128 + SIGINT(2)
     asm volatile ("sti");
@@ -478,6 +519,7 @@ pub fn terminateUserProcess(exit_code: u64) noreturn {
     // panic beats silent damage. This never fires on any reachable path.
     if (current == 0) @panic("terminateUserProcess: CPL3 fault on thread 0 (not a user process)");
     user_exit_code = exit_code; // the code runUser() will hand back to the loader
+    threads[current].exit_code = exit_code; // also retain it in the TCB so a wait()er can collect it
     @atomicStore(bool, &user_done, true, .release); // publish before we switch away
     threads[current].state = .finished; // never reschedule the faulted process
     _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic); // it no longer counts as alive
@@ -493,6 +535,138 @@ pub fn terminateUserProcess(exit_code: u64) noreturn {
 pub fn runUserStandalone(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) u64 {
     setupMain();
     return runUser(name, user_entry, user_stack, pml4);
+}
+
+// --- wait/waitpid: collect a child's exit code, then reap it ------------------
+// `runUser` above runs a child SYNCHRONOUSLY: the launcher parks until the child
+// exits and immediately gets its code back through the global `user_exit_code`
+// slot. That is fine when the parent has nothing else to do meanwhile, but it
+// can't express the Unix shape "spawn a child, keep running, LATER ask how it
+// ended" — and a synchronously-collected child is gone the moment runUser returns.
+//
+// wait/waitpid adds that shape. A child that exits becomes a ZOMBIE: its thread
+// slot stays occupied, holding only its exit code, until a waiter collects it.
+// The waiter (waitLastChild below, or the SYS_wait syscall) blocks until the
+// target child is a zombie, reads its exit code, then REAPS the slot — flips it to
+// .finished so the next spawn can reuse it (findFreeSlot). Reaping is what keeps
+// the thread table from filling with dead-but-remembered children.
+//
+// Single-child model (matches the rest of this file's one-image-at-a-time loader):
+// we track only the most-recently-spawned user process (`last_user_idx`). A full
+// multi-child PID table is a later refinement; the lifecycle mechanics — retain on
+// exit, block until zombie, read, reap — are the real, reusable part and are
+// exercised by the self-test below.
+
+// The slot the next wait() will collect. Set when a child is spawned to be wait()ed
+// on; cleared (to "no waitable child") after it's reaped. ~0 = none.
+const NO_CHILD: usize = ~@as(usize, 0);
+var wait_child_idx: usize = NO_CHILD;
+
+// SYS_exit handler installed while a child runs under waitLastChild: record the
+// child's exit code IN ITS OWN TCB and leave it as a ZOMBIE (not .finished), so the
+// waiter can still read the code after the child stops running. Same teardown shape
+// as captureUserExit, but the slot lingers until reaped instead of being forgotten.
+fn zombieExitHandler(code: u64) callconv(.c) noreturn {
+    asm volatile ("cli"); // the thread we switch to restores its own interrupt flag
+    threads[current].exit_code = code; // retain the code in the child's TCB...
+    threads[current].state = .zombie; // ...and keep the slot until a waiter reaps it
+    _ = @atomicRmw(usize, &alive, .Sub, 1, .monotonic); // a zombie no longer counts as alive
+    yield(); // hand the CPU back; a zombie is never scheduled again
+    unreachable;
+}
+
+// Reap an ENDED child at `idx`: read its retained exit code, then relinquish the
+// slot (force it to .finished) so the next spawn can reuse it. Returns the exit code.
+// The caller must have confirmed `idx` ended (childEnded: .zombie from a clean exit,
+// or .finished from a forced kill — both retain exit_code). Done with interrupts off
+// so the state flip can't race the scheduler. After this the child is GONE — a
+// second reap of the same slot would read a stale code, so wait() clears
+// wait_child_idx once reaped to make a double-reap impossible.
+fn reap(idx: usize) u64 {
+    asm volatile ("cli");
+    const code = reapState(idx); // the read + state flip (pure; unit-tested)
+    asm volatile ("sti");
+    return code;
+}
+
+// The pure heart of reap(): read the zombie's retained exit code and flip its slot
+// to .finished (relinquished, reusable). Split out from reap() so it can be unit-
+// tested on the host without the cli/sti interrupt-masking (privileged instructions
+// that fault outside ring 0). reap() wraps this in cli/sti; nothing else calls it.
+fn reapState(idx: usize) u64 {
+    const code = threads[idx].exit_code; // the code the child left behind
+    threads[idx].state = .finished; // relinquish the slot (now reusable by findFreeSlot)
+    return code;
+}
+
+// Is the thread at `idx` a zombie (finished, exit code retained, not yet reaped)?
+fn isZombie(idx: usize) bool {
+    return idx < thread_count and threads[idx].state == .zombie;
+}
+
+// Has the child at `idx` ENDED, by any route? A clean exit() leaves it a .zombie;
+// the two forced-termination paths (a CPU fault -> terminateUserProcess, or Ctrl-C
+// -> killForeground) leave it .finished. Both retain the exit code in the TCB, so
+// the waiter must wake on EITHER — waiting only for .zombie would spin forever if a
+// waited-on child instead faulted or was interrupted. (The window where a .finished
+// slot is reused by another spawn before the waiter reaps it cannot occur in the
+// single-child, cooperative-single-core model: the same thread that waits is the
+// only one that spawns, so nothing spawns between the child ending and this reap.)
+fn childEnded(idx: usize) bool {
+    if (idx >= thread_count) return false;
+    return threads[idx].state == .zombie or threads[idx].state == .finished;
+}
+
+// Spawn `entry` as a ring-3 child to be wait()ed on later, returning its slot index
+// ("pid"), or null if it couldn't be spawned. Unlike runUser this does NOT block:
+// the child runs as a zombie-on-exit process (its exit code is retained) and the
+// caller collects it with waitChild()/SYS_wait. Installs zombieExitHandler for the
+// child's exit() so the slot lingers; the caller restores the previous handler after
+// reaping (the self-test does this).
+fn spawnWaitableChild(name: []const u8, user_entry: u64, user_stack: u64, pml4: u64) ?usize {
+    syscall.exit_handler = &zombieExitHandler; // child's exit() -> retain code + become zombie
+    if (!spawnUser(name, user_entry, user_stack, pml4)) return null;
+    wait_child_idx = last_user_idx; // the slot we'll wait on
+    return last_user_idx;
+}
+
+// Block (cooperatively yielding) until the waitable child is a zombie, then read its
+// exit code and reap the slot. Returns the child's exit code, or SPAWN_FAILED if
+// there is no waitable child. MUST be called from a scheduler thread (so yield() has
+// somewhere to go). This is the kernel side of waitpid: "wait for the child to end,
+// tell me how, and clean it up". After it returns, wait_child_idx is cleared so a
+// second wait can't double-reap a reused slot.
+fn waitLastChild() u64 {
+    const idx = wait_child_idx;
+    if (idx == NO_CHILD) return SPAWN_FAILED; // nothing to wait on
+    while (!childEnded(idx)) yield(); // run the child (and others) until it ends (exit OR forced-kill)
+    const code = reap(idx); // collect its code + relinquish the slot
+    wait_child_idx = NO_CHILD; // collected: prevent a double-reap of a reused slot
+    return code;
+}
+
+// The outcome of a wait(): which child was collected and how it ended. `pid` is the
+// reaped child's thread-table slot index (our stand-in for a real PID); `code` is
+// its exit code. `pid == NO_CHILD` means "no child to wait on" (the caller maps that
+// to ECHILD). Returned by-value so the SYS_wait handler can both report the pid and
+// write the status without reaching into scheduler internals.
+pub const WaitResult = struct { pid: usize, code: u64 };
+
+// The public wait primitive the SYS_wait syscall calls: block until the most-
+// recently-spawned waitable child becomes a zombie, reap it, and report which child
+// it was + its exit code. Returns pid == noChild() when there's no waitable child.
+// (Single-child today; the slot index doubles as the PID — see the module notes.)
+pub fn waitForChild() WaitResult {
+    const idx = wait_child_idx; // captured before waitLastChild clears it
+    if (idx == NO_CHILD) return .{ .pid = NO_CHILD, .code = 0 };
+    const code = waitLastChild(); // block-until-zombie, read code, reap the slot
+    return .{ .pid = idx, .code = code };
+}
+
+// The sentinel `waitForChild` returns in `.pid` when there is no child to wait on,
+// exposed so the syscall layer can recognize it without importing the constant.
+pub fn noChild() usize {
+    return NO_CHILD;
 }
 
 // --- Self-test: two cooperative worker threads -------------------------------
@@ -569,6 +743,7 @@ pub fn dump() void {
             .running => "running",
             .finished => "finished",
             .blocked => "blocked",
+            .zombie => "zombie",
         };
         serial.print("  {d:>2}  {s:<9}  {s}\n", .{ i, st, t.name });
     }
@@ -829,4 +1004,168 @@ pub fn userFaultDemo() void {
     pmm.free(code_frame);
     pmm.free(stack_frame);
     vmm.destroyAddressSpace(as);
+}
+
+// --- wait/waitpid + zombie-reaping self-test ---------------------------------
+// Proves the wait lifecycle end to end without touching the disk:
+//   1. Build a ring-3 child that immediately exits with a KNOWN exit code.
+//   2. Spawn it as a waitable child (zombie-on-exit), then waitForChild():
+//      block until it's a zombie, read its retained exit code, reap the slot.
+//   3. Assert the collected code matches AND the slot was REAPED — verified by
+//      spawning a SECOND child and checking findFreeSlot handed it the SAME slot
+//      (a leaked zombie would have forced a new, higher slot).
+//   4. Repeat with a normal exit(0) child to prove the zero-code path is waited +
+//      reaped too.
+// Debug-log-gated (run from main only under -Ddebug-log); the harness greps the
+// success marker. A self-contained ring-3 exercise — no FAT32 needed.
+const WAIT_CODE_A: u8 = 42; // first child's non-zero exit code
+const WAIT_CODE_B: u8 = 0; // second child's exit code (the zero path)
+
+// Build a one-page-code + one-page-stack address space whose ring-3 entry is just
+// `exit(code)`. Returns the address space and its three frames so the caller can run
+// the child then tear everything down. Returns null on any allocation failure (and
+// frees whatever it already took, so the run-once self-test never leaks).
+const ExitChild = struct { as: u64, code_frame: u64, stack_frame: u64 };
+fn buildExitChild(code: u8) ?ExitChild {
+    const as = vmm.createAddressSpace() orelse return null;
+    const code_frame = pmm.allocZeroed() orelse {
+        vmm.destroyAddressSpace(as);
+        return null;
+    };
+    const stack_frame = pmm.allocZeroed() orelse {
+        pmm.free(code_frame);
+        vmm.destroyAddressSpace(as);
+        return null;
+    };
+
+    const U_CODE: u64 = 0x400000;
+    const U_STACK_TOP: u64 = 0x403000; // top of a one-page stack at 0x402000
+
+    // Hand-assemble: mov eax, SYS_exit ; mov edi, code ; syscall ; jmp $ (safety).
+    //   B8 <SYS_exit>       mov eax, SYS_exit
+    //   BF <code>           mov edi, code        ; the exit code (32-bit immediate)
+    //   0F 05               syscall              ; exit(code) — does not return
+    //   EB FE               jmp $                ; never reached
+    const c: [*]u8 = @ptrFromInt(pmm.physToVirt(code_frame));
+    c[0] = 0xB8; wr32(c + 1, @intCast(syscall.SYS_exit)); // mov eax, SYS_exit
+    c[5] = 0xBF; wr32(c + 6, code); // mov edi, code
+    c[10] = 0x0F; c[11] = 0x05; // syscall
+    c[12] = 0xEB; c[13] = 0xFE; // jmp $
+
+    vmm.mapInto(as, U_CODE, code_frame, vmm.FLAG_USER); // RX, user (the exit stub)
+    vmm.mapInto(as, U_STACK_TOP - 0x1000, stack_frame, vmm.FLAG_USER | vmm.FLAG_WRITE | vmm.FLAG_NX);
+    return .{ .as = as, .code_frame = code_frame, .stack_frame = stack_frame };
+}
+
+// Tear down a child built by buildExitChild (unmap + free its frames + destroy the
+// address space). The child already exited, so the kernel owns this cleanup.
+fn teardownExitChild(ch: ExitChild) void {
+    const U_CODE: u64 = 0x400000;
+    const U_STACK_TOP: u64 = 0x403000;
+    vmm.unmapInto(ch.as, U_CODE);
+    vmm.unmapInto(ch.as, U_STACK_TOP - 0x1000);
+    pmm.free(ch.code_frame);
+    pmm.free(ch.stack_frame);
+    vmm.destroyAddressSpace(ch.as);
+}
+
+// Spawn one exit(code) child, wait for it, and reap it. Fills `*out_pid` with the
+// slot it ran in and returns its collected exit code (or SPAWN_FAILED on spawn
+// failure). The address-space frames are torn down after the wait completes.
+fn runWaitChild(name: []const u8, code: u8, out_pid: *usize) u64 {
+    const ch = buildExitChild(code) orelse {
+        serial.log("[WAIT]   could not build an exit({d}) child\n", .{code});
+        out_pid.* = noChild();
+        return SPAWN_FAILED;
+    };
+    const U_CODE: u64 = 0x400000;
+    const U_STACK_TOP: u64 = 0x403000;
+    const pid = spawnWaitableChild(name, U_CODE, U_STACK_TOP, ch.as) orelse {
+        teardownExitChild(ch);
+        out_pid.* = noChild();
+        return SPAWN_FAILED;
+    };
+    out_pid.* = pid;
+    // Drive the child to completion under preemption, then collect it. We run under
+    // the timer (like the other process demos) so the child actually gets CPU time;
+    // waitForChild() yields until the child becomes a zombie, then reaps it.
+    preempting = true;
+    pic.on_tick = &tick;
+    const result = waitForChild(); // block-until-zombie -> read code -> reap slot
+    pic.on_tick = null;
+    preempting = false;
+    teardownExitChild(ch);
+    return result.code;
+}
+
+pub fn waitReapDemo() void {
+    setupMain(); // adopt the boot context as thread 0; thread_count = 1
+    const prev = syscall.exit_handler; // restore after (spawnWaitableChild installs ours)
+
+    // Child A: exits with a known NON-ZERO code. Wait for it and reap it.
+    var pid_a: usize = undefined;
+    const code_a = runWaitChild("waitA", WAIT_CODE_A, &pid_a);
+
+    // Child B: a normal exit(0). Wait + reap proves the zero-code path too — AND, by
+    // reusing the slot A vacated, that A was genuinely reaped (not left a zombie).
+    var pid_b: usize = undefined;
+    const code_b = runWaitChild("waitB", WAIT_CODE_B, &pid_b);
+
+    syscall.exit_handler = prev;
+
+    // Verdict: both exit codes collected correctly, and child B reused child A's
+    // slot — which can only happen if waitForChild() actually reaped A (a leaked
+    // zombie would have kept slot A occupied, forcing B into a fresh, higher slot).
+    const codes_ok = code_a == WAIT_CODE_A and code_b == WAIT_CODE_B;
+    const reaped_ok = pid_a != noChild() and pid_a == pid_b;
+    if (codes_ok and reaped_ok) {
+        serial.log("[WAIT] wait/reap self-test OK: collected exit codes {d} and {d}; zombie reaped (slot {d} reused).\n", .{ code_a, code_b, pid_a });
+    } else {
+        serial.log("[WAIT] wait/reap self-test FAILED (code_a={d} code_b={d} pid_a={d} pid_b={d}).\n", .{ code_a, code_b, pid_a, pid_b });
+    }
+}
+
+// --- Inline unit tests: the pure wait/reap lifecycle helpers -----------------
+// These run on the host (`zig build test`) and poke the thread table directly —
+// they need no hardware, so the slot-selection / zombie-retention / reap policy is
+// checked without booting. A tiny helper sets a slot's state with a placeholder
+// stack pointer so the table is well-formed for the functions under test.
+const testing = @import("std").testing;
+
+fn setTestSlot(idx: usize, st: State, code: u64) void {
+    threads[idx] = .{ .rsp = 0, .stack = &.{}, .state = st, .name = "t", .exit_code = code };
+}
+
+test "findFreeSlot reuses a reaped (.finished) slot, never slot 0 or a zombie/live one" {
+    // Table: [0]=running idle, [1]=zombie (owes a waiter), [2]=finished (reaped).
+    thread_count = 3;
+    setTestSlot(0, .running, 0);
+    setTestSlot(1, .zombie, 7); // a zombie's slot must NOT be reused (code still owed)
+    setTestSlot(2, .finished, 0); // a reaped slot is free for reuse
+    try testing.expectEqual(@as(?usize, 2), findFreeSlot()); // picks the reaped slot, not 0 or the zombie
+
+    // With no reusable slot below thread_count, it appends a fresh one.
+    setTestSlot(2, .ready, 0); // slot 2 now live -> nothing reusable
+    try testing.expectEqual(@as(?usize, 3), findFreeSlot()); // appends at thread_count
+
+    // Full table of live/zombie threads -> no slot available.
+    thread_count = MAX_THREADS;
+    for (1..MAX_THREADS) |i| setTestSlot(i, .ready, 0);
+    try testing.expectEqual(@as(?usize, null), findFreeSlot());
+}
+
+test "reap reads a zombie's exit code and relinquishes the slot (.zombie -> .finished)" {
+    thread_count = 2;
+    setTestSlot(0, .running, 0);
+    setTestSlot(1, .zombie, 99); // a zombie holding exit code 99
+    try testing.expect(isZombie(1)); // it is a zombie before reaping
+    try testing.expectEqual(@as(u64, 99), reapState(1)); // reap returns the retained code (pure core, no cli/sti)
+    try testing.expectEqual(State.finished, threads[1].state); // slot relinquished (reusable)
+    try testing.expect(!isZombie(1)); // and is no longer a zombie (so a double-reap can't happen)
+}
+
+test "waitLastChild reports no child when none is registered" {
+    wait_child_idx = NO_CHILD;
+    try testing.expectEqual(SPAWN_FAILED, waitLastChild()); // nothing to wait on
+    try testing.expectEqual(noChild(), waitForChild().pid); // and the public wrapper agrees
 }

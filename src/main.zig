@@ -429,6 +429,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
         scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
         syscall.selfTest(); // file syscalls: open/read/lseek/dup/close a FAT32 file via the fd table
         scheduler.userFaultDemo(); // demo fault->signal: a ring-3 page fault terminates the process (SIGSEGV), kernel returns
+        scheduler.waitReapDemo(); // demo wait/waitpid: a parent waits on a child, collects its exit code, and reaps the zombie slot
     }
 
     // Load and run the init binary off the disk (if present) as a RING-3 PROCESS
