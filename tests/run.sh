@@ -525,6 +525,12 @@ assert_in "$TMP/fat.log" "[FD] VFS-backed fd OK"           "fd table: a FAT32 fi
 # /dev/null is accepted (a discard sink); and a write to the read-only FAT32 file
 # /HELLO.TXT is refused with EROFS. This marker is that write-path proof.
 assert_in "$TMP/fat.log" "[FD] write path OK: tmpfs round-trip + devfs sink + FAT32 EROFS" "fd table: write() through the VFS — tmpfs round-trip + devfs sink + FAT32 EROFS"
+# Per-process cwd: the self-test chdir()s into /docs, open()s NOTES.TXT by its
+# RELATIVE name (which must resolve under the cwd), reads it back, and getcwd()s to
+# confirm the cwd moved — all through the syscall ABI. It also asserts chdir to a
+# missing dir is ENOENT and chdir to a file is ENOTDIR. This marker proves the
+# relative-path-resolution + chdir/getcwd path works end to end.
+assert_in "$TMP/fat.log" "[FD] cwd OK: chdir + relative open + getcwd via the syscall ABI" "fd table: chdir + relative open + getcwd via the syscall ABI (per-process cwd)"
 
 # --- AC'97 play (raw PCM + WAV) (FAT32 + AC97, -M pc) ------------------------
 # Stream audio from the FAT32 disk to the codec. Boot -M pc with both the IDE disk
