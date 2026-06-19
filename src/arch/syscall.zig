@@ -21,6 +21,7 @@ const vmm = @import("../mm/vmm.zig"); // validate user pointers against the page
 const fat32 = @import("../fs/fat32.zig"); // self-test: gate on the FAT32 disk being mounted
 const vfs = @import("../fs/vfs.zig"); // file syscalls route through the VFS (any backend)
 const tmpfs = @import("../fs/tmpfs.zig"); // self-test: seed a writable /tmp file for the write path
+const pipefs = @import("../fs/pipefs.zig"); // SYS_pipe: anonymous pipe ends (a shared in-kernel ring)
 
 // A dedicated ring-0 stack the entry stub switches to (`syscall` doesn't load one
 // for us). A single static stack is safe for now because the handler runs with
@@ -53,6 +54,7 @@ pub const SYS_dup: u64 = 8; // dup(fd) -> new fd (lowest free) or -errno
 pub const SYS_wait: u64 = 9; // wait(status_ptr) -> pid of the reaped child, or -ECHILD
 pub const SYS_chdir: u64 = 10; // chdir(path, len) -> 0, or -errno (move the process's cwd)
 pub const SYS_getcwd: u64 = 11; // getcwd(buf, len) -> cwd length, or -ERANGE (buffer too small)
+pub const SYS_pipe: u64 = 12; // pipe(fds_ptr) -> 0 and writes [read_fd, write_fd]; or -errno
 
 const ENOSYS: u64 = @bitCast(@as(i64, -38)); // unknown syscall
 const EBADF: u64 = @bitCast(@as(i64, -9)); // bad file descriptor
@@ -98,6 +100,7 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
         SYS_wait => sysWait(a1),
         SYS_chdir => sysChdir(a1, a2),
         SYS_getcwd => sysGetcwd(a1, a2),
+        SYS_pipe => sysPipe(a1),
         else => ENOSYS,
     };
 }
@@ -295,7 +298,13 @@ fn sysClose(fd: u64) u64 {
     if (fd >= scheduler.FD_MAX) return EBADF; // out of table range
     const table = scheduler.currentFdTable();
     if (table[fd] == null) return EBADF; // wasn't open
-    table[fd] = null; // free the slot (the VFS handle holds no resources to release)
+    // Tell the backend a handle is closing BEFORE we drop the slot. Stateless backends
+    // (FAT32/tmpfs/devfs) have no close hook, so this is a no-op for them — exactly the
+    // old behavior. A pipe end, though, decrements the pipe's refcount here (and frees
+    // the shared ring when the last end closes); skipping this would leak the pipe and,
+    // worse, leave a reader blocked forever waiting for an EOF that never comes.
+    vfs.closeFile(&table[fd].?.file);
+    table[fd] = null; // free the slot
     return 0;
 }
 
@@ -343,7 +352,14 @@ fn sysLseek(fd: u64, off: u64, whence: u64) u64 {
 // later refinement). Returns the new fd, or a negative errno.
 fn sysDup(fd: u64) u64 {
     const file = openFileFor(fd) orelse return EBADF; // nothing to duplicate
-    return scheduler.allocFd(file.*) orelse EMFILE; // copy the cursor into a new slot
+    const newfd = scheduler.allocFd(file.*) orelse return EMFILE; // copy the cursor into a new slot
+    // The new descriptor now refers to the SAME underlying object. Tell the backend so a
+    // refcounted one (a pipe) keeps it alive until BOTH fds close. Stateless backends have
+    // no clone hook -> no-op, so a FAT32/tmpfs/devfs dup stays a plain independent copy.
+    // We clone the NEW slot's handle (the copy), not the original, so the count tracks the
+    // descriptor we just added.
+    vfs.cloneFile(&scheduler.currentFdTable()[newfd].?.file);
+    return newfd;
 }
 
 // wait(status_ptr): block until the calling thread's most-recently-spawned child
@@ -430,6 +446,59 @@ fn sysGetcwd(buf: u64, len: u64) u64 {
     const dst = @as([*]u8, @ptrFromInt(buf))[0..cwd.len];
     @memcpy(dst, cwd);
     return cwd.len; // the number of bytes written (the cwd's length)
+}
+
+// pipe(fds_ptr): create a pipe — a one-way in-kernel byte conduit — and hand the
+// caller two file descriptors over it: a READ end (written to fds[0]) and a WRITE
+// end (fds[1]). Bytes written to fds[1] can be read from fds[0]; a writer blocks
+// while the pipe is full, a reader blocks while it's empty, and a reader sees EOF
+// once every write end is closed. This is the kernel half of `cmd1 | cmd2`.
+//
+// Returns 0 on success (with the two fd numbers stored in the user's int[2] at
+// fds_ptr), or a negative errno: EFAULT for a bad user buffer, EMFILE if the fd
+// table or the pipe pool is full. The user pointer is validated exactly like every
+// other (range check then page check), and the two fd numbers are stored back under
+// the SMAP guard. On any failure AFTER allocating the pipe/fds we undo the partial
+// work (free the allocated fds + close both pipe ends) so a failed pipe() leaks
+// nothing.
+fn sysPipe(fds_ptr: u64) u64 {
+    // Validate the user int[2] buffer (8 bytes: two 32-bit fd numbers) up front, BEFORE
+    // we allocate anything, so a bad pointer can't make us allocate then have to unwind.
+    const BYTES: u64 = 8; // two u32 fd numbers
+    if (fds_ptr >= USER_LIMIT or BYTES > USER_LIMIT - fds_ptr) return EFAULT; // escapes user space
+    if (!vmm.userRangeAccessible(vmm.activeSpace(), fds_ptr, BYTES)) return EFAULT; // unmapped / kernel-only
+
+    // Allocate the pipe + its two ends (a shared ring with refcount 2). Pool full -> EMFILE.
+    var read_end: vfs.OpenFile = undefined;
+    var write_end: vfs.OpenFile = undefined;
+    if (!pipefs.create(&read_end, &write_end)) return EMFILE; // pipe pool exhausted
+
+    // Install the two ends in the lowest free descriptors. If either allocFd fails (the
+    // fd table is full), unwind everything so we don't leak: free the fd we did get and
+    // close both pipe ends (dropping the refcount to 0, freeing the ring). Then EMFILE.
+    const read_fd = scheduler.allocFd(.{ .file = read_end }) orelse {
+        vfs.closeFile(&read_end); // refcount 2 -> 1
+        vfs.closeFile(&write_end); // refcount 1 -> 0: the pipe is freed
+        return EMFILE;
+    };
+    const write_fd = scheduler.allocFd(.{ .file = write_end }) orelse {
+        // The read end IS installed (in read_fd); closing it via the fd table runs the
+        // backend close hook (refcount 2 -> 1) and frees the slot. The write end was
+        // never installed, so close its local copy directly (refcount 1 -> 0: freed).
+        _ = sysClose(read_fd);
+        vfs.closeFile(&write_end);
+        return EMFILE;
+    };
+
+    // Both ends are installed; hand the two fd numbers back to ring 3 under the SMAP
+    // guard (the only place this syscall touches user memory). Read end first (fds[0]),
+    // write end second (fds[1]) — the POSIX order.
+    asm volatile ("stac");
+    defer asm volatile ("clac");
+    const out = @as([*]u32, @ptrFromInt(fds_ptr));
+    out[0] = @intCast(read_fd);
+    out[1] = @intCast(write_fd);
+    return 0;
 }
 
 // The `syscall` entry point (the LSTAR target). Global naked asm: switch to the
