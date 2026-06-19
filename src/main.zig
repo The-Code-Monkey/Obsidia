@@ -26,6 +26,7 @@ const ahci = @import("drivers/ahci.zig"); // AHCI/SATA disk (DMA block device, r
 const rtc = @import("drivers/rtc.zig"); // RTC / CMOS wall-clock (date + time)
 const tsc = @import("drivers/tsc.zig"); // TSC monotonic clock (high-res ns since boot)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
+const vfs = @import("fs/vfs.zig"); // virtual filesystem layer (mount/vnode over FAT32)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
@@ -352,6 +353,13 @@ export fn _start() noreturn {
 
     // Mount the FAT32 filesystem on the disk (if any) and prove the read path.
     fat32.selfTest();
+
+    // Bring up the virtual filesystem layer (a mount/vnode abstraction over the
+    // filesystem). Standalone for now — it wraps FAT32 but nothing is rewired to
+    // route through it yet; its debug-gated self-test mounts FAT32 and reads a
+    // file through the abstraction to prove the layer works end-to-end.
+    vfs.init();
+    vfs.selfTest();
 
     serial.log("BOOT_OK\n", .{}); // the marker our test harness greps for (debug-log only)
 
