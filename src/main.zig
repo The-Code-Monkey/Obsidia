@@ -229,6 +229,13 @@ export fn _start() noreturn {
     // early — the path isn't used until user code runs).
     syscall.init();
 
+    // Teach the exception handler how to TERMINATE a ring-3 process that takes a
+    // fatal CPU fault (page fault / #GP / illegal opcode / divide error): instead
+    // of dumping and halting the machine, the scheduler ends just that process and
+    // returns to the shell (the fault's default-action signal — SIGSEGV/SIGILL/
+    // SIGFPE — whose default is to kill). Kernel faults still dump-and-halt.
+    idt.user_fault_hook = &scheduler.terminateUserProcess;
+
     // Remap the PIC, start the PIT, and enable hardware interrupts.
     pic.init();
 
@@ -401,6 +408,7 @@ fn runAfterReclaim() callconv(.C) noreturn {
         vmm.selfTestUncacheable(); // demo an uncacheable (PCD/UC) MMIO-style mapping
         scheduler.userProcessDemo(); // demo a real ring-3 process scheduled with a kernel thread
         syscall.selfTest(); // file syscalls: open/read/lseek/dup/close a FAT32 file via the fd table
+        scheduler.userFaultDemo(); // demo fault->signal: a ring-3 page fault terminates the process (SIGSEGV), kernel returns
     }
 
     // Load and run the init binary off the disk (if present) as a RING-3 PROCESS
