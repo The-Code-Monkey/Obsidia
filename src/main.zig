@@ -368,25 +368,24 @@ export fn _start() noreturn {
     // route through it yet; its debug-gated self-test mounts FAT32 and reads a
     // file through the abstraction to prove the layer works end-to-end.
     vfs.init();
-    vfs.selfTest();
 
-    // Bring up tmpfs (an in-memory, WRITABLE filesystem) and mount it at "/tmp"
-    // through the same VFS layer. Unlike the read-only FAT32 disk, tmpfs stores
-    // files in RAM, so it gives us a place to CREATE and WRITE scratch files at
-    // runtime — the foundation a writable early root (initramfs) builds on. The
-    // mount is unconditional (so "/tmp" is always available); only the verbose
-    // self-test below is debug-log-gated.
+    // Mount the filesystems UNCONDITIONALLY, so the file syscalls (which now route
+    // through the VFS) can reach them on a NORMAL boot — not only when the debug
+    // self-tests below happen to run. Three backends:
+    //   "/"    the FAT32 disk — mounted only when a disk is actually present;
+    //   "/tmp" tmpfs, an in-RAM writable scratch filesystem (always available);
+    //   "/dev" devfs, the device nodes (/dev/null, /dev/zero, /dev/console).
+    // The self-tests further down just EXERCISE these mounts; they no longer do the
+    // mounting themselves (that kept the mounts out of production boots before).
+    if (fat32.isMounted()) _ = vfs.mount("/", vfs.fat32Backend());
     tmpfs.init();
     _ = vfs.mount("/tmp", tmpfs.backend());
-    tmpfs.selfTest(); // debug-gated: write a file to RAM, read it back via the VFS
+    _ = vfs.mount("/dev", devfs.backend());
+    serial.log("[DEVFS] devfs mounted at /dev (null, zero, console).\n", .{}); // debug-only marker
 
-    // Mount the device filesystem (devfs) at "/dev". It is the SECOND VFS backend
-    // and looks nothing like a disk: it serves a fixed set of "device nodes"
-    // (/dev/null, /dev/zero, /dev/console) whose read/write behaviour is driver
-    // code, not stored bytes. Proving these work through the same VFS front door
-    // shows the abstraction isn't secretly FAT32-shaped. The debug-gated self-test
-    // opens /dev/zero + /dev/null and writes /dev/console through the VFS.
-    devfs.selfTest();
+    vfs.selfTest(); // debug-gated: stat + read /HELLO.TXT through the VFS
+    tmpfs.selfTest(); // debug-gated: write a file to RAM, read it back via the VFS
+    devfs.selfTest(); // debug-gated: /dev/zero + /dev/null + /dev/console through the VFS
 
     serial.log("BOOT_OK\n", .{}); // the marker our test harness greps for (debug-log only)
 

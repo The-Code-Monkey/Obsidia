@@ -157,13 +157,8 @@ pub fn write(path: []const u8, bytes: []const u8) ?usize {
 pub fn selfTest() void {
     if (!@import("config").debug_log) return; // normal boot stays silent
 
-    // Mount devfs at "/dev" so "/dev/zero" etc. route here. If the table is full
-    // we cannot proceed — log and bail (boot continues regardless).
-    if (!vfs.mount("/dev", backend())) {
-        serial.log("[DEVFS] self-test: mount table full.\n", .{});
-        return;
-    }
-    serial.log("[DEVFS] devfs mounted at /dev (null, zero, console).\n", .{});
+    // devfs is mounted at "/dev" unconditionally at boot (see main.zig), so
+    // "/dev/zero" etc. already route here — the self-test just exercises them.
 
     // (1) /dev/zero: a read must fill the WHOLE buffer with zero bytes. Pre-poison
     // the buffer with 0xAA so we can tell zeroing actually happened (rather than

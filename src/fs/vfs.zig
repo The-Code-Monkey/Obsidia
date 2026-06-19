@@ -67,6 +67,12 @@ pub const Backend = struct {
         read: *const fn (ctx: *anyopaque, file: *OpenFile, dst: []u8) usize,
         // Same as resolve, but named for callers that only want metadata.
         stat: *const fn (ctx: *anyopaque, path: []const u8) ?Vnode,
+        // OPTIONAL: reposition an open file's cursor to absolute byte `abs_pos`
+        // and return true. Backends that can't seek (character devices like
+        // /dev/zero) leave this null — the VFS then reports the file as
+        // unseekable (lseek -> ESPIPE), matching how POSIX treats a pipe/tty.
+        // The default null means a backend opts in only if it implements it.
+        seek: ?*const fn (ctx: *anyopaque, file: *OpenFile, abs_pos: u64) bool = null,
     };
 };
 
@@ -78,11 +84,20 @@ pub const Backend = struct {
 // the FAT32 backend guards against it ever growing past this.
 pub const OpenFile = struct {
     backend: *const Backend, // which backend's `read` to call
+    // The current absolute byte position, tracked HERE (not in the backend) so
+    // that lseek's SEEK_CUR/SEEK_END work the same for every backend. `read`
+    // advances it; `seek` sets it. `size` is the file's byte length, captured at
+    // open time, so SEEK_END has a base without re-stat'ing.
+    offset: u64 = 0,
+    size: u64 = 0,
     inner: [INNER_SIZE]u8 align(INNER_ALIGN) = undefined, // backend-private reader bytes
 
-    // Forward a read to the owning backend.
+    // Forward a read to the owning backend AND advance our absolute offset by the
+    // number of bytes actually delivered, so `offset` always tracks the cursor.
     pub fn read(self: *OpenFile, dst: []u8) usize {
-        return self.backend.vtable.read(self.backend.ctx, self, dst);
+        const n = self.backend.vtable.read(self.backend.ctx, self, dst);
+        self.offset += n;
+        return n;
     }
 };
 
@@ -178,14 +193,49 @@ pub fn stat(path: []const u8) ?Vnode {
 // mount owns the path, or the backend's open failed (missing / a directory).
 pub fn open(path: []const u8, out: *OpenFile) bool {
     const r = findMount(path) orelse return false;
-    out.backend = &r.mount.backend;
-    return r.mount.backend.vtable.open(r.mount.backend.ctx, r.rel, out);
+    const b = &r.mount.backend;
+    if (!b.vtable.open(b.ctx, r.rel, out)) return false;
+    out.backend = b;
+    out.offset = 0; // a fresh handle starts at the beginning of the file
+    // Capture the size now (for SEEK_END). Devices report 0, which is fine — they
+    // are unseekable anyway (no seek vtable slot), so the size is never used.
+    out.size = if (b.vtable.stat(b.ctx, r.rel)) |v| v.size else 0;
+    return true;
 }
 
-// Read from an already-opened file. Thin pass-through to OpenFile.read so callers
-// can use either `vfs.read(&f, buf)` or `f.read(buf)`.
+// Read from an already-opened file. Thin pass-through to OpenFile.read (which also
+// advances `file.offset`) so callers can use either `vfs.read(&f, buf)` or `f.read(buf)`.
 pub fn read(file: *OpenFile, dst: []u8) usize {
     return file.read(dst);
+}
+
+// How lseek interprets its offset argument: from the start, the current position,
+// or the end of the file. Same numeric values as POSIX SEEK_SET/CUR/END.
+pub const SEEK_SET: u64 = 0;
+pub const SEEK_CUR: u64 = 1;
+pub const SEEK_END: u64 = 2;
+
+// Reposition an open file's cursor. `whence` picks the base (start / current /
+// end) and `delta` is a signed byte offset from it. Returns the new absolute
+// offset, or null if the file is unseekable (its backend has no seek slot — e.g.
+// /dev/zero) or `whence` is invalid. The target is clamped to [0, size]; the math
+// is done in i128 so a hostile `delta` (e.g. lseek(fd, INT64_MAX, SEEK_END)) can't
+// overflow before clamping.
+pub fn seek(file: *OpenFile, whence: u64, delta: i64) ?u64 {
+    const seek_fn = file.backend.vtable.seek orelse return null; // unseekable backend
+    const base: i128 = switch (whence) {
+        SEEK_SET => 0,
+        SEEK_CUR => @intCast(file.offset),
+        SEEK_END => @intCast(file.size),
+        else => return null, // unknown whence
+    };
+    var target: i128 = base + @as(i128, delta); // wide enough never to overflow
+    if (target < 0) target = 0; // can't seek before the start
+    if (target > @as(i128, @intCast(file.size))) target = @intCast(file.size); // clamp at EOF
+    const abs: u64 = @intCast(target);
+    if (!seek_fn(file.backend.ctx, file, abs)) return null; // backend rejected it
+    file.offset = abs; // keep our absolute offset in lock-step with the backend
+    return abs;
 }
 
 // === FAT32 backend ===========================================================
@@ -225,11 +275,21 @@ fn fat32Read(_: *anyopaque, file: *OpenFile, dst: []u8) usize {
     return slot.read(dst);
 }
 
+fn fat32Seek(_: *anyopaque, file: *OpenFile, abs_pos: u64) bool {
+    // FAT32's FileReader already knows how to jump to an absolute byte offset
+    // (forward = skip; backward = rewind to the first cluster + skip). The VFS has
+    // already clamped abs_pos into [0, size], so the @intCast is safe.
+    const slot: *fat32.FileReader = @ptrCast(@alignCast(&file.inner));
+    slot.seekTo(@intCast(abs_pos));
+    return true;
+}
+
 const fat32_vtable = Backend.VTable{
     .resolve = fat32Resolve,
     .open = fat32Open,
     .read = fat32Read,
     .stat = fat32Resolve, // stat is identical to resolve here
+    .seek = fat32Seek, // FAT32 files are seekable
 };
 
 // Build a Backend value bound to the FAT32 driver. Callers do
@@ -249,11 +309,8 @@ pub fn selfTest() void {
         serial.log("[VFS] self-test skipped (no filesystem mounted).\n", .{});
         return;
     }
-    // Mount the FAT32 backend at the root so "/HELLO.TXT" routes to it.
-    if (!mount("/", fat32Backend())) {
-        serial.log("[VFS] self-test: mount table full.\n", .{});
-        return;
-    }
+    // "/" is mounted to the FAT32 backend unconditionally at boot (see main.zig),
+    // so "/HELLO.TXT" already routes here — the self-test just exercises it.
     // stat the file through the abstraction first (metadata path).
     const st = stat("/HELLO.TXT") orelse {
         serial.log("[VFS] self-test: stat /HELLO.TXT failed.\n", .{});
@@ -370,4 +427,84 @@ test "missing file reports null even when a mount owns the path" {
     var state = FakeState{ .exists = false };
     try testing.expect(mount("/", .{ .ctx = &state, .vtable = &fake_vtable }));
     try testing.expect(stat("/ghost") == null);
+}
+
+// A seekable fake backend: its reader hands out N bytes total, and `seek` records
+// the absolute position. Used to test the VFS's offset tracking + seek math
+// independent of any real filesystem.
+const SEEK_FAKE_SIZE: u64 = 100;
+const SeekFakeReader = struct { pos: u64 };
+fn seekFakeResolve(_: *anyopaque, _: []const u8) ?Vnode {
+    return .{ .kind = .file, .size = SEEK_FAKE_SIZE, .handle = 0 };
+}
+fn seekFakeOpen(_: *anyopaque, _: []const u8, out: *OpenFile) bool {
+    const slot: *SeekFakeReader = @ptrCast(@alignCast(&out.inner));
+    slot.* = .{ .pos = 0 };
+    return true;
+}
+fn seekFakeRead(_: *anyopaque, file: *OpenFile, dst: []u8) usize {
+    const slot: *SeekFakeReader = @ptrCast(@alignCast(&file.inner));
+    const left = SEEK_FAKE_SIZE - slot.pos;
+    const n = @min(@as(u64, dst.len), left);
+    slot.pos += n;
+    return @intCast(n);
+}
+fn seekFakeSeek(_: *anyopaque, file: *OpenFile, abs_pos: u64) bool {
+    const slot: *SeekFakeReader = @ptrCast(@alignCast(&file.inner));
+    slot.pos = abs_pos;
+    return true;
+}
+const seek_fake_vtable = Backend.VTable{
+    .resolve = seekFakeResolve,
+    .open = seekFakeOpen,
+    .read = seekFakeRead,
+    .stat = seekFakeResolve,
+    .seek = seekFakeSeek,
+};
+
+test "open captures size and read advances the absolute offset" {
+    init();
+    var st: u8 = 0;
+    try testing.expect(mount("/", .{ .ctx = &st, .vtable = &seek_fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/file", &f));
+    try testing.expectEqual(@as(u64, SEEK_FAKE_SIZE), f.size); // captured at open
+    try testing.expectEqual(@as(u64, 0), f.offset);
+    var buf: [10]u8 = undefined;
+    _ = f.read(&buf);
+    try testing.expectEqual(@as(u64, 10), f.offset); // read moved the cursor
+}
+
+test "seek SET/CUR/END land at the right absolute offset" {
+    init();
+    var st: u8 = 0;
+    try testing.expect(mount("/", .{ .ctx = &st, .vtable = &seek_fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/file", &f));
+    try testing.expectEqual(@as(?u64, 30), seek(&f, SEEK_SET, 30)); // absolute 30
+    try testing.expectEqual(@as(u64, 30), f.offset);
+    try testing.expectEqual(@as(?u64, 35), seek(&f, SEEK_CUR, 5)); // 30 + 5
+    try testing.expectEqual(@as(?u64, 90), seek(&f, SEEK_END, -10)); // size 100 - 10
+}
+
+test "seek clamps to [0, size] and rejects a bad whence" {
+    init();
+    var st: u8 = 0;
+    try testing.expect(mount("/", .{ .ctx = &st, .vtable = &seek_fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/file", &f));
+    try testing.expectEqual(@as(?u64, 0), seek(&f, SEEK_SET, -50)); // clamps below 0
+    try testing.expectEqual(@as(?u64, SEEK_FAKE_SIZE), seek(&f, SEEK_SET, 9999)); // clamps at EOF
+    // A wildly negative delta from END must not overflow before clamping.
+    try testing.expectEqual(@as(?u64, 0), seek(&f, SEEK_END, std.math.minInt(i64)));
+    try testing.expect(seek(&f, 99, 0) == null); // unknown whence -> null
+}
+
+test "an unseekable backend (no seek slot) reports null from seek" {
+    init();
+    var state = FakeState{}; // fake_vtable has no .seek -> defaults to null
+    try testing.expect(mount("/", .{ .ctx = &state, .vtable = &fake_vtable }));
+    var f: OpenFile = undefined;
+    try testing.expect(open("/x", &f));
+    try testing.expect(seek(&f, SEEK_SET, 0) == null); // unseekable -> null (ESPIPE)
 }
