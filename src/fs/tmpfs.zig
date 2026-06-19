@@ -222,6 +222,25 @@ fn tmpfsSeek(_: *anyopaque, file: *vfs.OpenFile, abs_pos: u64) bool {
     return true;
 }
 
+// Copy bytes from `src` INTO the open file at the handle's current `pos`, the WRITE
+// mirror of tmpfsRead. Stores as many bytes as fit before the per-file cap
+// (MAX_FILE_SIZE), advances `pos` past them, and grows the file's length if the
+// write extended past the old end. Returns how many bytes were actually stored
+// (which may be FEWER than src.len if the write would overflow the file's fixed
+// buffer — the caller learns it could only place a prefix). A write that starts at
+// or past the cap stores nothing and returns 0.
+fn tmpfsWrite(_: *anyopaque, file: *vfs.OpenFile, src: []const u8) usize {
+    const slot: *Reader = @ptrCast(@alignCast(&file.inner));
+    const e = &files[slot.index];
+    if (slot.pos >= MAX_FILE_SIZE) return 0; // no room left in this file's buffer
+    const room = MAX_FILE_SIZE - slot.pos; // bytes that still fit before the cap
+    const n = @min(room, src.len); // store at most what fits / what was asked
+    @memcpy(e.data[slot.pos .. slot.pos + n], src[0..n]); // land the bytes in RAM
+    slot.pos += n; // advance the cursor past what we wrote
+    if (slot.pos > e.len) e.len = slot.pos; // grow the file if we wrote past its end
+    return n; // bytes actually stored (may be < src.len at the cap)
+}
+
 // The vtable wiring tmpfs's operations into the shape the VFS expects. resolve and
 // stat are the same function (metadata lookup is identical for both). tmpfs files
 // are seekable, so we provide the optional `seek` slot.
@@ -231,6 +250,7 @@ const tmpfs_vtable = vfs.Backend.VTable{
     .read = tmpfsRead,
     .stat = tmpfsResolve,
     .seek = tmpfsSeek,
+    .write = tmpfsWrite, // tmpfs is WRITABLE: streaming fd writes land in RAM
 };
 
 var tmpfs_dummy_ctx: u8 = 0; // a real address to hand out as the opaque ctx
@@ -401,4 +421,65 @@ test "writing more than the per-file cap is rejected" {
     try create("big");
     const toobig = [_]u8{0} ** (MAX_FILE_SIZE + 1);
     try testing.expectError(Error.FileTooBig, write("big", &toobig));
+}
+
+// --- Streaming fd write path (tmpfsWrite via the VFS vtable) ------------------
+// These exercise the new vtable write slot directly (the VFS would call exactly
+// this), driving it through an open handle just like the syscall path does.
+
+test "tmpfsWrite stores bytes at the cursor and grows the file length" {
+    init();
+    try create("w.txt");
+    var f: vfs.OpenFile = undefined;
+    f.backend = undefined; // we call the vtable fns directly, not via the backend
+    try testing.expect(tmpfsOpen(&tmpfs_dummy_ctx, "/w.txt", &f));
+    // Write a string into the empty file; it should store all of it and grow len.
+    const n = tmpfsWrite(&tmpfs_dummy_ctx, &f, "hello world");
+    try testing.expectEqual(@as(usize, 11), n);
+    const v = tmpfsResolve(&tmpfs_dummy_ctx, "/w.txt").?;
+    try testing.expectEqual(@as(u64, 11), v.size); // file grew to the written length
+}
+
+test "tmpfsWrite then read back returns exactly the written bytes" {
+    init();
+    try create("rt");
+    var f: vfs.OpenFile = undefined;
+    f.backend = undefined;
+    try testing.expect(tmpfsOpen(&tmpfs_dummy_ctx, "/rt", &f));
+    _ = tmpfsWrite(&tmpfs_dummy_ctx, &f, "round-trip");
+    // Rewind the reader to the start and read the bytes back out.
+    try testing.expect(tmpfsSeek(&tmpfs_dummy_ctx, &f, 0));
+    var buf: [32]u8 = undefined;
+    const r = tmpfsRead(&tmpfs_dummy_ctx, &f, &buf);
+    try testing.expectEqualStrings("round-trip", buf[0..r]);
+}
+
+test "tmpfsWrite mid-file overwrites in place without shrinking the file" {
+    init();
+    try create("mid");
+    var f: vfs.OpenFile = undefined;
+    f.backend = undefined;
+    try testing.expect(tmpfsOpen(&tmpfs_dummy_ctx, "/mid", &f));
+    _ = tmpfsWrite(&tmpfs_dummy_ctx, &f, "AAAAAAAA"); // 8 bytes, len = 8
+    try testing.expect(tmpfsSeek(&tmpfs_dummy_ctx, &f, 2)); // cursor at byte 2
+    _ = tmpfsWrite(&tmpfs_dummy_ctx, &f, "BB"); // overwrite bytes 2..4, len stays 8
+    const v = tmpfsResolve(&tmpfs_dummy_ctx, "/mid").?;
+    try testing.expectEqual(@as(u64, 8), v.size); // an in-place write didn't shrink it
+    try testing.expect(tmpfsSeek(&tmpfs_dummy_ctx, &f, 0));
+    var buf: [8]u8 = undefined;
+    const r = tmpfsRead(&tmpfs_dummy_ctx, &f, &buf);
+    try testing.expectEqualStrings("AABBAAAA", buf[0..r]);
+}
+
+test "tmpfsWrite caps at MAX_FILE_SIZE and reports the bytes that fit" {
+    init();
+    try create("cap");
+    var f: vfs.OpenFile = undefined;
+    f.backend = undefined;
+    try testing.expect(tmpfsOpen(&tmpfs_dummy_ctx, "/cap", &f));
+    // Start one byte before the cap, then ask to write 4: only one byte fits.
+    try testing.expect(tmpfsSeek(&tmpfs_dummy_ctx, &f, MAX_FILE_SIZE - 1));
+    try testing.expectEqual(@as(usize, 1), tmpfsWrite(&tmpfs_dummy_ctx, &f, "ABCD"));
+    // Now the cursor sits exactly at the cap: a further write stores nothing.
+    try testing.expectEqual(@as(usize, 0), tmpfsWrite(&tmpfs_dummy_ctx, &f, "X"));
 }
