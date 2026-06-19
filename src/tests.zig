@@ -15,4 +15,5 @@ test {
     _ = @import("fs/devfs.zig"); // devfs device nodes: /dev/null (EOF), /dev/zero (zeros), /dev/console (writes)
     _ = @import("arch/idt.zig"); // fault->signal vector mapping (pure default-action table)
     _ = @import("sched/scheduler.zig"); // wait/reap lifecycle: slot selection, zombie retention, reaping
+    _ = @import("arch/syscall.zig"); // path normalization: "."/".." collapse + relative->absolute join
 }
