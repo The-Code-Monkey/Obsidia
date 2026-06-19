@@ -19,8 +19,29 @@ const syscall = @import("../arch/syscall.zig"); // per-process syscall kernel st
 const usermode = @import("../arch/usermode.zig"); // enterRing3 (first user dispatch)
 const pmm = @import("../mm/pmm.zig"); // frames for the demo's user pages
 const tty = @import("../tty.zig"); // terminal foreground + Ctrl-C interrupt flag
+const fat32 = @import("../fs/fat32.zig"); // FileReader for open file descriptors
 
 const MAX_THREADS = 16; // also the number of guarded stack slots (kstack.MAX_STACKS)
+
+// --- Per-process file-descriptor table ---------------------------------------
+// A process refers to an open file by a small integer (a "file descriptor"). The
+// kernel keeps, per process, a fixed-size array mapping each descriptor to the
+// open file it names; an empty slot is `null`. By POSIX convention the first
+// three descriptors are reserved: 0 = stdin, 1 = stdout, 2 = stderr. We don't
+// model real stdin/stdout files yet (writes to fd 1/2 still go straight to the
+// serial console), so those slots stay `null` and are simply never handed out by
+// open(); a freshly opened file gets the LOWEST free descriptor at or above 3.
+pub const FD_MAX = 16; // descriptors 0..15 per process (0/1/2 reserved)
+pub const FD_FIRST_FREE: usize = 3; // open() allocates from here up (0/1/2 reserved)
+
+// One open file: the FAT32 streaming cursor that tracks where in the file we are.
+// `dup` makes a second descriptor refer to the same file; we model that by copying
+// the cursor (each fd then has its own independent position), which is enough for
+// the read/lseek/dup self-test. Reference-counted shared offsets are a later
+// refinement once real shared-fd semantics (e.g. dup2 onto a pipe) are needed.
+pub const OpenFile = struct {
+    reader: fat32.FileReader, // the file's streaming read cursor
+};
 
 // The low-level context switch, written in assembly (a normal Zig function with
 // a compiler prologue would corrupt the hand-managed stack). It saves the
@@ -65,6 +86,10 @@ const Thread = struct {
     kstack_top: u64 = 0, // ring-0 stack top for this thread's traps/syscalls
     user_entry: u64 = 0, // ring-3 entry point (user processes only)
     user_stack: u64 = 0, // ring-3 stack top (user processes only)
+    // Per-process open-file table. Every slot starts empty (`null`); the file
+    // syscalls (open/close/read/lseek/dup) hand out and reclaim slots. Kernel
+    // threads have one too but never use it — they don't make file syscalls.
+    fd: [FD_MAX]?OpenFile = [_]?OpenFile{null} ** FD_MAX,
 };
 
 var threads: [MAX_THREADS]Thread = undefined;
@@ -201,6 +226,43 @@ pub fn sleep(ticks: u64) void {
 // The running thread's id (e.g. so it can register itself to be woken later).
 pub fn currentId() usize {
     return current;
+}
+
+// The currently-running process's open-file table. The file syscalls call this to
+// read and mutate the caller's descriptors. It's a pointer into the live thread
+// slot, so changes (open/close/dup) persist for the process. Single-core +
+// syscalls-run-with-interrupts-masked means no locking is needed here.
+pub fn currentFdTable() *[FD_MAX]?OpenFile {
+    return &threads[current].fd;
+}
+
+// Empty the current process's descriptor table (every slot -> null). Used by the
+// file-syscall boot self-test to start from a known-clean table; real process
+// teardown will reuse this idea once it frees a process's fds on exit.
+pub fn resetCurrentFds() void {
+    threads[current].fd = [_]?OpenFile{null} ** FD_MAX;
+}
+
+// Find the lowest free descriptor at or above FD_FIRST_FREE in `table` (0/1/2 are
+// reserved for stdin/stdout/stderr and never handed out by open/dup). Returns the
+// index, or null if every slot is taken. A pure helper so the allocation policy
+// can be unit-tested without a live process.
+fn lowestFreeFd(table: *const [FD_MAX]?OpenFile) ?usize {
+    var i: usize = FD_FIRST_FREE;
+    while (i < FD_MAX) : (i += 1) {
+        if (table[i] == null) return i; // first empty slot, lowest index first
+    }
+    return null; // table full
+}
+
+// Allocate the lowest free descriptor for `file` in the current process's table,
+// returning the fd, or null if the table is full. The file syscalls (open, dup)
+// go through here so the "lowest free fd" rule lives in exactly one place.
+pub fn allocFd(file: OpenFile) ?usize {
+    const table = currentFdTable();
+    const i = lowestFreeFd(table) orelse return null;
+    table[i] = file;
+    return i;
 }
 
 // Block the current thread indefinitely until wake() is called on it (event
