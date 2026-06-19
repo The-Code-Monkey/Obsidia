@@ -156,6 +156,12 @@ check_markers() { # check_markers <log> <prefix-label>
     assert_in "$log" "exit syscall returned to the kernel"       "$p exit() syscall: returned control to the kernel"
     assert_in "$log" "Address-space self-test OK"                "$p VMM: per-process address space (create/switch/isolate/destroy)"
     assert_in "$log" "User-process self-test OK"                 "$p process model: ring-3 process + kernel thread co-scheduled across address spaces"
+    # Fault -> signal: a ring-3 page fault must TERMINATE the process (SIGSEGV,
+    # exit code 139) and return to the kernel, NOT dump-and-halt. Assert both the
+    # IDT-side termination marker and the self-test's "returned to the kernel" line
+    # — the latter only logs if control came back (proving the box did not halt).
+    assert_in "$log" "user fault -> SIGSEGV, process terminated (code 139)" "$p fault->signal: ring-3 page fault delivered SIGSEGV (terminate, code 139)"
+    assert_in "$log" "Fault->signal self-test OK"                "$p fault->signal: faulting process terminated + kernel returned (no halt)"
     assert_in "$log" "[PCI] Enumeration complete:"               "$p PCI: bus enumeration completed (config mechanism #1)"
     assert_in "$log" "[PCI] probing"                             "$p PCI: driver registry probed registered drivers"
     assert_in "$log" "class 01.06 prog-if 01"                    "$p PCI: decoded the AHCI controller (class/subclass/prog-if)"

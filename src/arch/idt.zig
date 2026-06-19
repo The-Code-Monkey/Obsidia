@@ -12,7 +12,7 @@
 // single common trampoline (`isrCommon`) that saves all GP registers, calls the
 // Zig handler with a pointer to the frame, restores, and `iretq`s.
 
-const std = @import("std"); // for comptimePrint when generating stubs
+const std = @import("std"); // for comptimePrint when generating stubs (+ inline tests)
 const serial = @import("../drivers/serial.zig"); // logging
 const config = @import("config"); // build-time flags (debug_log)
 const gdt = @import("gdt.zig"); // for the KERNEL_CODE selector used in gates
@@ -84,6 +84,15 @@ var idtr: Idtr = undefined; // the pointer we feed to lidt
 // code. The hook returns true if it handled the fault (the frame may be rewritten
 // to change where iretq resumes); false to fall through to the normal dump.
 pub var fault_hook: ?*const fn (*InterruptFrame) bool = null;
+
+// Optional USER-fault hook: how to terminate the *current* ring-3 process when it
+// triggers a fatal CPU fault (page fault / #GP / illegal opcode / divide error).
+// The scheduler installs this (via main.zig) to mark the faulting process finished
+// and return to the shell — the kernel must not halt just because a *user* program
+// misbehaved. It takes the conventional exit code (128 + signal number) and never
+// returns (control resumes in the launcher thread). Left null before user mode is
+// live, in which case a CPL3 fault falls through to the normal dump path.
+pub var user_fault_hook: ?*const fn (u64) noreturn = null;
 
 // Vectors that push a hardware error code onto the stack. For all others we push
 // a dummy 0 so the stack frame is uniform.
@@ -215,6 +224,27 @@ fn exceptionName(v: u64) []const u8 {
     };
 }
 
+// --- Fault -> signal mapping -------------------------------------------------
+// A user (CPL3) process that takes a fatal CPU fault is terminated as if it were
+// killed by the conventional POSIX signal for that fault, whose default action is
+// to kill the process. The exit code a shell reports for a signal-killed process
+// is 128 + the signal number, so we map each handled vector straight to that code:
+//   #DE  (vector 0)  divide error    -> SIGFPE (8)  -> exit 136
+//   #UD  (vector 6)  invalid opcode   -> SIGILL (4)  -> exit 132
+//   #GP  (vector 13) protection fault -> SIGSEGV(11) -> exit 139
+//   #PF  (vector 14) page fault       -> SIGSEGV(11) -> exit 139
+// Any other vector returns null (we don't deliver a default-action signal for it
+// from user mode — it falls through to the normal dump path).
+const UserSignal = struct { name: []const u8, code: u64 };
+fn userFaultSignal(vector: u64) ?UserSignal {
+    return switch (vector) {
+        0 => .{ .name = "SIGFPE", .code = 136 }, // #DE: 128 + 8
+        6 => .{ .name = "SIGILL", .code = 132 }, // #UD: 128 + 4
+        13, 14 => .{ .name = "SIGSEGV", .code = 139 }, // #GP / #PF: 128 + 11
+        else => null,
+    };
+}
+
 // Print the full machine state for a CPU exception to serial.
 fn dumpException(f: *InterruptFrame) void {
     serial.print("\n", .{});
@@ -261,6 +291,22 @@ export fn isrHandler(frame: *InterruptFrame) callconv(.C) void {
         // where iretq resumes, so we neither dump nor halt.
         if (fault_hook) |hook| {
             if (hook(frame)) return;
+        }
+        // No hook handled it. If the fault came from RING 3 (CPL = CS & 3 == 3),
+        // it's a *user* program crashing, not the kernel: deliver the default-action
+        // signal for the fault (terminate the process) and return to the shell,
+        // rather than halting the whole machine. Kernel-mode faults (CPL 0) skip
+        // this and keep today's dump-and-halt — a kernel fault IS fatal to the box.
+        if (frame.cs & 3 == 3) {
+            if (userFaultSignal(frame.vector)) |sig| {
+                if (user_fault_hook) |terminate| {
+                    // Diagnostic only (debug-log-gated): which process, which fault,
+                    // which signal, and the exit code the shell will see. Proves we
+                    // terminated the process instead of dumping + halting.
+                    serial.log("[IDT] user fault -> {s}, process terminated (code {d}) [vector {d} {s}]\n", .{ sig.name, sig.code, frame.vector, exceptionName(frame.vector) });
+                    terminate(sig.code); // noreturn: marks the process finished + yields to the launcher
+                }
+            }
         }
         dumpException(frame); // print the crash dump
         // #BP (breakpoint) is recoverable and used as our self-test, so return
@@ -317,4 +363,26 @@ pub fn init() void {
     }
 
     serial.log("[IDT] IDT initialized.\n", .{});
+}
+
+// --- Inline tests ------------------------------------------------------------
+// The fault->signal mapping is pure data, so we can check it on the host: each
+// terminating CPU vector must map to the conventional "128 + signal" exit code,
+// and every non-terminating vector must map to null (so it never silently kills a
+// user process). 128 + signal: SIGFPE=8 -> 136, SIGILL=4 -> 132, SIGSEGV=11 -> 139.
+test "userFaultSignal maps the terminating vectors to 128+signal" {
+    try std.testing.expectEqual(@as(u64, 136), userFaultSignal(0).?.code); // #DE -> SIGFPE
+    try std.testing.expectEqualStrings("SIGFPE", userFaultSignal(0).?.name);
+    try std.testing.expectEqual(@as(u64, 132), userFaultSignal(6).?.code); // #UD -> SIGILL
+    try std.testing.expectEqualStrings("SIGILL", userFaultSignal(6).?.name);
+    try std.testing.expectEqual(@as(u64, 139), userFaultSignal(13).?.code); // #GP -> SIGSEGV
+    try std.testing.expectEqual(@as(u64, 139), userFaultSignal(14).?.code); // #PF -> SIGSEGV
+    try std.testing.expectEqualStrings("SIGSEGV", userFaultSignal(14).?.name);
+}
+
+test "userFaultSignal returns null for vectors we don't default-kill on" {
+    try std.testing.expectEqual(@as(?UserSignal, null), userFaultSignal(3)); // #BP (recoverable)
+    try std.testing.expectEqual(@as(?UserSignal, null), userFaultSignal(8)); // #DF (kernel-fatal)
+    try std.testing.expectEqual(@as(?UserSignal, null), userFaultSignal(1)); // #DB
+    try std.testing.expectEqual(@as(?UserSignal, null), userFaultSignal(32)); // an IRQ vector
 }
