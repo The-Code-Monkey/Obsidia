@@ -27,6 +27,7 @@ const rtc = @import("drivers/rtc.zig"); // RTC / CMOS wall-clock (date + time)
 const tsc = @import("drivers/tsc.zig"); // TSC monotonic clock (high-res ns since boot)
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const vfs = @import("fs/vfs.zig"); // virtual filesystem layer (mount/vnode over FAT32)
+const tmpfs = @import("fs/tmpfs.zig"); // in-memory writable filesystem mounted at /tmp
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
@@ -367,6 +368,16 @@ export fn _start() noreturn {
     // file through the abstraction to prove the layer works end-to-end.
     vfs.init();
     vfs.selfTest();
+
+    // Bring up tmpfs (an in-memory, WRITABLE filesystem) and mount it at "/tmp"
+    // through the same VFS layer. Unlike the read-only FAT32 disk, tmpfs stores
+    // files in RAM, so it gives us a place to CREATE and WRITE scratch files at
+    // runtime — the foundation a writable early root (initramfs) builds on. The
+    // mount is unconditional (so "/tmp" is always available); only the verbose
+    // self-test below is debug-log-gated.
+    tmpfs.init();
+    _ = vfs.mount("/tmp", tmpfs.backend());
+    tmpfs.selfTest(); // debug-gated: write a file to RAM, read it back via the VFS
 
     serial.log("BOOT_OK\n", .{}); // the marker our test harness greps for (debug-log only)
 

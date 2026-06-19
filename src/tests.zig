@@ -11,5 +11,6 @@ test {
     _ = @import("fs/gpt.zig"); // GPT layout: protective MBR, headers, CRCs
     _ = @import("fs/fatformat.zig"); // FAT32 mkfs: BPB, FSInfo, FATs, root
     _ = @import("fs/lfn.zig"); // FAT32 long-name encoding: alias, checksum, entries
+    _ = @import("fs/tmpfs.zig"); // tmpfs: in-memory create/write/read + VFS-backed reads
     _ = @import("arch/idt.zig"); // fault->signal vector mapping (pure default-action table)
 }
