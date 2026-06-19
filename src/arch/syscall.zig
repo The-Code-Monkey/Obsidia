@@ -47,7 +47,7 @@ pub const SYS_close: u64 = 5; // close(fd) -> 0, or -errno
 pub const SYS_read: u64 = 6; // read(fd, ptr, len) -> bytes read (0 = EOF) or -errno
 pub const SYS_lseek: u64 = 7; // lseek(fd, off, whence) -> new offset or -errno
 pub const SYS_dup: u64 = 8; // dup(fd) -> new fd (lowest free) or -errno
-// (number 9 is reserved for the next file syscall; the plan numbers these 4..9.)
+pub const SYS_wait: u64 = 9; // wait(status_ptr) -> pid of the reaped child, or -ECHILD
 
 const ENOSYS: u64 = @bitCast(@as(i64, -38)); // unknown syscall
 const EBADF: u64 = @bitCast(@as(i64, -9)); // bad file descriptor
@@ -55,6 +55,7 @@ const EFAULT: u64 = @bitCast(@as(i64, -14)); // bad (out-of-bounds) user address
 const EINVAL: u64 = @bitCast(@as(i64, -22)); // invalid argument (e.g. bad whence)
 const EMFILE: u64 = @bitCast(@as(i64, -24)); // too many open files (fd table full)
 const ENOENT: u64 = @bitCast(@as(i64, -2)); // no such file or directory
+const ECHILD: u64 = @bitCast(@as(i64, -10)); // wait() with no child to wait for
 
 // lseek `whence` values (POSIX): the offset is interpreted relative to the start
 // of the file, the current cursor, or the end of the file respectively.
@@ -84,6 +85,7 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
         SYS_read => sysRead(a1, a2, a3),
         SYS_lseek => sysLseek(a1, a2, a3),
         SYS_dup => sysDup(a1),
+        SYS_wait => sysWait(a1),
         else => ENOSYS,
     };
 }
@@ -250,6 +252,39 @@ fn sysLseek(fd: u64, off: u64, whence: u64) u64 {
 fn sysDup(fd: u64) u64 {
     const file = openFileFor(fd) orelse return EBADF; // nothing to duplicate
     return scheduler.allocFd(file.*) orelse EMFILE; // copy the cursor into a new slot
+}
+
+// wait(status_ptr): block until the calling thread's most-recently-spawned child
+// process finishes, collect (reap) it, and return its PID. If `status_ptr` is
+// non-null, the child's exit code is written there (so the parent learns both WHICH
+// child ended and HOW). With no child to wait on we return ECHILD (POSIX), matching
+// `waitpid` when the caller has no unwaited children. This is the syscall face of
+// scheduler.waitForChild(): the scheduler does the block-until-zombie + reap; this
+// handler just validates the user pointer and marshals the result.
+//
+// status_ptr is validated exactly like every other user pointer: a RANGE check (the
+// 8-byte word lies in the user half, below USER_LIMIT) then a PAGE check (mapped +
+// user-accessible), and the single store is bracketed by STAC/CLAC so SMAP stays
+// armed everywhere else. status_ptr == 0 means "don't report the code" (POSIX NULL).
+//
+// Validation happens BEFORE we collect the child: waitForChild() reaps the zombie
+// (the child is gone afterwards, its exit code unrecoverable), so a bad status_ptr
+// must be rejected up front — otherwise wait(badptr) would silently consume the
+// child and the parent could never learn how it ended. With the check first, an
+// EFAULT leaves the child still waitable for a retry with a good pointer.
+fn sysWait(status_ptr: u64) u64 {
+    if (status_ptr != 0) { // the caller wants the exit code written back: vet the pointer first
+        if (status_ptr >= USER_LIMIT or 8 > USER_LIMIT - status_ptr) return EFAULT; // escapes user space
+        if (!vmm.userRangeAccessible(vmm.activeSpace(), status_ptr, 8)) return EFAULT; // unmapped / kernel-only
+    }
+    const result = scheduler.waitForChild(); // block-until-zombie -> read code -> reap
+    if (result.pid == scheduler.noChild()) return ECHILD; // nothing to wait on
+    if (status_ptr != 0) { // pointer already validated above; just do the guarded store
+        asm volatile ("stac"); // lift SMAP for exactly this one store
+        defer asm volatile ("clac");
+        @as(*u64, @ptrFromInt(status_ptr)).* = result.code; // hand the exit code back to ring 3
+    }
+    return result.pid; // the reaped child's PID (its thread-table slot index)
 }
 
 // The `syscall` entry point (the LSTAR target). Global naked asm: switch to the
