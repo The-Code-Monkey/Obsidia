@@ -28,6 +28,7 @@ const tsc = @import("drivers/tsc.zig"); // TSC monotonic clock (high-res ns sinc
 const fat32 = @import("fs/fat32.zig"); // FAT32 filesystem (read-only)
 const vfs = @import("fs/vfs.zig"); // virtual filesystem layer (mount/vnode over FAT32)
 const tmpfs = @import("fs/tmpfs.zig"); // in-memory writable filesystem mounted at /tmp
+const devfs = @import("fs/devfs.zig"); // device filesystem: /dev/null, /dev/zero, /dev/console (2nd VFS backend)
 const loader = @import("loader.zig"); // ELF64/flat program loader (runs the init binary)
 const acpi = @import("acpi/acpi.zig"); // ACPI table parsing
 const scheduler = @import("sched/scheduler.zig"); // cooperative kernel threads
@@ -378,6 +379,14 @@ export fn _start() noreturn {
     tmpfs.init();
     _ = vfs.mount("/tmp", tmpfs.backend());
     tmpfs.selfTest(); // debug-gated: write a file to RAM, read it back via the VFS
+
+    // Mount the device filesystem (devfs) at "/dev". It is the SECOND VFS backend
+    // and looks nothing like a disk: it serves a fixed set of "device nodes"
+    // (/dev/null, /dev/zero, /dev/console) whose read/write behaviour is driver
+    // code, not stored bytes. Proving these work through the same VFS front door
+    // shows the abstraction isn't secretly FAT32-shaped. The debug-gated self-test
+    // opens /dev/zero + /dev/null and writes /dev/console through the VFS.
+    devfs.selfTest();
 
     serial.log("BOOT_OK\n", .{}); // the marker our test harness greps for (debug-log only)
 
