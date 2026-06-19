@@ -19,6 +19,7 @@ const scheduler = @import("../sched/scheduler.zig"); // SYS_yield hands off the 
 const vmm = @import("../mm/vmm.zig"); // validate user pointers against the page tables
 const fat32 = @import("../fs/fat32.zig"); // self-test: gate on the FAT32 disk being mounted
 const vfs = @import("../fs/vfs.zig"); // file syscalls route through the VFS (any backend)
+const tmpfs = @import("../fs/tmpfs.zig"); // self-test: seed a writable /tmp file for the write path
 
 // A dedicated ring-0 stack the entry stub switches to (`syscall` doesn't load one
 // for us). A single static stack is safe for now because the handler runs with
@@ -58,6 +59,7 @@ const EMFILE: u64 = @bitCast(@as(i64, -24)); // too many open files (fd table fu
 const ENOENT: u64 = @bitCast(@as(i64, -2)); // no such file or directory
 const ECHILD: u64 = @bitCast(@as(i64, -10)); // wait() with no child to wait for
 const ESPIPE: u64 = @bitCast(@as(i64, -29)); // lseek on an unseekable fd (e.g. /dev/zero)
+const EROFS: u64 = @bitCast(@as(i64, -30)); // write to a read-only fd (e.g. a FAT32 file)
 
 // lseek `whence` values (POSIX): the offset is interpreted relative to the start
 // of the file, the current cursor, or the end of the file respectively.
@@ -102,23 +104,23 @@ fn openFileFor(fd: u64) ?*scheduler.OpenFile {
     return null; // empty slot -> bad descriptor
 }
 
-// write(fd, ptr, len): copy `len` bytes from the user buffer to serial (the only
-// sink for now). fd 1 (stdout) / 2 (stderr) only — any other descriptor is EBADF.
-// The order of checks matters: a bad descriptor is reported (EBADF) before the
-// buffer is even looked at, matching POSIX (and the behavior this syscall had
-// before the fd table existed).
+// write(fd, ptr, len): copy `len` bytes from the user buffer to the descriptor's
+// sink. fd 1 (stdout) / 2 (stderr) go to the serial console; any other fd must name
+// an open file, and the bytes are streamed THROUGH the VFS into its backend (tmpfs
+// lands them in RAM, devfs sinks/consoles them; a read-only backend like FAT32
+// reports EROFS). The order of checks matches POSIX: a bad descriptor is reported
+// (EBADF) before the buffer is even looked at.
 fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
-    // Validate the descriptor FIRST (EBADF before EFAULT, like POSIX): fd 1 (stdout)
-    // / 2 (stderr) go to the serial console (the only terminal sink we have); any
-    // other fd must name a file the process opened, or it's a bad descriptor.
-    // Write-to-file isn't a streaming append yet: the FAT32 write path (writeFile)
-    // overwrites a whole file at once, so a file-fd write here would be a
-    // no-op-or-clobber. We therefore reject file-fd writes for now (EBADF) and keep
-    // fd 1/2 -> serial; the read/seek/dup side is this milestone. (A buffered
-    // file-append write is a clean follow-up.)
-    if (fd != 1 and fd != 2) return EBADF;
+    // Resolve the descriptor FIRST (EBADF before EFAULT, like POSIX). fd 1/2 are the
+    // serial console; for any other fd we need a matching open file (else EBADF). We
+    // look the file up here, before touching the user buffer, so a bad fd is rejected
+    // even for a zero-length write and before any user-pointer work.
+    var file: ?*scheduler.OpenFile = null;
+    if (fd != 1 and fd != 2) {
+        file = openFileFor(fd) orelse return EBADF; // not stdout/stderr and not an open file
+    }
     if (len == 0) return 0;
-    const n = @min(len, 4096);
+    const n = @min(len, 4096); // bound a single write like sysRead bounds a read
     // Validate the user buffer in two steps so a hostile or buggy caller can never
     // make the kernel touch memory it shouldn't: first a RANGE check (the whole
     // buffer lies in the user half, below USER_LIMIT — not the kernel's higher
@@ -130,11 +132,20 @@ fn sysWrite(fd: u64, ptr: u64, len: u64) u64 {
     // This is one of the few places the kernel dereferences a raw user pointer.
     // With SMAP on, a ring-0 access to a U=1 page faults unless we lift the guard:
     // STAC sets RFLAGS.AC (access allowed), CLAC clears it again. We re-arm via
-    // defer so the window is exactly the buffer copy below and nothing more —
+    // defer so the window is exactly the buffer use below and nothing more —
     // leaving AC set would silently disable SMAP for the rest of this syscall.
     asm volatile ("stac");
     defer asm volatile ("clac");
     const buf = @as([*]const u8, @ptrFromInt(ptr))[0..n];
+    if (file) |f| {
+        // A file fd: stream the bytes into its backend via the VFS, which advances
+        // the handle's offset (keeping a later SEEK_CUR/read correct). A null return
+        // means the backend is read-only (no write slot, e.g. FAT32) -> EROFS. The
+        // backend's write runs under the STAC window, but it only READS `buf` (the
+        // user page we just OK'd) and writes to its own storage, so that's safe.
+        return vfs.write(&f.file, buf) orelse return EROFS;
+    }
+    // fd 1/2: the serial console, the always-on terminal sink.
     serial.print("{s}", .{buf});
     return n;
 }
@@ -489,6 +500,78 @@ pub fn selfTest() void {
             break :blk false;
         }
         _ = syscallDispatch(SYS_close, dfd, 0, 0);
+
+        // --- Prove the WRITE path through the fd ABI ---------------------------
+        // sysWrite used to reject every file fd (EBADF). Now a writable backend can
+        // be written THROUGH the write syscall, the cursor advances, and the bytes
+        // can be read back. We prove three things: a tmpfs round-trip (write then
+        // lseek 0 then read returns the same bytes), a /dev/null write succeeds
+        // (returns the byte count), and a FAT32 file write is refused with EROFS.
+
+        // (a) tmpfs round-trip. Seed an empty file directly in tmpfs (so the test is
+        // self-contained, not relying on the tmpfs self-test having run), open it
+        // through the fd ABI, write a known string, rewind, and read it back.
+        const TMP = "/tmp/fdwrite.txt"; // routes to tmpfs (mounted at /tmp)
+        const MSG = "fd write path!"; // the bytes we round-trip
+        tmpfs.create("fdwrite.txt") catch {
+            serial.log("[FD] FAIL: tmpfs.create for the write-path test failed.\n", .{});
+            break :blk false;
+        };
+        @memcpy(path_kalias[0..TMP.len], TMP); // put the path in the user page
+        const tfd = syscallDispatch(SYS_open, U_PATH, TMP.len, 0);
+        if (tfd != 3) { // table empty after the closes above -> lowest free is 3
+            serial.log("[FD] FAIL: open {s} returned {d} (expected fd 3).\n", .{ TMP, @as(i64, @bitCast(tfd)) });
+            break :blk false;
+        }
+        // Place the message in the user buffer (via its HHDM alias) and write it.
+        @memcpy(buf_kalias[0..MSG.len], MSG);
+        const wn = syscallDispatch(SYS_write, tfd, U_BUF, MSG.len);
+        if (wn != MSG.len) {
+            serial.log("[FD] FAIL: write to {s} stored {d} bytes (expected {d}).\n", .{ TMP, @as(i64, @bitCast(wn)), MSG.len });
+            break :blk false;
+        }
+        // Rewind to the start, then read the bytes back into a freshly poisoned buffer.
+        _ = syscallDispatch(SYS_lseek, tfd, 0, SEEK_SET);
+        @memset(buf_kalias[0..MSG.len], 0xAA); // so a match can only come from the read
+        const rb = syscallDispatch(SYS_read, tfd, U_BUF, MSG.len);
+        if (rb != MSG.len or !userBufEquals(U_BUF, MSG)) {
+            serial.log("[FD] FAIL: tmpfs read-back got {d} bytes / wrong contents.\n", .{rb});
+            break :blk false;
+        }
+        _ = syscallDispatch(SYS_close, tfd, 0, 0);
+
+        // (b) /dev/null write succeeds and reports the byte count (a discard sink).
+        const NUL = "/dev/null";
+        @memcpy(path_kalias[0..NUL.len], NUL);
+        const nfd = syscallDispatch(SYS_open, U_PATH, NUL.len, 0);
+        if (nfd != 3) {
+            serial.log("[FD] FAIL: open /dev/null returned {d} (expected fd 3).\n", .{@as(i64, @bitCast(nfd))});
+            break :blk false;
+        }
+        @memcpy(buf_kalias[0..MSG.len], MSG);
+        const nw = syscallDispatch(SYS_write, nfd, U_BUF, MSG.len);
+        if (nw != MSG.len) { // the sink accepts (discards) every byte
+            serial.log("[FD] FAIL: write to /dev/null returned {d} (expected {d}).\n", .{ @as(i64, @bitCast(nw)), MSG.len });
+            break :blk false;
+        }
+        _ = syscallDispatch(SYS_close, nfd, 0, 0);
+
+        // (c) A FAT32 file is read-only through the fd write path: a write must be
+        // refused with EROFS (its VFS backend has no write slot).
+        @memcpy(path_kalias[0..PATH.len], PATH); // "/HELLO.TXT"
+        const hfd = syscallDispatch(SYS_open, U_PATH, PATH.len, 0);
+        if (hfd != 3) {
+            serial.log("[FD] FAIL: re-open {s} returned {d} (expected fd 3).\n", .{ PATH, @as(i64, @bitCast(hfd)) });
+            break :blk false;
+        }
+        @memcpy(buf_kalias[0..MSG.len], MSG);
+        const hw = syscallDispatch(SYS_write, hfd, U_BUF, MSG.len);
+        if (hw != EROFS) {
+            serial.log("[FD] FAIL: write to {s} -> {d} (expected EROFS).\n", .{ PATH, @as(i64, @bitCast(hw)) });
+            break :blk false;
+        }
+        _ = syscallDispatch(SYS_close, hfd, 0, 0);
+
         break :blk true;
     };
 
@@ -502,6 +585,7 @@ pub fn selfTest() void {
     if (ok) {
         serial.log("[FD] file-syscall self-test OK: open/read/lseek/dup/close on {s} via the syscall ABI.\n", .{PATH});
         serial.log("[FD] VFS-backed fd OK: a FAT32 file and /dev/zero opened+read through one fd ABI.\n", .{});
+        serial.log("[FD] write path OK: tmpfs round-trip + devfs sink + FAT32 EROFS\n", .{});
     } else {
         serial.log("[FD] file-syscall self-test FAILED.\n", .{});
     }
