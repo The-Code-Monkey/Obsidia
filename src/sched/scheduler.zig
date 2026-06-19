@@ -110,6 +110,14 @@ const Thread = struct {
     // syscalls (open/close/read/lseek/dup) hand out and reclaim slots. Kernel
     // threads have one too but never use it — they don't make file syscalls.
     fd: [FD_MAX]?OpenFile = [_]?OpenFile{null} ** FD_MAX,
+    // Per-process current working directory: the absolute, already-normalized
+    // path a RELATIVE open() resolves under (e.g. open("foo.txt") -> "<cwd>/foo.txt").
+    // `cwd_len` is how many of the buffer's bytes are valid. Every process starts
+    // at the root "/" (len 1). This is SEPARATE from the shell's own cwd: the shell
+    // is a ring-0 REPL that calls the filesystem directly, while THIS cwd belongs to
+    // a ring-3 process and is moved by the chdir() syscall / read by getcwd().
+    cwd_buf: [256]u8 = [_]u8{'/'} ++ [_]u8{0} ** 255,
+    cwd_len: usize = 1,
 };
 
 var threads: [MAX_THREADS]Thread = undefined;
@@ -285,6 +293,27 @@ pub fn currentFdTable() *[FD_MAX]?OpenFile {
 // teardown will reuse this idea once it frees a process's fds on exit.
 pub fn resetCurrentFds() void {
     threads[current].fd = [_]?OpenFile{null} ** FD_MAX;
+}
+
+// --- Per-process current working directory -----------------------------------
+// The running process's cwd, as an absolute normalized path slice into its TCB.
+// The chdir/open syscalls read this to resolve a relative path under it. Like
+// currentFdTable() this points into the live thread slot, so it reflects the
+// caller's process; single-core + interrupts-masked syscalls means no locking.
+pub fn currentCwd() []const u8 {
+    return threads[current].cwd_buf[0..threads[current].cwd_len];
+}
+
+// Replace the running process's cwd with `path` (which the syscall layer has
+// already validated as an existing directory and normalized to an absolute path).
+// Copies it into the TCB's fixed buffer if it fits, returning true; if `path` is
+// longer than the buffer it leaves the cwd unchanged and returns false (so the
+// caller can report the failure rather than truncate the directory silently).
+pub fn setCwd(path: []const u8) bool {
+    if (path.len > threads[current].cwd_buf.len) return false; // wouldn't fit
+    @memcpy(threads[current].cwd_buf[0..path.len], path);
+    threads[current].cwd_len = path.len;
+    return true;
 }
 
 // Find the lowest free descriptor at or above FD_FIRST_FREE in `table` (0/1/2 are

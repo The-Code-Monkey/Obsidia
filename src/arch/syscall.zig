@@ -12,6 +12,7 @@
 // Stage 1 wires the full round trip and proves it with one test syscall; the real
 // syscall table (write/exit/yield) lands next.
 
+const std = @import("std"); // tokenizeScalar / mem.eql for path normalization
 const serial = @import("../drivers/serial.zig");
 const gdt = @import("gdt.zig");
 const cpu = @import("cpu.zig");
@@ -50,6 +51,8 @@ pub const SYS_read: u64 = 6; // read(fd, ptr, len) -> bytes read (0 = EOF) or -e
 pub const SYS_lseek: u64 = 7; // lseek(fd, off, whence) -> new offset or -errno
 pub const SYS_dup: u64 = 8; // dup(fd) -> new fd (lowest free) or -errno
 pub const SYS_wait: u64 = 9; // wait(status_ptr) -> pid of the reaped child, or -ECHILD
+pub const SYS_chdir: u64 = 10; // chdir(path, len) -> 0, or -errno (move the process's cwd)
+pub const SYS_getcwd: u64 = 11; // getcwd(buf, len) -> cwd length, or -ERANGE (buffer too small)
 
 const ENOSYS: u64 = @bitCast(@as(i64, -38)); // unknown syscall
 const EBADF: u64 = @bitCast(@as(i64, -9)); // bad file descriptor
@@ -60,6 +63,9 @@ const ENOENT: u64 = @bitCast(@as(i64, -2)); // no such file or directory
 const ECHILD: u64 = @bitCast(@as(i64, -10)); // wait() with no child to wait for
 const ESPIPE: u64 = @bitCast(@as(i64, -29)); // lseek on an unseekable fd (e.g. /dev/zero)
 const EROFS: u64 = @bitCast(@as(i64, -30)); // write to a read-only fd (e.g. a FAT32 file)
+const ENOTDIR: u64 = @bitCast(@as(i64, -20)); // chdir target exists but isn't a directory
+const ERANGE: u64 = @bitCast(@as(i64, -34)); // getcwd: the user buffer can't hold the cwd
+const ENAMETOOLONG: u64 = @bitCast(@as(i64, -36)); // resolved path too long for the cwd buffer
 
 // lseek `whence` values (POSIX): the offset is interpreted relative to the start
 // of the file, the current cursor, or the end of the file respectively.
@@ -90,6 +96,8 @@ export fn syscallDispatch(num: u64, a1: u64, a2: u64, a3: u64) callconv(.c) u64 
         SYS_lseek => sysLseek(a1, a2, a3),
         SYS_dup => sysDup(a1),
         SYS_wait => sysWait(a1),
+        SYS_chdir => sysChdir(a1, a2),
+        SYS_getcwd => sysGetcwd(a1, a2),
         else => ENOSYS,
     };
 }
@@ -170,6 +178,76 @@ fn sysExit(code: u64) u64 {
 // a fixed kernel buffer means we never allocate (or trust a user length blindly).
 const PATH_MAX = 256;
 
+// --- Relative-path resolution ------------------------------------------------
+// A ring-3 process may pass open()/chdir() a RELATIVE path (one that doesn't begin
+// with '/'). We resolve it against the process's cwd: join "<cwd>/<path>", then
+// collapse "."/".." segments into a clean absolute path. This mirrors the shell's
+// own normalizePath (shell.zig) but is reimplemented here because that one is
+// private to the shell, and the shell's cwd is a DIFFERENT thing from the per-
+// process syscall cwd we resolve against. The whole thing stays in fixed kernel
+// buffers (no heap, no trusting a user length).
+
+// Collapse "." and ".." in the absolute path `raw` (which must start with '/')
+// into `out`, returning the normalized slice. "." stays put; ".." pops the last
+// component (a no-op at the root); everything else is a real component. With
+// nothing left we return "/". Returns null only if the result would overflow
+// `out` (which never happens here: `out` is sized like `raw`). Pure + unit-tested.
+fn normalizeInto(raw: []const u8, out: []u8) ?[]const u8 {
+    var comps: [PATH_MAX / 2][]const u8 = undefined; // at most ~one component per 2 bytes ("/x")
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, raw, '/');
+    while (it.next()) |c| {
+        if (std.mem.eql(u8, c, ".")) continue; // "." = stay in this directory
+        if (std.mem.eql(u8, c, "..")) { // ".." = up one (a no-op already at the root)
+            if (n > 0) n -= 1;
+            continue;
+        }
+        if (n >= comps.len) return null; // implausibly many components
+        comps[n] = c;
+        n += 1;
+    }
+    if (n == 0) { // everything collapsed away -> the root
+        if (out.len < 1) return null;
+        out[0] = '/';
+        return out[0..1];
+    }
+    var len: usize = 0;
+    for (comps[0..n]) |c| {
+        if (len + 1 + c.len > out.len) return null; // would overflow the output buffer
+        out[len] = '/';
+        len += 1;
+        @memcpy(out[len..][0..c.len], c);
+        len += c.len;
+    }
+    return out[0..len];
+}
+
+// Resolve `name` (the user's path, already copied into kernel memory) to a
+// normalized ABSOLUTE path written into `out`. An absolute `name` (leading '/') is
+// normalized as-is; a relative one is joined onto the running process's cwd first
+// ("<cwd>/<name>"), so it resolves under wherever the process chdir'd. Returns the
+// normalized slice, or null if the joined path would overflow the scratch buffer
+// (the caller maps that to ENAMETOOLONG/EINVAL — we never truncate a path).
+fn resolveUserPath(name: []const u8, out: []u8) ?[]const u8 {
+    var raw: [PATH_MAX * 2]u8 = undefined; // room for cwd + '/' + name before collapsing
+    var rl: usize = 0;
+    if (name.len > 0 and name[0] == '/') {
+        if (name.len > raw.len) return null; // can't fit even before normalizing
+        @memcpy(raw[0..name.len], name);
+        rl = name.len;
+    } else {
+        const cwd = scheduler.currentCwd(); // the process's current directory
+        if (cwd.len + 1 + name.len > raw.len) return null; // join would overflow
+        @memcpy(raw[0..cwd.len], cwd);
+        rl = cwd.len;
+        raw[rl] = '/'; // separator between the cwd and the relative name
+        rl += 1;
+        @memcpy(raw[rl..][0..name.len], name);
+        rl += name.len;
+    }
+    return normalizeInto(raw[0..rl], out);
+}
+
 // open(path, len): resolve the NUL-free path string at user address `path` (with
 // length `len`) on the FAT32 disk and, if it names a regular file, install it in
 // the lowest free descriptor (>= 3) of the calling process. Returns that fd, or a
@@ -193,14 +271,21 @@ fn sysOpen(path: u64, len: u64) u64 {
     }
     const name = kbuf[0..len];
 
-    // Route through the VFS, so `name` can live on ANY mounted backend — the FAT32
+    // Resolve the path against the process's cwd: an absolute `name` is used as-is
+    // (just normalized); a RELATIVE one is joined onto the cwd ("<cwd>/<name>") so
+    // open("foo.txt") finds the file under wherever the process chdir'd. A path that
+    // doesn't fit the scratch buffer after joining is rejected rather than truncated.
+    var pbuf: [PATH_MAX]u8 = undefined;
+    const abs = resolveUserPath(name, &pbuf) orelse return EINVAL; // too long after join
+
+    // Route through the VFS, so `abs` can live on ANY mounted backend — the FAT32
     // disk at "/", tmpfs at "/tmp", or devfs at "/dev" — not just the FAT32 disk.
     // stat() distinguishes "missing" (ENOENT) from "is a directory" (EINVAL); open()
     // returns false for either, so we stat first to give a precise errno.
-    const node = vfs.stat(name) orelse return ENOENT;
+    const node = vfs.stat(abs) orelse return ENOENT;
     if (node.kind == .dir) return EINVAL; // can't open a directory as a readable file
     var handle: vfs.OpenFile = undefined;
-    if (!vfs.open(name, &handle)) return ENOENT; // (re-checks mount/path)
+    if (!vfs.open(abs, &handle)) return ENOENT; // (re-checks mount/path)
     return scheduler.allocFd(.{ .file = handle }) orelse EMFILE; // table full -> EMFILE
 }
 
@@ -292,6 +377,59 @@ fn sysWait(status_ptr: u64) u64 {
         @as(*u64, @ptrFromInt(status_ptr)).* = result.code; // hand the exit code back to ring 3
     }
     return result.pid; // the reaped child's PID (its thread-table slot index)
+}
+
+// chdir(path, len): move the calling process's current working directory to the
+// directory named by the path string at user address `path` (length `len`). Like
+// open(), a relative path resolves under the current cwd, so `chdir("sub")` then
+// `chdir("..")` walk in and back out. Returns 0 on success, or a negative errno:
+// the target must EXIST (else ENOENT) and be a DIRECTORY (else ENOTDIR). The user
+// pointer is validated and copied under the SMAP guard exactly like sysOpen's, so
+// the resolve/stat below run on a trusted kernel copy.
+fn sysChdir(path: u64, len: u64) u64 {
+    if (len == 0 or len > PATH_MAX) return EINVAL; // empty or implausibly long path
+    if (path >= USER_LIMIT or len > USER_LIMIT - path) return EFAULT; // escapes user space
+    if (!vmm.userRangeAccessible(vmm.activeSpace(), path, len)) return EFAULT; // unmapped / kernel-only
+
+    var kbuf: [PATH_MAX]u8 = undefined;
+    {
+        asm volatile ("stac"); // lift SMAP for exactly the copy out of the user page
+        defer asm volatile ("clac");
+        const ubuf = @as([*]const u8, @ptrFromInt(path))[0..len];
+        @memcpy(kbuf[0..len], ubuf);
+    }
+    const name = kbuf[0..len];
+
+    // Resolve to an absolute, normalized path (relative -> joined onto the cwd).
+    var pbuf: [PATH_MAX]u8 = undefined;
+    const abs = resolveUserPath(name, &pbuf) orelse return EINVAL; // too long after join
+
+    // The target must exist AND be a directory before we move the cwd: a missing
+    // path is ENOENT, an existing non-directory (a regular file) is ENOTDIR. We only
+    // call setCwd once both hold, so a failed chdir never disturbs the current cwd.
+    const node = vfs.stat(abs) orelse return ENOENT;
+    if (node.kind != .dir) return ENOTDIR; // exists, but it's a file -> can't cd into it
+    if (!scheduler.setCwd(abs)) return ENAMETOOLONG; // normalized path didn't fit the cwd buffer
+    return 0;
+}
+
+// getcwd(buf, len): copy the calling process's current working directory (an
+// absolute path) into the user buffer at `buf` (capacity `len` bytes) and return
+// its length. Returns -ERANGE if the buffer is too small to hold the path (POSIX),
+// or -EFAULT for a bad user buffer. We do NOT NUL-terminate: the caller learns the
+// exact length from the return value (a small, fixed ABI). The user buffer is
+// validated like every other (range then page check), and the copy into it is
+// bracketed by STAC/CLAC so SMAP stays armed everywhere else.
+fn sysGetcwd(buf: u64, len: u64) u64 {
+    const cwd = scheduler.currentCwd(); // absolute, normalized path slice in the TCB
+    if (len < cwd.len) return ERANGE; // buffer can't hold the path -> POSIX ERANGE
+    if (buf >= USER_LIMIT or cwd.len > USER_LIMIT - buf) return EFAULT; // escapes user space
+    if (!vmm.userRangeAccessible(vmm.activeSpace(), buf, cwd.len)) return EFAULT; // unmapped / kernel-only
+    asm volatile ("stac"); // lift SMAP for exactly the copy into the user page
+    defer asm volatile ("clac");
+    const dst = @as([*]u8, @ptrFromInt(buf))[0..cwd.len];
+    @memcpy(dst, cwd);
+    return cwd.len; // the number of bytes written (the cwd's length)
 }
 
 // The `syscall` entry point (the LSTAR target). Global naked asm: switch to the
@@ -572,6 +710,84 @@ pub fn selfTest() void {
         }
         _ = syscallDispatch(SYS_close, hfd, 0, 0);
 
+        // --- cwd: chdir + RELATIVE open + getcwd through the syscall ABI --------
+        // The test disk has a /docs directory holding NOTES.TXT (seeded by run.sh).
+        // We exercise the per-process cwd: chdir into /docs, open the file by its
+        // RELATIVE name (which must resolve under the cwd), read its bytes back, and
+        // getcwd to confirm the cwd actually moved. We also assert the two error
+        // paths: chdir to a missing dir is ENOENT, chdir to a FILE is ENOTDIR.
+        // Skip cleanly if /docs/NOTES.TXT isn't present (so a stripped-down disk
+        // still passes the rest of the self-test).
+        const cwd_ok = blk2: {
+            if (vfs.stat("/docs") == null or vfs.stat("/docs/NOTES.TXT") == null) {
+                serial.log("[FD] cwd self-test skipped (no /docs/NOTES.TXT).\n", .{});
+                break :blk2 true; // nothing to test here; don't fail the whole self-test
+            }
+            const NOTES = "nested file contents ok"; // /docs/NOTES.TXT without the newline
+
+            // chdir("/docs"): move the process cwd into the directory.
+            const DIR = "/docs";
+            @memcpy(path_kalias[0..DIR.len], DIR);
+            if (syscallDispatch(SYS_chdir, U_PATH, DIR.len, 0) != 0) {
+                serial.log("[FD] FAIL: chdir /docs did not return 0.\n", .{});
+                break :blk2 false;
+            }
+            // getcwd into U_BUF: it must read back exactly "/docs" (length 5).
+            const gl = syscallDispatch(SYS_getcwd, U_BUF, 64, 0);
+            if (gl != DIR.len or !userBufEquals(U_BUF, DIR)) {
+                serial.log("[FD] FAIL: getcwd returned {d}, expected the chdir'd path.\n", .{@as(i64, @bitCast(gl))});
+                break :blk2 false;
+            }
+            // open("NOTES.TXT") — a RELATIVE path — must resolve to /docs/NOTES.TXT.
+            const REL = "NOTES.TXT";
+            @memcpy(path_kalias[0..REL.len], REL);
+            const rfd = syscallDispatch(SYS_open, U_PATH, REL.len, 0);
+            if (rfd != 3) {
+                serial.log("[FD] FAIL: relative open NOTES.TXT returned {d} (expected fd 3).\n", .{@as(i64, @bitCast(rfd))});
+                break :blk2 false;
+            }
+            // Read its first bytes and confirm they're the file's real contents —
+            // proving the relative name resolved under the cwd, not "/".
+            const rr = syscallDispatch(SYS_read, rfd, U_BUF, NOTES.len);
+            if (rr != NOTES.len or !userBufEquals(U_BUF, NOTES)) {
+                serial.log("[FD] FAIL: relative-open read got {d} bytes / wrong contents.\n", .{rr});
+                break :blk2 false;
+            }
+            _ = syscallDispatch(SYS_close, rfd, 0, 0);
+
+            // getcwd with a buffer smaller than the cwd must report ERANGE.
+            const tooSmall = syscallDispatch(SYS_getcwd, U_BUF, DIR.len - 1, 0);
+            if (tooSmall != ERANGE) {
+                serial.log("[FD] FAIL: getcwd(small buf) -> {d} (expected ERANGE).\n", .{@as(i64, @bitCast(tooSmall))});
+                break :blk2 false;
+            }
+            // chdir to a NON-EXISTENT directory -> ENOENT (and the cwd is unchanged).
+            const MISSING = "/nope-not-here";
+            @memcpy(path_kalias[0..MISSING.len], MISSING);
+            if (syscallDispatch(SYS_chdir, U_PATH, MISSING.len, 0) != ENOENT) {
+                serial.log("[FD] FAIL: chdir to a missing dir did not return ENOENT.\n", .{});
+                break :blk2 false;
+            }
+            // chdir to a FILE (not a directory) -> ENOTDIR.
+            const FILEP = "/docs/NOTES.TXT";
+            @memcpy(path_kalias[0..FILEP.len], FILEP);
+            if (syscallDispatch(SYS_chdir, U_PATH, FILEP.len, 0) != ENOTDIR) {
+                serial.log("[FD] FAIL: chdir to a file did not return ENOTDIR.\n", .{});
+                break :blk2 false;
+            }
+            // A failed chdir must NOT have moved the cwd: it should still be /docs.
+            const gl2 = syscallDispatch(SYS_getcwd, U_BUF, 64, 0);
+            if (gl2 != DIR.len or !userBufEquals(U_BUF, DIR)) {
+                serial.log("[FD] FAIL: cwd changed after a failed chdir.\n", .{});
+                break :blk2 false;
+            }
+            // Leave the process cwd back at the root for any later test.
+            const ROOT = "/";
+            @memcpy(path_kalias[0..ROOT.len], ROOT);
+            _ = syscallDispatch(SYS_chdir, U_PATH, ROOT.len, 0);
+            break :blk2 true;
+        };
+        if (!cwd_ok) break :blk false;
         break :blk true;
     };
 
@@ -586,6 +802,7 @@ pub fn selfTest() void {
         serial.log("[FD] file-syscall self-test OK: open/read/lseek/dup/close on {s} via the syscall ABI.\n", .{PATH});
         serial.log("[FD] VFS-backed fd OK: a FAT32 file and /dev/zero opened+read through one fd ABI.\n", .{});
         serial.log("[FD] write path OK: tmpfs round-trip + devfs sink + FAT32 EROFS\n", .{});
+        serial.log("[FD] cwd OK: chdir + relative open + getcwd via the syscall ABI\n", .{});
     } else {
         serial.log("[FD] file-syscall self-test FAILED.\n", .{});
     }
@@ -616,4 +833,28 @@ fn userBufAllZero(va: u64, n: usize) bool {
     const got = @as([*]const u8, @ptrFromInt(va))[0..n];
     for (got) |b| if (b != 0) return false;
     return true;
+}
+
+// --- Inline unit tests: the pure path-normalization helper -------------------
+// normalizeInto collapses "."/".." in an absolute path. It is pure (no hardware,
+// no user memory), so `zig build test` exercises every shape on the host: a clean
+// path, "." kept-in-place, ".." popping a component, ".." at the root (a no-op),
+// and a path that collapses entirely back to "/".
+const testing = std.testing;
+
+test "normalizeInto collapses . and .. into a clean absolute path" {
+    var out: [PATH_MAX]u8 = undefined;
+    // A plain path passes through unchanged.
+    try testing.expectEqualStrings("/docs/notes", normalizeInto("/docs/notes", &out).?);
+    // "." stays in the current directory (dropped).
+    try testing.expectEqualStrings("/docs/notes", normalizeInto("/docs/./notes", &out).?);
+    // ".." pops the previous component.
+    try testing.expectEqualStrings("/notes", normalizeInto("/docs/../notes", &out).?);
+    // Redundant slashes are squeezed out by tokenizing on '/'.
+    try testing.expectEqualStrings("/a/b", normalizeInto("//a///b", &out).?);
+    // ".." at (or past) the root is a no-op — you can't go above "/".
+    try testing.expectEqualStrings("/", normalizeInto("/..", &out).?);
+    try testing.expectEqualStrings("/", normalizeInto("/a/../..", &out).?);
+    // A path that collapses entirely (all "." / "..") becomes the root.
+    try testing.expectEqualStrings("/", normalizeInto("/./.", &out).?);
 }
