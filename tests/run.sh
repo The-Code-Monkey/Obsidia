@@ -469,6 +469,24 @@ assert_in "$TMP/fat.log" "[VFS] self-test OK: opened + read /HELLO.TXT through t
 # (and the kernel must still reach BOOT_OK, which the marker checks above prove).
 assert_in "$TMP/bios.log" "[VFS] self-test skipped (no filesystem mounted)."    "VFS: disk-less boot skips the self-test gracefully"
 
+# --- tmpfs (in-memory writable filesystem mounted at /tmp) -------------------
+# tmpfs stores files entirely in RAM (no disk), so it works on EVERY boot,
+# including the disk-less BIOS/UEFI ones. Its debug-log-gated boot self-test
+# CREATES a file in RAM, WRITES a known string into it (via tmpfs's write helper,
+# since the VFS vtable is read-only), then opens + reads it back THROUGH the VFS
+# at "/tmp/hello.txt" and confirms the bytes match. We assert against the
+# FAT32-disk boot (where the verbose log lives), checking: the layer initialized,
+# the write happened, stat() saw the file via the VFS, the bytes read back via the
+# VFS are exactly what was written (proving the write->VFS-read round-trip), and
+# the overall OK marker. We also confirm it works on the disk-less BIOS boot,
+# since tmpfs needs no disk.
+assert_in "$TMP/fat.log" "[TMPFS] in-memory filesystem initialized."             "tmpfs: layer initialized at boot"
+assert_in "$TMP/fat.log" "[TMPFS] self-test: wrote 24 bytes to /tmp/hello.txt."  "tmpfs: wrote a file's contents into RAM"
+assert_in "$TMP/fat.log" "[TMPFS] self-test: stat /tmp/hello.txt -> file,"       "tmpfs: stat() resolved the in-RAM file through the VFS"
+assert_in "$TMP/fat.log" "read 24 bytes via VFS: Hello from tmpfs in RAM!"       "tmpfs: bytes read back via the VFS match what was written"
+assert_in "$TMP/fat.log" "[TMPFS] self-test OK: wrote a file to RAM and read it back through the VFS." "tmpfs: write-to-RAM then read-back-through-VFS succeeded end-to-end"
+assert_in "$TMP/bios.log" "[TMPFS] self-test OK: wrote a file to RAM and read it back through the VFS." "tmpfs: works on a disk-less boot (no disk needed for an in-RAM fs)"
+
 # --- Per-process file-descriptor table + file syscalls -----------------------
 # The boot self-test (debug-log-gated) opens /HELLO.TXT through the REAL syscall
 # dispatcher and the real user-pointer validation, then read()s, lseek()s (forward
