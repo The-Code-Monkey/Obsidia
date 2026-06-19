@@ -81,6 +81,20 @@ pub const Backend = struct {
         // only if it implements a streaming write. It is the WRITE mirror of
         // `read`: same shape, advancing the same cursor.
         write: ?*const fn (ctx: *anyopaque, file: *OpenFile, src: []const u8) usize = null,
+        // OPTIONAL: a handle to this file is being CLOSED (its fd freed). Most backends
+        // hold no per-handle resource — closing just drops the fd slot — so they leave
+        // this null and nothing happens. A backend that DOES (e.g. a pipe, which keeps
+        // a reference count of how many ends are open) implements it to release that
+        // resource: pipefs decrements the pipe's refcount here and frees the ring when
+        // the last end closes. Called by `closeFile` just before the fd slot is nulled.
+        close: ?*const fn (ctx: *anyopaque, file: *OpenFile) void = null,
+        // OPTIONAL: a handle to this file is being DUPLICATED (dup copies the OpenFile,
+        // so a second fd now refers to the same underlying object). Backends with a
+        // reference count must bump it here so the object survives until BOTH fds close;
+        // pipefs increments the pipe's refcount. Stateless backends leave this null (a
+        // dup is then just an independent copy of the cursor, as before). Called by
+        // `cloneFile` on the NEW handle right after dup copies it.
+        clone: ?*const fn (ctx: *anyopaque, file: *OpenFile) void = null,
     };
 };
 
@@ -239,6 +253,26 @@ pub fn read(file: *OpenFile, dst: []u8) usize {
 // write slot), so a caller can report EROFS; otherwise the count of bytes stored.
 pub fn write(file: *OpenFile, src: []const u8) ?usize {
     return file.write(src);
+}
+
+// Notify the backend that this handle is being CLOSED (its fd is about to be freed).
+// Calls the backend's close hook if it has one, so a stateful backend (a pipe) can
+// release its per-handle resource (decrement a refcount, free the ring at zero). For
+// the common stateless backends (FAT32/tmpfs/devfs, no close slot) this is a no-op —
+// the fd slot is simply dropped, exactly as before. The syscall layer calls this in
+// sysClose just before it nulls the descriptor.
+pub fn closeFile(file: *OpenFile) void {
+    if (file.backend.vtable.close) |close_fn| close_fn(file.backend.ctx, file);
+}
+
+// Notify the backend that this handle was just DUPLICATED (dup copied the OpenFile,
+// so a new fd refers to the same object). Calls the backend's clone hook if it has
+// one, so a refcounted backend (a pipe) can bump its count to keep the object alive
+// until both fds close. Stateless backends (no clone slot) are a no-op — the dup is
+// then just an independent copy of the cursor, the existing behavior. The syscall
+// layer calls this in sysDup on the NEW slot's handle right after the copy.
+pub fn cloneFile(file: *OpenFile) void {
+    if (file.backend.vtable.clone) |clone_fn| clone_fn(file.backend.ctx, file);
 }
 
 // How lseek interprets its offset argument: from the start, the current position,
