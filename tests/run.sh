@@ -445,6 +445,24 @@ assert_in "$TMP/fat.log" "Hello from FAT32 on Obsidia!"    "FAT32: reads a file'
 assert_in "$TMP/fat.log" "nested file contents ok"         "FAT32: resolves a nested path (/docs/notes.txt)"
 assert_in "$TMP/fat.log" "long names work too"             "FAT32: reads a long-name file by path"
 
+# --- VFS layer (mount/vnode abstraction over FAT32) --------------------------
+# The VFS layer mounts the FAT32 backend at "/" and opens + reads a known file
+# (/HELLO.TXT) THROUGH the abstraction — not by calling FAT32 directly. The boot
+# self-test (debug-log-gated) runs on this same FAT32 boot (the disk is mounted),
+# so we assert against fat.log. We check the layer initialized, that stat() saw
+# the file, that read() returned bytes via the VFS, that those bytes are the
+# file's real contents (proving they flowed through the VFS read path), and the
+# overall OK marker. The disk-less BIOS/UEFI boots have no filesystem, so the
+# self-test logs "skipped" there — which we also confirm stays graceful.
+assert_in "$TMP/fat.log" "[VFS] virtual filesystem layer initialized."          "VFS: layer initialized at boot"
+assert_in "$TMP/fat.log" "[VFS] self-test: stat /HELLO.TXT -> file,"            "VFS: stat() resolved a file through the abstraction"
+assert_in "$TMP/fat.log" "[VFS] self-test: read"                                "VFS: read() returned bytes through the abstraction"
+assert_in "$TMP/fat.log" "bytes via VFS: Hello from FAT32 on Obsidia!"          "VFS: the bytes read via VFS are the file's real contents"
+assert_in "$TMP/fat.log" "[VFS] self-test OK: opened + read /HELLO.TXT through the VFS." "VFS: open+read of /HELLO.TXT through the VFS succeeded end-to-end"
+# A disk-less boot has no filesystem, so the VFS self-test must skip gracefully
+# (and the kernel must still reach BOOT_OK, which the marker checks above prove).
+assert_in "$TMP/bios.log" "[VFS] self-test skipped (no filesystem mounted)."    "VFS: disk-less boot skips the self-test gracefully"
+
 # --- AC'97 play (raw PCM + WAV) (FAT32 + AC97, -M pc) ------------------------
 # Stream audio from the FAT32 disk to the codec. Boot -M pc with both the IDE disk
 # and an AC'97 device, then drive `play` for three files exercising every path:
