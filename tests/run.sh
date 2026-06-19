@@ -487,6 +487,21 @@ assert_in "$TMP/fat.log" "read 24 bytes via VFS: Hello from tmpfs in RAM!"      
 assert_in "$TMP/fat.log" "[TMPFS] self-test OK: wrote a file to RAM and read it back through the VFS." "tmpfs: write-to-RAM then read-back-through-VFS succeeded end-to-end"
 assert_in "$TMP/bios.log" "[TMPFS] self-test OK: wrote a file to RAM and read it back through the VFS." "tmpfs: works on a disk-less boot (no disk needed for an in-RAM fs)"
 
+# --- devfs (/dev device nodes: a SECOND VFS backend) -------------------------
+# devfs proves the VFS abstraction supports filesystems that are NOT FAT32: it
+# serves driver-backed device nodes (/dev/null, /dev/zero, /dev/console) with no
+# disk behind them. The boot self-test (debug-log-gated) mounts devfs at "/dev",
+# then THROUGH the VFS: reads /dev/zero (must fill the buffer with zero bytes),
+# reads /dev/null (must return 0 = EOF), and writes a line to /dev/console (which
+# must reach the serial terminal). devfs needs no disk, so it runs on the FAT32
+# boot like the VFS block; we assert against fat.log. The OK marker requires all
+# three behaviours to have held.
+assert_in "$TMP/fat.log" "[DEVFS] devfs mounted at /dev (null, zero, console)." "devfs: mounted as a second VFS backend at /dev"
+assert_in "$TMP/fat.log" "[DEVFS] self-test: /dev/zero read 16 bytes, all-zero=true." "devfs: /dev/zero reads return zeroed bytes through the VFS"
+assert_in "$TMP/fat.log" "[DEVFS] self-test: /dev/null read 0 bytes (EOF expected)." "devfs: /dev/null reads return EOF through the VFS"
+assert_in "$TMP/fat.log" "[DEVFS] hello from /dev/console"                       "devfs: a write to /dev/console reached the serial terminal"
+assert_in "$TMP/fat.log" "[DEVFS] self-test OK: zero/null/console served through the VFS." "devfs: zero/null/console all served through the VFS end-to-end"
+
 # --- Per-process file-descriptor table + file syscalls -----------------------
 # The boot self-test (debug-log-gated) opens /HELLO.TXT through the REAL syscall
 # dispatcher and the real user-pointer validation, then read()s, lseek()s (forward

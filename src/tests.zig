@@ -12,5 +12,6 @@ test {
     _ = @import("fs/fatformat.zig"); // FAT32 mkfs: BPB, FSInfo, FATs, root
     _ = @import("fs/lfn.zig"); // FAT32 long-name encoding: alias, checksum, entries
     _ = @import("fs/tmpfs.zig"); // tmpfs: in-memory create/write/read + VFS-backed reads
+    _ = @import("fs/devfs.zig"); // devfs device nodes: /dev/null (EOF), /dev/zero (zeros), /dev/console (writes)
     _ = @import("arch/idt.zig"); // fault->signal vector mapping (pure default-action table)
 }
